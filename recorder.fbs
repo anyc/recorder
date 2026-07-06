@@ -1,0 +1,32 @@
+namespace journal;
+
+table Entry {
+  // timestamps
+  realtime_ts:ulong;
+  monotonic_ts:ulong;
+
+  // core log fields
+  priority:ubyte;
+  message:string;
+  message_id:string;
+  unit:string;
+
+  // identity
+  pid:uint;
+  uid:uint;
+  gid:uint;
+
+  // optional strings
+  hostname:string;
+  comm:string;
+  exe:string;
+
+  // optional structured field
+  errno:ushort = 0;
+}
+
+table Chunk {
+  entries:[Entry];
+}
+
+root_type Chunk;

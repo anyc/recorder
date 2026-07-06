@@ -1,0 +1,14 @@
+[Unit]
+Description=Persistent journal recorder
+Documentation=file:///etc/recorder.json
+After=systemd-journald.service local-fs.target
+Requires=systemd-journald.service
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/recorder
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target

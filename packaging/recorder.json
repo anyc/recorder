@@ -1,0 +1,30 @@
+{
+  "log_max_bytes": 67108864,
+  "segment_max_bytes": 4194304,
+  "segment_max_age_sec": 900,
+  "durable_priority_max": 3,
+  "durability_flush_frames": 32,
+  "durability_flush_interval_sec": 5,
+  "compress_enabled": true,
+  "compress_min_frame_bytes": 256,
+  "compress_if_smaller": true,
+  "capture_message_id": true,
+  "capture_unit": true,
+  "capture_hostname": false,
+  "capture_comm": false,
+  "capture_exe": false,
+  "capture_pid": false,
+  "capture_uid": false,
+  "capture_gid": false,
+  "priority_groups": [
+    { "name": "p0", "priorities": [0] },
+    { "name": "p1", "priorities": [1] },
+    { "name": "p2", "priorities": [2] },
+    { "name": "p3", "priorities": [3] },
+    { "name": "p4", "priorities": [4] },
+    { "name": "p5", "priorities": [5] },
+    { "name": "p6", "priorities": [6] },
+    { "name": "p7", "priorities": [7] }
+  ],
+  "static_dict_paths": {}
+}
