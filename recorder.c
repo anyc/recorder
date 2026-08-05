@@ -40,6 +40,7 @@ typedef void sd_journal;
 
 #include "helper.h"
 #include "index.h"
+#include "script_worker.h"
 #include "fallback_source.h"
 #ifdef errno
 #pragma push_macro("errno")
@@ -123,6 +124,11 @@ typedef struct {
 	char *replacement;
 	int drop;
 	int set_priority;
+	/* Fire-and-forget action.  The command is an argv-style vector. */
+	char **script_command;
+	size_t script_command_count;
+	int script_run_on_replay;
+	unsigned script_timeout_sec;
 } EntryModifier;
 
 typedef struct {
@@ -282,7 +288,19 @@ typedef struct {
 	int64_t clock_jump_usec;
 	int clock_offset_initialized;
 	int64_t last_clock_offset_usec;
+	ScriptWorker *script_worker;
+	int startup_catchup;
+	uint64_t startup_replayed_entries;
 } Recorder;
+
+/*
+ * Script modifiers are deliberately fire-and-forget.  The worker implementation
+ * can replace this weak hook; keeping a no-op default makes configurations with
+ * script modifiers harmless in builds that do not enable the worker.
+ */
+static void recorder_script_modifier_enqueue(Recorder *recorder,
+								 const EntryModifier *modifier,
+								 const LogEntry *entry, int is_replay);
 
 typedef struct {
 	char path[512];
@@ -384,6 +402,12 @@ static void modifier_list_destroy(ModifierList *list)
 #endif
 		free(list->items[i].rewrite_field);
 		free(list->items[i].replacement);
+		if (list->items[i].script_command) {
+			size_t j;
+			for (j = 0; j < list->items[i].script_command_count; j++)
+				free(list->items[i].script_command[j]);
+			free(list->items[i].script_command);
+		}
 	}
 	free(list->items);
 	list->items = NULL;
@@ -889,6 +913,7 @@ static int json_get_modifier_list(json_t *owner, const char *scope, ModifierList
 		json_t *rewrite;
 		json_t *drop;
 		json_t *set_priority;
+		json_t *script;
 		EntryModifier *modifier;
 		EntryModifier *tmp;
 
@@ -914,6 +939,7 @@ static int json_get_modifier_list(json_t *owner, const char *scope, ModifierList
 		modifier = &list->items[list->count];
 		memset(modifier, 0, sizeof(*modifier));
 		modifier->set_priority = -1;
+		modifier->script_timeout_sec = 10;
 		list->count++;
 		modifier->match_field = strdup(field ? json_string_value(field) : "MESSAGE");
 		if (!modifier->match_field) return -1;
@@ -997,7 +1023,45 @@ static int json_get_modifier_list(json_t *owner, const char *scope, ModifierList
 			return -1;
 #endif
 		}
-		if (!modifier->drop && modifier->set_priority < 0 && !modifier->rewrite_field) {
+		script = json_object_get(item, "script");
+		if (script) {
+			json_t *command = json_object_get(script, "command");
+			json_t *run_on_replay = json_object_get(script, "run_on_replay");
+			json_t *timeout = json_object_get(script, "timeout_sec");
+			size_t command_count;
+			size_t j;
+			json_int_t timeout_value;
+
+			if (!json_is_object(script) || !json_is_array(command) ||
+				(json_array_size(command) == 0) ||
+				(run_on_replay && !json_is_boolean(run_on_replay)) ||
+				(timeout && (!json_is_integer(timeout) ||
+					(timeout_value = json_integer_value(timeout)) < 1 || timeout_value > 86400))) {
+				fprintf(stderr, "recorder: modifier %zu in %s has invalid script (expected command array, optional run_on_replay and timeout_sec)\n", i, scope);
+				return -1;
+			}
+			command_count = json_array_size(command);
+			modifier->script_command = calloc(command_count + 1, sizeof(char *));
+			if (!modifier->script_command) return -1;
+			modifier->script_command_count = command_count;
+			for (j = 0; j < command_count; j++) {
+				json_t *arg = json_array_get(command, j);
+				if (!json_is_string(arg) || !json_string_value(arg)[0]) {
+					fprintf(stderr, "recorder: modifier %zu in %s has a non-string or empty script argument\n", i, scope);
+					return -1;
+				}
+				if (j == 0 && json_string_value(arg)[0] != '/') {
+					fprintf(stderr, "recorder: modifier %zu in %s script command must use an absolute executable path\n", i, scope);
+					return -1;
+				}
+				modifier->script_command[j] = strdup(json_string_value(arg));
+				if (!modifier->script_command[j]) return -1;
+			}
+			modifier->script_run_on_replay = run_on_replay && json_is_true(run_on_replay);
+			if (timeout) modifier->script_timeout_sec = (unsigned)json_integer_value(timeout);
+		}
+		if (!modifier->drop && modifier->set_priority < 0 && !modifier->rewrite_field &&
+			!modifier->script_command) {
 			fprintf(stderr, "recorder: modifier %zu in %s has no action\n", i, scope);
 			return -1;
 		}
@@ -2709,7 +2773,8 @@ static int build_regex_replacement(const EntryModifier *modifier, JournalField s
 	return 0;
 }
 
-static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j,
+					void *recorder, int is_replay)
 {
 	size_t i;
 
@@ -2761,12 +2826,15 @@ static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_jou
 		}
 		if (match_data) pcre2_match_data_free(match_data);
 		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->script_command)
+			recorder_script_modifier_enqueue(recorder, modifier, entry, is_replay);
 		if (modifier->drop) return 1;
 	}
 	return 0;
 }
 #elif defined(HAVE_LIBC_REGEX)
-static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j,
+					void *recorder, int is_replay)
 {
 	size_t i;
 
@@ -2797,12 +2865,15 @@ static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_jou
 		if (modifier->negate) matched = !matched;
 		if (!matched) continue;
 		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->script_command)
+			recorder_script_modifier_enqueue(recorder, modifier, entry, is_replay);
 		if (modifier->drop) return 1;
 	}
 	return 0;
 }
 #else
-static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j,
+					void *recorder, int is_replay)
 {
 	size_t i;
 
@@ -2823,6 +2894,8 @@ static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_jou
 		if (modifier->negate) matched = !matched;
 		if (!matched) continue;
 		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->script_command)
+			recorder_script_modifier_enqueue(recorder, modifier, entry, is_replay);
 		if (modifier->drop) return 1;
 	}
 	return 0;
@@ -3381,6 +3454,11 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 	r->j = j;
 	r->config = *cfg;
 	r->verbose = verbose;
+	r->startup_catchup = 1;
+	if (script_worker_create(256, 2, &r->script_worker) != 0) {
+		fprintf(stderr, "recorder: script modifiers disabled (worker unavailable)\n");
+		r->script_worker = NULL;
+	}
 	r->persistent_cursor_enabled = journal_mode;
 	if (snprintf(r->persistent_cursor_path, sizeof(r->persistent_cursor_path),
 				 "%s/state/journal.cursor%s%s", g_log_dir,
@@ -3570,13 +3648,112 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 	return 0;
 }
 
-static int apply_entry_modifiers(Recorder *r, LogEntry *entry)
+static int script_add_field(json_t *json, const char *name, JournalField field,
+						const char **env_names, const char **env_values,
+						size_t *env_count, char **owned_values, size_t *owned_count)
+{
+	char *value;
+	json_t *json_value;
+
+	if (!field.data || field.len == 0 || field.len > 64u * 1024u ||
+		memchr(field.data, '\0', field.len) != NULL || *env_count >= 32) {
+		return 0;
+	}
+	value = strndup(field.data, field.len);
+	if (!value || *owned_count >= 32) {
+		free(value);
+		return -1;
+	}
+	json_value = json_stringn(field.data, field.len);
+	if (!json_value) {
+		free(value);
+		return 0;
+	}
+	if (json_object_set_new(json, name, json_value) != 0) {
+		json_decref(json_value);
+		free(value);
+		return -1;
+	}
+	env_names[*env_count] = name;
+	env_values[*env_count] = value;
+	(*env_count)++;
+	owned_values[(*owned_count)++] = value;
+	return 0;
+}
+
+static void recorder_script_modifier_enqueue(Recorder *recorder,
+								 const EntryModifier *modifier,
+								 const LogEntry *entry, int is_replay)
+{
+	json_t *json;
+	char *payload = NULL;
+	const char *env_names[32];
+	const char *env_values[32];
+	char *owned_values[32] = {0};
+	char numeric[8][32];
+	size_t env_count = 0, owned_count = 0, i;
+	ScriptJobSpec spec;
+
+	if (!recorder || !recorder->script_worker || !modifier || !entry ||
+		(is_replay && !modifier->script_run_on_replay)) return;
+	json = json_object();
+	if (!json) return;
+	for (i = 0; i < 8; i++) numeric[i][0] = '\0';
+	snprintf(numeric[0], sizeof(numeric[0]), "%" PRIu64, entry->realtime_ts);
+	snprintf(numeric[1], sizeof(numeric[1]), "%" PRIu64, entry->monotonic_ts);
+	snprintf(numeric[2], sizeof(numeric[2]), "%u", entry->boot_seq);
+	snprintf(numeric[3], sizeof(numeric[3]), "%u", entry->priority);
+	snprintf(numeric[4], sizeof(numeric[4]), "%u", entry->pid);
+	snprintf(numeric[5], sizeof(numeric[5]), "%u", entry->uid);
+	snprintf(numeric[6], sizeof(numeric[6]), "%u", entry->gid);
+	{
+		const char *names[] = {"REC_REALTIME_TS", "REC_MONOTONIC_TS", "REC_BOOT_SEQ",
+			"REC_PRIORITY", "REC_PID", "REC_UID", "REC_GID"};
+		for (i = 0; i < 7; i++) {
+			JournalField f = {(const char *)numeric[i], strlen(numeric[i])};
+			if (script_add_field(json, names[i], f, env_names, env_values,
+								&env_count, owned_values, &owned_count) != 0) goto out;
+		}
+	}
+	{
+		const char *names[] = {"REC_BOOT_ID", "REC_MESSAGE", "REC_MESSAGE_ID",
+			"REC_HOSTNAME", "REC_SYSTEMD_UNIT", "REC_COMM", "REC_EXE"};
+		JournalField fields[] = {
+			{entry->boot_id, strlen(entry->boot_id)}, entry->message, entry->message_id,
+			entry->hostname, entry->unit, entry->comm, entry->exe
+		};
+		for (i = 0; i < 7; i++) {
+			if (script_add_field(json, names[i], fields[i], env_names, env_values,
+								&env_count, owned_values, &owned_count) != 0) goto out;
+		}
+	}
+	json_object_set_new(json, "REC_IS_REPLAY", json_boolean(is_replay));
+	payload = json_dumps(json, JSON_COMPACT);
+	if (!payload) goto out;
+	memset(&spec, 0, sizeof(spec));
+	spec.argv = (const char *const *)modifier->script_command;
+	spec.argc = modifier->script_command_count;
+	spec.json_payload = payload;
+	spec.env_names = env_names;
+	spec.env_values = env_values;
+	spec.env_count = env_count;
+	spec.timeout_sec = modifier->script_timeout_sec;
+	if (script_worker_submit(recorder->script_worker, &spec) != 0 && recorder->verbose) {
+		recorder_verbose_log(recorder, "script modifier queue is full or rejected the job");
+	}
+out:
+	free(payload);
+	json_decref(json);
+	for (i = 0; i < owned_count; i++) free(owned_values[i]);
+}
+
+static int apply_entry_modifiers(Recorder *r, LogEntry *entry, int is_replay)
 {
 	unsigned seen_priorities;
 	unsigned reroutes;
 	int result;
 
-	result = apply_modifier_list(&r->config.modifiers, entry, r->j);
+	result = apply_modifier_list(&r->config.modifiers, entry, r->j, r, is_replay);
 	if (result != 0) return result;
 	seen_priorities = 1u << entry->priority;
 	for (reroutes = 0; reroutes < MAX_MODIFIER_REROUTES; reroutes++) {
@@ -3584,7 +3761,7 @@ static int apply_entry_modifiers(Recorder *r, LogEntry *entry)
 		uint8_t previous_priority = entry->priority;
 
 		if (group_index < 0 || (size_t)group_index >= r->config.group_count) return -1;
-		result = apply_modifier_list(&r->config.groups[group_index].modifiers, entry, r->j);
+		result = apply_modifier_list(&r->config.groups[group_index].modifiers, entry, r->j, r, is_replay);
 		if (result != 0) return result;
 		if (entry->priority == previous_priority) return 0;
 		if (seen_priorities & (1u << entry->priority)) {
@@ -3621,7 +3798,7 @@ static size_t recorder_step_fallback(Recorder *r)
 	}
 	fallback_record_destroy(&record);
 	if (r->boots.count != boot_count_before) persist_boot_state(&r->boots);
-	modifier_result = apply_entry_modifiers(r, &entry);
+	modifier_result = apply_entry_modifiers(r, &entry, r->startup_catchup);
 	if (modifier_result < 0) {
 		fprintf(stderr, "recorder: failed to apply entry modifiers\n");
 		free_log_entry(&entry);
@@ -3667,7 +3844,7 @@ static size_t recorder_step(Recorder *r)
 		if (r->boots.count != boot_count_before) {
 			persist_boot_state(&r->boots);
 		}
-		modifier_result = apply_entry_modifiers(r, &entry);
+		modifier_result = apply_entry_modifiers(r, &entry, r->startup_catchup);
 		if (modifier_result < 0) {
 			fprintf(stderr, "recorder: failed to apply entry modifiers\n");
 			free_log_entry(&entry);
@@ -3743,6 +3920,10 @@ static void recorder_shutdown(Recorder *r)
 				close_ok = 0;
 			}
 		}
+	}
+	if (r->script_worker) {
+		script_worker_destroy(r->script_worker);
+		r->script_worker = NULL;
 	}
 	if (close_ok && r->pending_cursor) {
 		if (r->cursor_enabled && persist_journal_cursor(r) != 0) {
@@ -3902,6 +4083,7 @@ int main(int argc, char **argv)
 	if (recorder_init(&r, j, &cfg, verbose, cursor_path, journal_namespace,
 				  !fallback_mode) != 0) {
 		fprintf(stderr, "recorder: failed to initialize cursor path\n");
+		script_worker_destroy(r.script_worker);
 		#ifdef HAVE_SYSTEMD
 		if (j) sd_journal_close(j);
 		#endif
@@ -3977,6 +4159,8 @@ int main(int argc, char **argv)
 	while (!g_shutdown) {
 		recorder_sample_clock(&r);
 		size_t n = recorder_step(&r);
+		if (r.startup_catchup && n > 0)
+			r.startup_replayed_entries += n;
 
 		if (n > 0) {
 			if (recorder_flush_all(&r, 1) != 0) {
@@ -3989,6 +4173,12 @@ int main(int argc, char **argv)
 			fprintf(stderr, "recorder: failed to flush stored entries\n");
 			break;
 		}
+		if (r.startup_catchup && r.verbose >= 1) {
+			printf("recorder: replay complete; replayed %" PRIu64 " entries\n",
+				r.startup_replayed_entries);
+			fflush(stdout);
+		}
+		r.startup_catchup = 0;
 		#ifdef HAVE_SYSTEMD
 		if (!fallback_mode && sd_journal_wait(j, JOURNAL_WAIT_USEC) < 0) {
 			break;

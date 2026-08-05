@@ -57,20 +57,21 @@ LDLIBS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --libs libsystemd))
 LDLIBS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --libs $(PCRE2_PKG)))
 LDLIBS += $(FLATCC_LIBS)
 
-CFLAGS += -ggdb -Wall -MMD -MP
+CFLAGS += -ggdb -Wall -MMD -MP -pthread
+LDLIBS += -pthread
 
 all: recorder player librecorder.a
 
 repo:
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) all
 
-recorder: recorder.o fallback_source.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
+recorder: recorder.o fallback_source.o helper.o segment.o index.o recorder_crypto.o script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-player: player.o librecorder.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
+player: player.o librecorder.o helper.o segment.o index.o recorder_crypto.o script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-librecorder.a: librecorder.o segment.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
+librecorder.a: librecorder.o segment.o recorder_crypto.o script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(AR) rcs $@ $^
 
 smoke-test: smoke_test.o librecorder.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)

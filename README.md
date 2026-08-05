@@ -333,6 +333,37 @@ Global modifiers run once. If a group modifier changes priority, recorder
 selects the new group and applies that group's modifiers. It drops an entry if
 modifiers would route it in a priority loop or after eight reroutes.
 
+#### Script modifiers
+
+A matching `script` modifier queues an external program for asynchronous,
+fire-and-forget execution. The script does not change the entry or recorder
+state, and it is never invoked through a shell. `command` is an argv array and
+must name an executable using an absolute path. The matching entry is supplied
+as compact JSON on standard input; convenience environment variables with the
+`REC_` prefix contain the supported scalar fields (unsuitable or unavailable
+values are omitted). The worker queue is bounded, so a saturated queue drops
+the script invocation without affecting recording.
+
+By default scripts run only for live entries. Set `run_on_replay` to `true` to
+also run during recorder startup catch-up (the period before the first empty
+journal scan); the JSON input includes `REC_IS_REPLAY` so a script can tell the
+two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
+
+```json
+{
+  "modifiers": [
+    {
+      "match": { "field": "MESSAGE", "exact": "rotate-now" },
+      "script": {
+        "command": ["/usr/local/libexec/recorder-hook", "rotate"],
+        "run_on_replay": false,
+        "timeout_sec": 10
+      }
+    }
+  ]
+}
+```
+
 ## Example Configuration
 
 ```json
