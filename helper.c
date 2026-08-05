@@ -59,9 +59,9 @@ uint32_t read_u32_le(const void *src)
 	const unsigned char *p = src;
 
 	return ((uint32_t)p[0])
-	     | ((uint32_t)p[1] << 8)
-	     | ((uint32_t)p[2] << 16)
-	     | ((uint32_t)p[3] << 24);
+			| ((uint32_t)p[1] << 8)
+			| ((uint32_t)p[2] << 16)
+			| ((uint32_t)p[3] << 24);
 }
 
 uint64_t read_u64_le(const void *src)
@@ -69,13 +69,13 @@ uint64_t read_u64_le(const void *src)
 	const unsigned char *p = src;
 
 	return ((uint64_t)p[0])
-	     | ((uint64_t)p[1] << 8)
-	     | ((uint64_t)p[2] << 16)
-	     | ((uint64_t)p[3] << 24)
-	     | ((uint64_t)p[4] << 32)
-	     | ((uint64_t)p[5] << 40)
-	     | ((uint64_t)p[6] << 48)
-	     | ((uint64_t)p[7] << 56);
+			| ((uint64_t)p[1] << 8)
+			| ((uint64_t)p[2] << 16)
+			| ((uint64_t)p[3] << 24)
+			| ((uint64_t)p[4] << 32)
+			| ((uint64_t)p[5] << 40)
+			| ((uint64_t)p[6] << 48)
+			| ((uint64_t)p[7] << 56);
 }
 
 void write_u32_le(void *dst, uint32_t value)
@@ -139,7 +139,7 @@ int write_framed_chunk(FILE *fp, const void *buf, uint32_t size)
 }
 
 int read_framed_chunk_header(const void *buf, size_t remaining,
-                             uint32_t *chunk_size, size_t *header_size)
+								uint32_t *chunk_size, size_t *header_size)
 {
 	if (remaining < RECORDER_FRAME_HEADER_SIZE) {
 		return -1;

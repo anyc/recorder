@@ -11,7 +11,11 @@ REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
 FLATCC_PKG ?= flatccrt
 FLATCC_MODE ?= sysroot
-FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),flatcc/src/runtime/builder.o flatcc/src/runtime/refmap.o flatcc/src/runtime/emitter.o flatcc/src/runtime/verifier.o,)
+FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),\
+	flatcc/src/runtime/builder.o \
+	flatcc/src/runtime/refmap.o \
+	flatcc/src/runtime/emitter.o \
+	flatcc/src/runtime/verifier.o,)
 FLATCC_CPPFLAGS = $(if $(filter repo,$(FLATCC_MODE)),-Iflatcc/include/,$(shell $(PKG_CONFIG) --cflags $(FLATCC_PKG)))
 FLATCC_LIBS = $(if $(filter repo,$(FLATCC_MODE)),,$(shell $(PKG_CONFIG) --libs $(FLATCC_PKG)))
 
