@@ -160,11 +160,9 @@ static int boot_matches(const PrintContext *pc, const SegmentHeader *header)
 			strncmp(header->boot_id, pc->boot_id_filter, filter_len) == 0;
 }
 
-static int entry_matches(const PrintContext *pc, journal_Entry_table_t entry)
+static int entry_matches_values(const PrintContext *pc, uint64_t realtime_ts,
+								const char *unit)
 {
-	const char *unit;
-	uint64_t realtime_ts = journal_Entry_realtime_ts(entry);
-
 	if (pc->have_since && realtime_ts < pc->since_ts) {
 		return 0;
 	}
@@ -174,8 +172,20 @@ static int entry_matches(const PrintContext *pc, journal_Entry_table_t entry)
 	if (!pc->unit_filter) {
 		return 1;
 	}
-	unit = journal_Entry_unit(entry);
 	return unit && strcmp(unit, pc->unit_filter) == 0;
+}
+
+static int entry_matches(const PrintContext *pc, journal_FullEntry_table_t entry)
+{
+	return entry_matches_values(pc, journal_FullEntry_realtime_ts(entry),
+							journal_FullEntry_unit(entry));
+}
+
+static int compact_entry_matches(const PrintContext *pc,
+							journal_CompactEntry_table_t entry)
+{
+	return entry_matches_values(pc, journal_CompactEntry_realtime_ts(entry),
+							journal_CompactEntry_unit(entry));
 }
 
 static void format_realtime(uint64_t realtime_ts, char *buf, size_t bufsz)
@@ -285,18 +295,18 @@ static void free_player_entries(PlayerEntry *entries, size_t count)
 	free(entries);
 }
 
-static int copy_player_entry(PlayerEntry *dst, journal_Entry_table_t src)
+static int copy_player_entry(PlayerEntry *dst, journal_FullEntry_table_t src)
 {
-	const char *hostname = journal_Entry_hostname(src);
-	const char *comm = journal_Entry_comm(src);
-	const char *unit = journal_Entry_unit(src);
-	const char *exe = journal_Entry_exe(src);
-	const char *message = journal_Entry_message(src);
+	const char *hostname = journal_FullEntry_hostname(src);
+	const char *comm = journal_FullEntry_comm(src);
+	const char *unit = journal_FullEntry_unit(src);
+	const char *exe = journal_FullEntry_exe(src);
+	const char *message = journal_FullEntry_message(src);
 
 	memset(dst, 0, sizeof(*dst));
-	dst->realtime_ts = journal_Entry_realtime_ts(src);
+	dst->realtime_ts = journal_FullEntry_realtime_ts(src);
 	dst->order = 0;
-	dst->pid = journal_Entry_pid(src);
+	dst->pid = journal_FullEntry_pid(src);
 	dst->hostname = hostname ? strdup(hostname) : NULL;
 	dst->comm = comm ? strdup(comm) : NULL;
 	dst->unit = unit ? strdup(unit) : NULL;
@@ -316,7 +326,28 @@ static int copy_player_entry(PlayerEntry *dst, journal_Entry_table_t src)
 	return 0;
 }
 
-static int append_player_entry(PrintContext *pc, journal_Entry_table_t entry)
+static int copy_compact_player_entry(PlayerEntry *dst,
+							journal_CompactEntry_table_t src)
+{
+	const char *unit = journal_CompactEntry_unit(src);
+	const char *message = journal_CompactEntry_message(src);
+
+	memset(dst, 0, sizeof(*dst));
+	dst->realtime_ts = journal_CompactEntry_realtime_ts(src);
+	dst->order = 0;
+	dst->pid = journal_CompactEntry_pid(src);
+	dst->unit = unit ? strdup(unit) : NULL;
+	dst->message = message ? strdup(message) : NULL;
+	if ((unit && !dst->unit) || (message && !dst->message)) {
+		free(dst->unit);
+		free(dst->message);
+		memset(dst, 0, sizeof(*dst));
+		return -1;
+	}
+	return 0;
+}
+
+static int append_player_entry(PrintContext *pc, journal_FullEntry_table_t entry)
 {
 	PlayerEntry *tmp;
 	size_t new_capacity;
@@ -335,7 +366,32 @@ static int append_player_entry(PrintContext *pc, journal_Entry_table_t entry)
 	}
 	pc->entries[pc->entry_count].order = pc->entry_count;
 	pc->entries[pc->entry_count].follow_new = pc->initial_follow_scan &&
-			journal_Entry_realtime_ts(entry) >= pc->follow_start_ts;
+			journal_FullEntry_realtime_ts(entry) >= pc->follow_start_ts;
+	pc->entry_count++;
+	return 0;
+}
+
+static int append_compact_player_entry(PrintContext *pc,
+							journal_CompactEntry_table_t entry)
+{
+	PlayerEntry *tmp;
+	size_t new_capacity;
+
+	if (pc->entry_count == pc->entry_capacity) {
+		new_capacity = pc->entry_capacity ? pc->entry_capacity * 2 : 64;
+		tmp = realloc(pc->entries, new_capacity * sizeof(*tmp));
+		if (!tmp) {
+			return -1;
+		}
+		pc->entries = tmp;
+		pc->entry_capacity = new_capacity;
+	}
+	if (copy_compact_player_entry(&pc->entries[pc->entry_count], entry) != 0) {
+		return -1;
+	}
+	pc->entries[pc->entry_count].order = pc->entry_count;
+	pc->entries[pc->entry_count].follow_new = pc->initial_follow_scan &&
+			journal_CompactEntry_realtime_ts(entry) >= pc->follow_start_ts;
 	pc->entry_count++;
 	return 0;
 }
@@ -435,9 +491,6 @@ static int print_frame(const SegmentHeader *header,
 						void *ctx)
 {
 	PrintContext *pc = ctx;
-	journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
-	flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
-	size_t n = flatbuffers_uint32_vec_len(entries);
 	size_t i;
 
 	(void)chunk_size;
@@ -445,11 +498,26 @@ static int print_frame(const SegmentHeader *header,
 	if (frame->file_offset < pc->min_frame_offset || !boot_matches(pc, header)) {
 		return 0;
 	}
-	for (i = 0; i < n; i++) {
-		journal_Entry_table_t e = journal_Entry_vec_at(entries, i);
+	if ((header->flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0) {
+		journal_DefaultChunk_table_t chunk = journal_DefaultChunk_as_root(chunk_buf);
+		flatbuffers_uint32_vec_t entries = journal_DefaultChunk_entries(chunk);
+		size_t n = flatbuffers_uint32_vec_len(entries);
 
-		if (entry_matches(pc, e)) {
-			if (append_player_entry(pc, e) != 0) {
+		for (i = 0; i < n; i++) {
+			journal_CompactEntry_table_t e = journal_CompactEntry_vec_at(entries, i);
+			if (compact_entry_matches(pc, e) &&
+				append_compact_player_entry(pc, e) != 0) {
+				return -1;
+			}
+		}
+	} else {
+		journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
+		flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
+		size_t n = flatbuffers_uint32_vec_len(entries);
+
+		for (i = 0; i < n; i++) {
+			journal_FullEntry_table_t e = journal_FullEntry_vec_at(entries, i);
+			if (entry_matches(pc, e) && append_player_entry(pc, e) != 0) {
 				return -1;
 			}
 		}

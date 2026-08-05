@@ -300,7 +300,14 @@ static int segment_scan_impl(const void *buf, size_t size, segment_frame_cb cb,
 			if (drv < 0) {
 				break;
 			}
-			if (journal_Chunk_verify_as_root(chunk_buf, chunk_size) != flatcc_verify_ok) {
+			int verify_rv;
+
+			if ((header.flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0) {
+				verify_rv = journal_DefaultChunk_verify_as_root(chunk_buf, chunk_size);
+			} else {
+				verify_rv = journal_Chunk_verify_as_root(chunk_buf, chunk_size);
+			}
+			if (verify_rv != flatcc_verify_ok) {
 				if (drv > 0) {
 					free(chunk_buf);
 				}

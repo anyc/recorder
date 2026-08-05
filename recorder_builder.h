@@ -17,90 +17,185 @@
 #define flatbuffers_extension "bin"
 #endif
 
-static const flatbuffers_voffset_t __journal_Entry_required[] = { 0 };
-typedef flatbuffers_ref_t journal_Entry_ref_t;
-static journal_Entry_ref_t journal_Entry_clone(flatbuffers_builder_t *B, journal_Entry_table_t t);
-__flatbuffers_build_table(flatbuffers_, journal_Entry, 13)
+static const flatbuffers_voffset_t __journal_Field_required[] = { 0 };
+typedef flatbuffers_ref_t journal_Field_ref_t;
+static journal_Field_ref_t journal_Field_clone(flatbuffers_builder_t *B, journal_Field_table_t t);
+__flatbuffers_build_table(flatbuffers_, journal_Field, 2)
+
+static const flatbuffers_voffset_t __journal_CompactEntry_required[] = { 0 };
+typedef flatbuffers_ref_t journal_CompactEntry_ref_t;
+static journal_CompactEntry_ref_t journal_CompactEntry_clone(flatbuffers_builder_t *B, journal_CompactEntry_table_t t);
+__flatbuffers_build_table(flatbuffers_, journal_CompactEntry, 6)
+
+static const flatbuffers_voffset_t __journal_FullEntry_required[] = { 0 };
+typedef flatbuffers_ref_t journal_FullEntry_ref_t;
+static journal_FullEntry_ref_t journal_FullEntry_clone(flatbuffers_builder_t *B, journal_FullEntry_table_t t);
+__flatbuffers_build_table(flatbuffers_, journal_FullEntry, 14)
 
 static const flatbuffers_voffset_t __journal_Chunk_required[] = { 0 };
 typedef flatbuffers_ref_t journal_Chunk_ref_t;
 static journal_Chunk_ref_t journal_Chunk_clone(flatbuffers_builder_t *B, journal_Chunk_table_t t);
 __flatbuffers_build_table(flatbuffers_, journal_Chunk, 1)
 
-#define __journal_Entry_formal_args ,\
+static const flatbuffers_voffset_t __journal_DefaultChunk_required[] = { 0 };
+typedef flatbuffers_ref_t journal_DefaultChunk_ref_t;
+static journal_DefaultChunk_ref_t journal_DefaultChunk_clone(flatbuffers_builder_t *B, journal_DefaultChunk_table_t t);
+__flatbuffers_build_table(flatbuffers_, journal_DefaultChunk, 1)
+
+#define __journal_Field_formal_args , flatbuffers_string_ref_t v0, flatbuffers_uint8_vec_ref_t v1
+#define __journal_Field_call_args , v0, v1
+static inline journal_Field_ref_t journal_Field_create(flatbuffers_builder_t *B __journal_Field_formal_args);
+__flatbuffers_build_table_prolog(flatbuffers_, journal_Field, journal_Field_file_identifier, journal_Field_type_identifier)
+
+#define __journal_CompactEntry_formal_args ,\
+  uint64_t v0, uint64_t v1, uint8_t v2, flatbuffers_string_ref_t v3, uint32_t v4, flatbuffers_string_ref_t v5
+#define __journal_CompactEntry_call_args ,\
+  v0, v1, v2, v3, v4, v5
+static inline journal_CompactEntry_ref_t journal_CompactEntry_create(flatbuffers_builder_t *B __journal_CompactEntry_formal_args);
+__flatbuffers_build_table_prolog(flatbuffers_, journal_CompactEntry, journal_CompactEntry_file_identifier, journal_CompactEntry_type_identifier)
+
+#define __journal_FullEntry_formal_args ,\
   uint64_t v0, uint64_t v1, uint8_t v2, flatbuffers_string_ref_t v3,\
-  flatbuffers_string_ref_t v4, flatbuffers_string_ref_t v5, uint32_t v6, uint32_t v7,\
-  uint32_t v8, flatbuffers_string_ref_t v9, flatbuffers_string_ref_t v10, flatbuffers_string_ref_t v11, uint16_t v12
-#define __journal_Entry_call_args ,\
+  journal_Field_vec_ref_t v4, flatbuffers_string_ref_t v5, flatbuffers_string_ref_t v6, uint32_t v7,\
+  uint32_t v8, uint32_t v9, flatbuffers_string_ref_t v10, flatbuffers_string_ref_t v11, flatbuffers_string_ref_t v12, uint16_t v13
+#define __journal_FullEntry_call_args ,\
   v0, v1, v2, v3,\
   v4, v5, v6, v7,\
-  v8, v9, v10, v11, v12
-static inline journal_Entry_ref_t journal_Entry_create(flatbuffers_builder_t *B __journal_Entry_formal_args);
-__flatbuffers_build_table_prolog(flatbuffers_, journal_Entry, journal_Entry_file_identifier, journal_Entry_type_identifier)
+  v8, v9, v10, v11, v12, v13
+static inline journal_FullEntry_ref_t journal_FullEntry_create(flatbuffers_builder_t *B __journal_FullEntry_formal_args);
+__flatbuffers_build_table_prolog(flatbuffers_, journal_FullEntry, journal_FullEntry_file_identifier, journal_FullEntry_type_identifier)
 
-#define __journal_Chunk_formal_args , journal_Entry_vec_ref_t v0
+#define __journal_Chunk_formal_args , journal_FullEntry_vec_ref_t v0
 #define __journal_Chunk_call_args , v0
 static inline journal_Chunk_ref_t journal_Chunk_create(flatbuffers_builder_t *B __journal_Chunk_formal_args);
 __flatbuffers_build_table_prolog(flatbuffers_, journal_Chunk, journal_Chunk_file_identifier, journal_Chunk_type_identifier)
 
-__flatbuffers_build_scalar_field(0, flatbuffers_, journal_Entry_realtime_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_Entry)
-__flatbuffers_build_scalar_field(1, flatbuffers_, journal_Entry_monotonic_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_Entry)
-__flatbuffers_build_scalar_field(2, flatbuffers_, journal_Entry_priority, flatbuffers_uint8, uint8_t, 1, 1, UINT8_C(0), journal_Entry)
-__flatbuffers_build_string_field(3, flatbuffers_, journal_Entry_message, journal_Entry)
-__flatbuffers_build_string_field(4, flatbuffers_, journal_Entry_message_id, journal_Entry)
-__flatbuffers_build_string_field(5, flatbuffers_, journal_Entry_unit, journal_Entry)
-__flatbuffers_build_scalar_field(6, flatbuffers_, journal_Entry_pid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_Entry)
-__flatbuffers_build_scalar_field(7, flatbuffers_, journal_Entry_uid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_Entry)
-__flatbuffers_build_scalar_field(8, flatbuffers_, journal_Entry_gid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_Entry)
-__flatbuffers_build_string_field(9, flatbuffers_, journal_Entry_hostname, journal_Entry)
-__flatbuffers_build_string_field(10, flatbuffers_, journal_Entry_comm, journal_Entry)
-__flatbuffers_build_string_field(11, flatbuffers_, journal_Entry_exe, journal_Entry)
-__flatbuffers_build_scalar_field(12, flatbuffers_, journal_Entry_errno, flatbuffers_uint16, uint16_t, 2, 2, UINT16_C(0), journal_Entry)
+#define __journal_DefaultChunk_formal_args , journal_CompactEntry_vec_ref_t v0
+#define __journal_DefaultChunk_call_args , v0
+static inline journal_DefaultChunk_ref_t journal_DefaultChunk_create(flatbuffers_builder_t *B __journal_DefaultChunk_formal_args);
+__flatbuffers_build_table_prolog(flatbuffers_, journal_DefaultChunk, journal_DefaultChunk_file_identifier, journal_DefaultChunk_type_identifier)
 
-static inline journal_Entry_ref_t journal_Entry_create(flatbuffers_builder_t *B __journal_Entry_formal_args)
+__flatbuffers_build_string_field(0, flatbuffers_, journal_Field_name, journal_Field)
+__flatbuffers_build_vector_field(1, flatbuffers_, journal_Field_value, flatbuffers_uint8, uint8_t, journal_Field)
+
+static inline journal_Field_ref_t journal_Field_create(flatbuffers_builder_t *B __journal_Field_formal_args)
 {
-    if (journal_Entry_start(B)
-        || journal_Entry_realtime_ts_add(B, v0)
-        || journal_Entry_monotonic_ts_add(B, v1)
-        || journal_Entry_message_add(B, v3)
-        || journal_Entry_message_id_add(B, v4)
-        || journal_Entry_unit_add(B, v5)
-        || journal_Entry_pid_add(B, v6)
-        || journal_Entry_uid_add(B, v7)
-        || journal_Entry_gid_add(B, v8)
-        || journal_Entry_hostname_add(B, v9)
-        || journal_Entry_comm_add(B, v10)
-        || journal_Entry_exe_add(B, v11)
-        || journal_Entry_errno_add(B, v12)
-        || journal_Entry_priority_add(B, v2)) {
+    if (journal_Field_start(B)
+        || journal_Field_name_add(B, v0)
+        || journal_Field_value_add(B, v1)) {
         return 0;
     }
-    return journal_Entry_end(B);
+    return journal_Field_end(B);
 }
 
-static journal_Entry_ref_t journal_Entry_clone(flatbuffers_builder_t *B, journal_Entry_table_t t)
+static journal_Field_ref_t journal_Field_clone(flatbuffers_builder_t *B, journal_Field_table_t t)
 {
     __flatbuffers_memoize_begin(B, t);
-    if (journal_Entry_start(B)
-        || journal_Entry_realtime_ts_pick(B, t)
-        || journal_Entry_monotonic_ts_pick(B, t)
-        || journal_Entry_message_pick(B, t)
-        || journal_Entry_message_id_pick(B, t)
-        || journal_Entry_unit_pick(B, t)
-        || journal_Entry_pid_pick(B, t)
-        || journal_Entry_uid_pick(B, t)
-        || journal_Entry_gid_pick(B, t)
-        || journal_Entry_hostname_pick(B, t)
-        || journal_Entry_comm_pick(B, t)
-        || journal_Entry_exe_pick(B, t)
-        || journal_Entry_errno_pick(B, t)
-        || journal_Entry_priority_pick(B, t)) {
+    if (journal_Field_start(B)
+        || journal_Field_name_pick(B, t)
+        || journal_Field_value_pick(B, t)) {
         return 0;
     }
-    __flatbuffers_memoize_end(B, t, journal_Entry_end(B));
+    __flatbuffers_memoize_end(B, t, journal_Field_end(B));
 }
 
-__flatbuffers_build_table_vector_field(0, flatbuffers_, journal_Chunk_entries, journal_Entry, journal_Chunk)
+__flatbuffers_build_scalar_field(0, flatbuffers_, journal_CompactEntry_realtime_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_CompactEntry)
+__flatbuffers_build_scalar_field(1, flatbuffers_, journal_CompactEntry_monotonic_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_CompactEntry)
+__flatbuffers_build_scalar_field(2, flatbuffers_, journal_CompactEntry_priority, flatbuffers_uint8, uint8_t, 1, 1, UINT8_C(0), journal_CompactEntry)
+__flatbuffers_build_string_field(3, flatbuffers_, journal_CompactEntry_message, journal_CompactEntry)
+__flatbuffers_build_scalar_field(4, flatbuffers_, journal_CompactEntry_pid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_CompactEntry)
+__flatbuffers_build_string_field(5, flatbuffers_, journal_CompactEntry_unit, journal_CompactEntry)
+
+static inline journal_CompactEntry_ref_t journal_CompactEntry_create(flatbuffers_builder_t *B __journal_CompactEntry_formal_args)
+{
+    if (journal_CompactEntry_start(B)
+        || journal_CompactEntry_realtime_ts_add(B, v0)
+        || journal_CompactEntry_monotonic_ts_add(B, v1)
+        || journal_CompactEntry_message_add(B, v3)
+        || journal_CompactEntry_pid_add(B, v4)
+        || journal_CompactEntry_unit_add(B, v5)
+        || journal_CompactEntry_priority_add(B, v2)) {
+        return 0;
+    }
+    return journal_CompactEntry_end(B);
+}
+
+static journal_CompactEntry_ref_t journal_CompactEntry_clone(flatbuffers_builder_t *B, journal_CompactEntry_table_t t)
+{
+    __flatbuffers_memoize_begin(B, t);
+    if (journal_CompactEntry_start(B)
+        || journal_CompactEntry_realtime_ts_pick(B, t)
+        || journal_CompactEntry_monotonic_ts_pick(B, t)
+        || journal_CompactEntry_message_pick(B, t)
+        || journal_CompactEntry_pid_pick(B, t)
+        || journal_CompactEntry_unit_pick(B, t)
+        || journal_CompactEntry_priority_pick(B, t)) {
+        return 0;
+    }
+    __flatbuffers_memoize_end(B, t, journal_CompactEntry_end(B));
+}
+
+__flatbuffers_build_scalar_field(0, flatbuffers_, journal_FullEntry_realtime_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_FullEntry)
+__flatbuffers_build_scalar_field(1, flatbuffers_, journal_FullEntry_monotonic_ts, flatbuffers_uint64, uint64_t, 8, 8, UINT64_C(0), journal_FullEntry)
+__flatbuffers_build_scalar_field(2, flatbuffers_, journal_FullEntry_priority, flatbuffers_uint8, uint8_t, 1, 1, UINT8_C(0), journal_FullEntry)
+__flatbuffers_build_string_field(3, flatbuffers_, journal_FullEntry_message, journal_FullEntry)
+__flatbuffers_build_table_vector_field(4, flatbuffers_, journal_FullEntry_fields, journal_Field, journal_FullEntry)
+__flatbuffers_build_string_field(5, flatbuffers_, journal_FullEntry_message_id, journal_FullEntry)
+__flatbuffers_build_string_field(6, flatbuffers_, journal_FullEntry_unit, journal_FullEntry)
+__flatbuffers_build_scalar_field(7, flatbuffers_, journal_FullEntry_pid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_FullEntry)
+__flatbuffers_build_scalar_field(8, flatbuffers_, journal_FullEntry_uid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_FullEntry)
+__flatbuffers_build_scalar_field(9, flatbuffers_, journal_FullEntry_gid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_FullEntry)
+__flatbuffers_build_string_field(10, flatbuffers_, journal_FullEntry_hostname, journal_FullEntry)
+__flatbuffers_build_string_field(11, flatbuffers_, journal_FullEntry_comm, journal_FullEntry)
+__flatbuffers_build_string_field(12, flatbuffers_, journal_FullEntry_exe, journal_FullEntry)
+__flatbuffers_build_scalar_field(13, flatbuffers_, journal_FullEntry_errno, flatbuffers_uint16, uint16_t, 2, 2, UINT16_C(0), journal_FullEntry)
+
+static inline journal_FullEntry_ref_t journal_FullEntry_create(flatbuffers_builder_t *B __journal_FullEntry_formal_args)
+{
+    if (journal_FullEntry_start(B)
+        || journal_FullEntry_realtime_ts_add(B, v0)
+        || journal_FullEntry_monotonic_ts_add(B, v1)
+        || journal_FullEntry_message_add(B, v3)
+        || journal_FullEntry_fields_add(B, v4)
+        || journal_FullEntry_message_id_add(B, v5)
+        || journal_FullEntry_unit_add(B, v6)
+        || journal_FullEntry_pid_add(B, v7)
+        || journal_FullEntry_uid_add(B, v8)
+        || journal_FullEntry_gid_add(B, v9)
+        || journal_FullEntry_hostname_add(B, v10)
+        || journal_FullEntry_comm_add(B, v11)
+        || journal_FullEntry_exe_add(B, v12)
+        || journal_FullEntry_errno_add(B, v13)
+        || journal_FullEntry_priority_add(B, v2)) {
+        return 0;
+    }
+    return journal_FullEntry_end(B);
+}
+
+static journal_FullEntry_ref_t journal_FullEntry_clone(flatbuffers_builder_t *B, journal_FullEntry_table_t t)
+{
+    __flatbuffers_memoize_begin(B, t);
+    if (journal_FullEntry_start(B)
+        || journal_FullEntry_realtime_ts_pick(B, t)
+        || journal_FullEntry_monotonic_ts_pick(B, t)
+        || journal_FullEntry_message_pick(B, t)
+        || journal_FullEntry_fields_pick(B, t)
+        || journal_FullEntry_message_id_pick(B, t)
+        || journal_FullEntry_unit_pick(B, t)
+        || journal_FullEntry_pid_pick(B, t)
+        || journal_FullEntry_uid_pick(B, t)
+        || journal_FullEntry_gid_pick(B, t)
+        || journal_FullEntry_hostname_pick(B, t)
+        || journal_FullEntry_comm_pick(B, t)
+        || journal_FullEntry_exe_pick(B, t)
+        || journal_FullEntry_errno_pick(B, t)
+        || journal_FullEntry_priority_pick(B, t)) {
+        return 0;
+    }
+    __flatbuffers_memoize_end(B, t, journal_FullEntry_end(B));
+}
+
+__flatbuffers_build_table_vector_field(0, flatbuffers_, journal_Chunk_entries, journal_FullEntry, journal_Chunk)
 
 static inline journal_Chunk_ref_t journal_Chunk_create(flatbuffers_builder_t *B __journal_Chunk_formal_args)
 {
@@ -119,6 +214,27 @@ static journal_Chunk_ref_t journal_Chunk_clone(flatbuffers_builder_t *B, journal
         return 0;
     }
     __flatbuffers_memoize_end(B, t, journal_Chunk_end(B));
+}
+
+__flatbuffers_build_table_vector_field(0, flatbuffers_, journal_DefaultChunk_entries, journal_CompactEntry, journal_DefaultChunk)
+
+static inline journal_DefaultChunk_ref_t journal_DefaultChunk_create(flatbuffers_builder_t *B __journal_DefaultChunk_formal_args)
+{
+    if (journal_DefaultChunk_start(B)
+        || journal_DefaultChunk_entries_add(B, v0)) {
+        return 0;
+    }
+    return journal_DefaultChunk_end(B);
+}
+
+static journal_DefaultChunk_ref_t journal_DefaultChunk_clone(flatbuffers_builder_t *B, journal_DefaultChunk_table_t t)
+{
+    __flatbuffers_memoize_begin(B, t);
+    if (journal_DefaultChunk_start(B)
+        || journal_DefaultChunk_entries_pick(B, t)) {
+        return 0;
+    }
+    __flatbuffers_memoize_end(B, t, journal_DefaultChunk_end(B));
 }
 
 #include "flatcc/flatcc_epilogue.h"

@@ -65,6 +65,13 @@ An explicit cursor path can be selected with `--cursor PATH` (or `-c PATH`).
 When specified, recorder uses that path regardless of its filesystem type and
 updates an existing file or device in place. A missing path is created.
 
+To read a systemd journal namespace instead of the default namespace, use
+`--namespace NAME` (or `-n NAME`).
+
+For isolated tests, recorder's storage directory can be overridden with
+`--log-dir PATH` (or `-l PATH`). This directory includes the segments, indexes,
+state, lock, and cursor files for that run.
+
 Run the player on one segment:
 
 ```sh
@@ -76,6 +83,121 @@ Run the player on a whole recorder directory:
 ```sh
 ./player /var/log/recorder
 ```
+
+## Storage Comparison
+
+To measure how much space journald and recorder consume over the same period:
+
+```sh
+python3 scripts/compare_storage.py \
+  --duration 3600 \
+  --interval 60 \
+  --csv /tmp/recorder-storage.csv
+```
+
+The script reports absolute logical and physical usage, allocation growth,
+journal entries observed during the test, file counts, and the physical space
+saved by recorder relative to journald. Journald may reuse preallocated file
+space, so entry counts can increase even when allocation growth is zero. It
+measures storage only and does not compare stored fields.
+
+For a repeatable namespace benchmark, use `scripts/benchmark_storage.py`:
+
+```sh
+python3 scripts/benchmark_storage.py config \
+  --namespace recorder-bench \
+  --output /tmp/journald@recorder-bench.conf
+
+python3 scripts/benchmark_storage.py capture \
+  --since "1 day ago" \
+  --output /tmp/recorder-bench.log
+```
+
+Copy the generated config as instructed by the script, clear the namespace's
+old journal files, and run the baseline replay:
+
+```sh
+python3 scripts/benchmark_storage.py replay \
+  --namespace recorder-bench \
+  --input /tmp/recorder-bench.log
+```
+
+Replay uses `sudo systemd-run` so it can create a system service assigned to
+the namespace. Use `--run-as USER` to run the replay process unprivileged, or
+`--no-sudo` when already running as root.
+
+For the recorder run, configure the namespace with `Storage=volatile`, start
+recorder with a fresh output directory, and replay the same input again:
+
+```sh
+recorder --namespace recorder-bench --log-dir /tmp/recorder-bench-output
+```
+
+Measure the persistent namespace directory for the journald run and
+`/tmp/recorder-bench-output` for the recorder run with `compare_storage.py`.
+
+The complete workflow can also be run interactively. It captures the input,
+creates and installs the namespace configuration through prompted `sudo`
+commands, runs both fresh-storage phases, prints the result, and offers to
+remove the namespace data and temporary files. A differing existing namespace
+configuration is backed up and always restored afterward; an identical config
+does not create a redundant backup. Existing journal data must be explicitly
+approved for deletion:
+
+Before the first privileged operation, it prints the complete `sudo` command
+plan. The recorder transient unit is started with `User=` set to the user who
+invoked the benchmark, so recorder itself does not run as root.
+
+```sh
+python3 scripts/benchmark_storage.py interactive \
+  --since "1 day ago" \
+  --capture-all-fields \
+  --recorder ./recorder
+```
+
+Add `--capture-all-fields` to enable all optional journald metadata fields
+that recorder currently represents (`MESSAGE_ID`, unit, hostname, comm,
+executable, PID, UID, and GID). Timestamps, priority, boot identity, and
+errno are stored by recorder regardless of this option. With the option
+enabled, arbitrary journald fields are also preserved in the entry's
+`fields` vector, including binary values. This makes the benchmark compare
+the fuller recorder entry representation.
+
+The interactive run disables journald and per-service rate limiting, verifies
+that both replays contain every input message, and waits for recorder's cursor
+to reach a fixed journal-tail cursor. `--drain-seconds` controls the short
+additional settling delay after that cursor is reached.
+
+The result compares journald and recorder physical allocation directly for the
+headline space saving. It also reports apparent size, the value from
+`journalctl --header`, and a nonzero-data extent calculated by ignoring
+trailing zero-filled journal preallocation. That extent is an upper bound, not
+an exact measure of journal object bytes. The export size is reported
+separately to show the serialized entries and metadata rather than on-disk
+storage.
+
+To compare retention capacity under an equal storage budget, use the separate
+capacity benchmark:
+
+```sh
+python3 scripts/benchmark_capacity.py \
+  --budget 20M \
+  --capture-all-fields \
+  --recorder ./recorder \
+  --player ./player
+```
+
+The script generates one oversized, random-looking workload and replays the
+same generated messages into both phases. Journald and recorder use separate
+fresh namespaces, so changing the baseline limit cannot affect recorder's
+input transport. Before recorder starts, the script verifies that its larger
+transport journal retained every generated sequence. Journald rate limiting is
+disabled in both benchmark namespaces so burst drops cannot distort the result.
+Both stores are considered full only after the oldest generated sequences have
+actually been evicted; rotation log messages and preallocated file size are
+not used as proof. The result reports retained entries, oldest retained
+sequence, actual budget utilization, logical/physical usage, and recorder's
+retention advantage.
 
 `player` scans all subdirectories under the given log root and reads any valid `.seg` files it finds.
 Player output sanitizes terminal control characters by default. Use
@@ -118,7 +240,7 @@ The config file is JSON. Before parsing, lines starting with `#` are removed, so
   "compress_enabled": true,
   "compress_min_frame_bytes": 256,
   "compress_if_smaller": true,
-  "capture_message_id": true,
+  "capture_message_id": false,
   "capture_unit": true,
   "capture_hostname": false,
   "capture_comm": false,
@@ -126,6 +248,10 @@ The config file is JSON. Before parsing, lines starting with `#` are removed, so
   "capture_pid": false,
   "capture_uid": false,
   "capture_gid": false,
+  "capture_all_fields": false,
+  "entry_format": "default",
+  "capture_fields_whitelist": [],
+  "capture_fields_blacklist": [],
   "priority_groups": [
     { "name": "high", "priorities": [0, 1, 2, 3] },
     { "name": "low", "priorities": [4, 5, 6, 7] }
@@ -169,6 +295,21 @@ The config file is JSON. Before parsing, lines starting with `#` are removed, so
   Store `_UID` when present.
 - `capture_gid`
   Store `_GID` when present.
+- `capture_all_fields`
+  Store all optional fixed fields and arbitrary journald fields in the
+  entry's `fields` vector. Field values are preserved as bytes.
+- `entry_format`
+  Select `default` for the compact entry representation or `full` for the
+  representation containing arbitrary journald fields. `capture_all_fields`
+  and `capture_message_id`, `capture_hostname`, `capture_comm`,
+  `capture_exe`, `capture_uid`, and `capture_gid` require `full`. Compact
+  entries always retain PID and support unit storage.
+- `capture_fields_whitelist`
+  Optional array of custom journald field names to store. When non-empty,
+  custom fields not in this list are skipped.
+- `capture_fields_blacklist`
+  Optional array of custom journald field names to skip. The blacklist takes
+  precedence over the whitelist.
 - `sanitize_output`
   Escape terminal control characters in `recorder -vv` output. Enabled by default.
 - `priority_groups`

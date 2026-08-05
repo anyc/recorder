@@ -41,15 +41,50 @@ static void store_u32(FILE *fp, uint32_t value)
 	fwrite(buf, 1, sizeof(buf), fp);
 }
 
+static void index_add_entry(uint64_t rt, uint64_t mono, uint8_t entry_priority,
+							const char *unit, size_t entry_index,
+							uint64_t *min_rt, uint64_t *max_rt,
+							uint64_t *min_mono, uint64_t *max_mono,
+							uint8_t *priority,
+							uint64_t *service_hashes, size_t *service_count,
+							uint8_t *overflow)
+{
+	size_t j;
+	int seen = 0;
+
+	if (entry_index == 0 || rt < *min_rt) *min_rt = rt;
+	if (entry_index == 0 || rt > *max_rt) *max_rt = rt;
+	if (entry_index == 0 || mono < *min_mono) *min_mono = mono;
+	if (entry_index == 0 || mono > *max_mono) *max_mono = mono;
+	*priority = entry_priority;
+	if (!unit) {
+		return;
+	}
+	{
+		uint64_t hash = fnv1a64(unit);
+		for (j = 0; j < *service_count; j++) {
+			if (service_hashes[j] == hash) {
+				seen = 1;
+				break;
+			}
+		}
+		if (!seen) {
+			if (*service_count < RECORDER_SERVICE_HASH_SLOTS) {
+				service_hashes[(*service_count)++] = hash;
+			} else {
+				*overflow = 1;
+			}
+		}
+	}
+}
+
 static int write_index_frame(const SegmentHeader *header,
 								const SegmentFrameInfo *frame,
 								const void *chunk_buf, size_t chunk_size,
 								void *ctx)
 {
 	IndexBuildContext *ib = ctx;
-	journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
-	flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
-	size_t n = flatbuffers_uint32_vec_len(entries);
+	size_t n = 0;
 	size_t i;
 	uint64_t min_rt = 0, max_rt = 0, min_mono = 0, max_mono = 0;
 	uint8_t priority = 0;
@@ -61,37 +96,30 @@ static int write_index_frame(const SegmentHeader *header,
 	(void)header;
 	(void)chunk_size;
 
-	for (i = 0; i < n; i++) {
-		journal_Entry_table_t e = journal_Entry_vec_at(entries, i);
-		uint64_t rt = journal_Entry_realtime_ts(e);
-		uint64_t mono = journal_Entry_monotonic_ts(e);
-		const char *unit = journal_Entry_unit(e);
-		size_t j;
-		int seen = 0;
-
-		if (i == 0 || rt < min_rt) min_rt = rt;
-		if (i == 0 || rt > max_rt) max_rt = rt;
-		if (i == 0 || mono < min_mono) min_mono = mono;
-		if (i == 0 || mono > max_mono) max_mono = mono;
-		priority = journal_Entry_priority(e);
-		if (!unit) {
-			continue;
+	if ((header->flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0) {
+		journal_DefaultChunk_table_t chunk = journal_DefaultChunk_as_root(chunk_buf);
+		flatbuffers_uint32_vec_t entries = journal_DefaultChunk_entries(chunk);
+		n = flatbuffers_uint32_vec_len(entries);
+		for (i = 0; i < n; i++) {
+			journal_CompactEntry_table_t e = journal_CompactEntry_vec_at(entries, i);
+			index_add_entry(journal_CompactEntry_realtime_ts(e),
+					journal_CompactEntry_monotonic_ts(e),
+					journal_CompactEntry_priority(e),
+					journal_CompactEntry_unit(e), i, &min_rt, &max_rt,
+					&min_mono, &max_mono, &priority, service_hashes,
+					&service_count, &overflow);
 		}
-		{
-			uint64_t hash = fnv1a64(unit);
-			for (j = 0; j < service_count; j++) {
-				if (service_hashes[j] == hash) {
-					seen = 1;
-					break;
-				}
-			}
-			if (!seen) {
-				if (service_count < RECORDER_SERVICE_HASH_SLOTS) {
-					service_hashes[service_count++] = hash;
-				} else {
-					overflow = 1;
-				}
-			}
+	} else {
+		journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
+		flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
+		n = flatbuffers_uint32_vec_len(entries);
+		for (i = 0; i < n; i++) {
+			journal_FullEntry_table_t e = journal_FullEntry_vec_at(entries, i);
+			index_add_entry(journal_FullEntry_realtime_ts(e),
+					journal_FullEntry_monotonic_ts(e), journal_FullEntry_priority(e),
+					journal_FullEntry_unit(e), i, &min_rt, &max_rt, &min_mono,
+					&max_mono, &priority, service_hashes, &service_count,
+					&overflow);
 		}
 	}
 

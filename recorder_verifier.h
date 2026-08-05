@@ -9,72 +9,176 @@
 #include "flatcc/flatcc_verifier.h"
 #include "flatcc/flatcc_prologue.h"
 
-static int journal_Entry_verify_table(flatcc_table_verifier_descriptor_t *td);
+static int journal_Field_verify_table(flatcc_table_verifier_descriptor_t *td);
+static int journal_CompactEntry_verify_table(flatcc_table_verifier_descriptor_t *td);
+static int journal_FullEntry_verify_table(flatcc_table_verifier_descriptor_t *td);
 static int journal_Chunk_verify_table(flatcc_table_verifier_descriptor_t *td);
+static int journal_DefaultChunk_verify_table(flatcc_table_verifier_descriptor_t *td);
 
-static int journal_Entry_verify_table(flatcc_table_verifier_descriptor_t *td)
+static int journal_Field_verify_table(flatcc_table_verifier_descriptor_t *td)
+{
+    int ret;
+    if ((ret = flatcc_verify_string_field(td, 0, 0) /* name */)) return ret;
+    if ((ret = flatcc_verify_vector_field(td, 1, 0, 1, 1, INT64_C(4294967295)) /* value */)) return ret;
+    return flatcc_verify_ok;
+}
+
+static inline int journal_Field_verify_as_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_Field_identifier, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_Field_identifier, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_typed_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_Field_type_identifier, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_typed_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_Field_type_identifier, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_root_with_identifier(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, fid, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_root_with_identifier_and_size(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, fid, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_root_with_type_hash(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root(buf, bufsiz, thash, &journal_Field_verify_table);
+}
+
+static inline int journal_Field_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_Field_verify_table);
+}
+
+static int journal_CompactEntry_verify_table(flatcc_table_verifier_descriptor_t *td)
 {
     int ret;
     if ((ret = flatcc_verify_field(td, 0, 8, 8) /* realtime_ts */)) return ret;
     if ((ret = flatcc_verify_field(td, 1, 8, 8) /* monotonic_ts */)) return ret;
     if ((ret = flatcc_verify_field(td, 2, 1, 1) /* priority */)) return ret;
     if ((ret = flatcc_verify_string_field(td, 3, 0) /* message */)) return ret;
-    if ((ret = flatcc_verify_string_field(td, 4, 0) /* message_id */)) return ret;
+    if ((ret = flatcc_verify_field(td, 4, 4, 4) /* pid */)) return ret;
     if ((ret = flatcc_verify_string_field(td, 5, 0) /* unit */)) return ret;
-    if ((ret = flatcc_verify_field(td, 6, 4, 4) /* pid */)) return ret;
-    if ((ret = flatcc_verify_field(td, 7, 4, 4) /* uid */)) return ret;
-    if ((ret = flatcc_verify_field(td, 8, 4, 4) /* gid */)) return ret;
-    if ((ret = flatcc_verify_string_field(td, 9, 0) /* hostname */)) return ret;
-    if ((ret = flatcc_verify_string_field(td, 10, 0) /* comm */)) return ret;
-    if ((ret = flatcc_verify_string_field(td, 11, 0) /* exe */)) return ret;
-    if ((ret = flatcc_verify_field(td, 12, 2, 2) /* errno */)) return ret;
     return flatcc_verify_ok;
 }
 
-static inline int journal_Entry_verify_as_root(const void *buf, size_t bufsiz)
+static inline int journal_CompactEntry_verify_as_root(const void *buf, size_t bufsiz)
 {
-    return flatcc_verify_table_as_root(buf, bufsiz, journal_Entry_identifier, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_CompactEntry_identifier, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_root_with_size(const void *buf, size_t bufsiz)
+static inline int journal_CompactEntry_verify_as_root_with_size(const void *buf, size_t bufsiz)
 {
-    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_Entry_identifier, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_CompactEntry_identifier, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_typed_root(const void *buf, size_t bufsiz)
+static inline int journal_CompactEntry_verify_as_typed_root(const void *buf, size_t bufsiz)
 {
-    return flatcc_verify_table_as_root(buf, bufsiz, journal_Entry_type_identifier, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_CompactEntry_type_identifier, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_typed_root_with_size(const void *buf, size_t bufsiz)
+static inline int journal_CompactEntry_verify_as_typed_root_with_size(const void *buf, size_t bufsiz)
 {
-    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_Entry_type_identifier, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_CompactEntry_type_identifier, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_root_with_identifier(const void *buf, size_t bufsiz, const char *fid)
+static inline int journal_CompactEntry_verify_as_root_with_identifier(const void *buf, size_t bufsiz, const char *fid)
 {
-    return flatcc_verify_table_as_root(buf, bufsiz, fid, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root(buf, bufsiz, fid, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_root_with_identifier_and_size(const void *buf, size_t bufsiz, const char *fid)
+static inline int journal_CompactEntry_verify_as_root_with_identifier_and_size(const void *buf, size_t bufsiz, const char *fid)
 {
-    return flatcc_verify_table_as_root_with_size(buf, bufsiz, fid, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, fid, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_root_with_type_hash(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+static inline int journal_CompactEntry_verify_as_root_with_type_hash(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
 {
-    return flatcc_verify_table_as_typed_root(buf, bufsiz, thash, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_typed_root(buf, bufsiz, thash, &journal_CompactEntry_verify_table);
 }
 
-static inline int journal_Entry_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+static inline int journal_CompactEntry_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
 {
-    return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_Entry_verify_table);
+    return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_CompactEntry_verify_table);
+}
+
+static int journal_FullEntry_verify_table(flatcc_table_verifier_descriptor_t *td)
+{
+    int ret;
+    if ((ret = flatcc_verify_field(td, 0, 8, 8) /* realtime_ts */)) return ret;
+    if ((ret = flatcc_verify_field(td, 1, 8, 8) /* monotonic_ts */)) return ret;
+    if ((ret = flatcc_verify_field(td, 2, 1, 1) /* priority */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 3, 0) /* message */)) return ret;
+    if ((ret = flatcc_verify_table_vector_field(td, 4, 0, &journal_Field_verify_table) /* fields */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 5, 0) /* message_id */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 6, 0) /* unit */)) return ret;
+    if ((ret = flatcc_verify_field(td, 7, 4, 4) /* pid */)) return ret;
+    if ((ret = flatcc_verify_field(td, 8, 4, 4) /* uid */)) return ret;
+    if ((ret = flatcc_verify_field(td, 9, 4, 4) /* gid */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 10, 0) /* hostname */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 11, 0) /* comm */)) return ret;
+    if ((ret = flatcc_verify_string_field(td, 12, 0) /* exe */)) return ret;
+    if ((ret = flatcc_verify_field(td, 13, 2, 2) /* errno */)) return ret;
+    return flatcc_verify_ok;
+}
+
+static inline int journal_FullEntry_verify_as_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_FullEntry_identifier, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_FullEntry_identifier, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_typed_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_FullEntry_type_identifier, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_typed_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_FullEntry_type_identifier, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_root_with_identifier(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, fid, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_root_with_identifier_and_size(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, fid, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_root_with_type_hash(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root(buf, bufsiz, thash, &journal_FullEntry_verify_table);
+}
+
+static inline int journal_FullEntry_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_FullEntry_verify_table);
 }
 
 static int journal_Chunk_verify_table(flatcc_table_verifier_descriptor_t *td)
 {
     int ret;
-    if ((ret = flatcc_verify_table_vector_field(td, 0, 0, &journal_Entry_verify_table) /* entries */)) return ret;
+    if ((ret = flatcc_verify_table_vector_field(td, 0, 0, &journal_FullEntry_verify_table) /* entries */)) return ret;
     return flatcc_verify_ok;
 }
 
@@ -116,6 +220,53 @@ static inline int journal_Chunk_verify_as_root_with_type_hash(const void *buf, s
 static inline int journal_Chunk_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
 {
     return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_Chunk_verify_table);
+}
+
+static int journal_DefaultChunk_verify_table(flatcc_table_verifier_descriptor_t *td)
+{
+    int ret;
+    if ((ret = flatcc_verify_table_vector_field(td, 0, 0, &journal_CompactEntry_verify_table) /* entries */)) return ret;
+    return flatcc_verify_ok;
+}
+
+static inline int journal_DefaultChunk_verify_as_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_DefaultChunk_identifier, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_DefaultChunk_identifier, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_typed_root(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, journal_DefaultChunk_type_identifier, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_typed_root_with_size(const void *buf, size_t bufsiz)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, journal_DefaultChunk_type_identifier, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_root_with_identifier(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root(buf, bufsiz, fid, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_root_with_identifier_and_size(const void *buf, size_t bufsiz, const char *fid)
+{
+    return flatcc_verify_table_as_root_with_size(buf, bufsiz, fid, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_root_with_type_hash(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root(buf, bufsiz, thash, &journal_DefaultChunk_verify_table);
+}
+
+static inline int journal_DefaultChunk_verify_as_root_with_type_hash_and_size(const void *buf, size_t bufsiz, flatbuffers_thash_t thash)
+{
+    return flatcc_verify_table_as_typed_root_with_size(buf, bufsiz, thash, &journal_DefaultChunk_verify_table);
 }
 
 #include "flatcc/flatcc_epilogue.h"

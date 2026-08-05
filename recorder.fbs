@@ -1,6 +1,20 @@
 namespace journal;
 
-table Entry {
+table Field {
+  name:string;
+  value:[ubyte];
+}
+
+table CompactEntry {
+  realtime_ts:ulong;
+  monotonic_ts:ulong;
+  priority:ubyte;
+  message:string;
+  pid:uint;
+  unit:string;
+}
+
+table FullEntry {
   // timestamps
   realtime_ts:ulong;
   monotonic_ts:ulong;
@@ -8,6 +22,7 @@ table Entry {
   // core log fields
   priority:ubyte;
   message:string;
+  fields:[Field];
   message_id:string;
   unit:string;
 
@@ -26,7 +41,11 @@ table Entry {
 }
 
 table Chunk {
-  entries:[Entry];
+  entries:[FullEntry];
+}
+
+table DefaultChunk {
+  entries:[CompactEntry];
 }
 
 root_type Chunk;

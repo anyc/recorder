@@ -82,7 +82,10 @@ static int check_frame(const SegmentHeader *header,
 	SmokeContext *sc = ctx;
 	journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
 	flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
-	journal_Entry_table_t entry;
+	journal_FullEntry_table_t entry;
+	journal_Field_vec_t fields;
+	journal_Field_table_t field;
+	flatbuffers_uint8_vec_t field_value;
 
 	(void)frame;
 	(void)chunk_size;
@@ -95,10 +98,22 @@ static int check_frame(const SegmentHeader *header,
 		fprintf(stderr, "smoke: bad entry count\n");
 		return -1;
 	}
-	entry = journal_Entry_vec_at(entries, 0);
-	if (strcmp(journal_Entry_message(entry), "hello smoke") != 0 ||
-		strcmp(journal_Entry_unit(entry), "smoke.service") != 0 ||
-		journal_Entry_priority(entry) != 5) {
+	entry = journal_FullEntry_vec_at(entries, 0);
+	fields = journal_FullEntry_fields(entry);
+	if (journal_Field_vec_len(fields) != 1) {
+		fprintf(stderr, "smoke: bad extra field count\n");
+		return -1;
+	}
+	field = journal_Field_vec_at(fields, 0);
+	field_value = journal_Field_value(field);
+	if (strcmp(journal_FullEntry_message(entry), "hello smoke") != 0 ||
+		strcmp(journal_FullEntry_unit(entry), "smoke.service") != 0 ||
+		journal_FullEntry_priority(entry) != 5 ||
+		strcmp(journal_Field_name(field), "CUSTOM_FIELD") != 0 ||
+		flatbuffers_uint8_vec_len(field_value) != 3 ||
+		flatbuffers_uint8_vec_at(field_value, 0) != 0x00 ||
+		flatbuffers_uint8_vec_at(field_value, 1) != 0xff ||
+		flatbuffers_uint8_vec_at(field_value, 2) != 0x7f) {
 		fprintf(stderr, "smoke: bad entry payload\n");
 		return -1;
 	}
@@ -111,8 +126,12 @@ int main(void)
 	flatcc_builder_t B;
 	flatbuffers_string_ref_t message_ref;
 	flatbuffers_string_ref_t unit_ref;
-	journal_Entry_ref_t entry_ref;
-	journal_Entry_vec_ref_t entries_ref;
+	flatbuffers_string_ref_t field_name_ref;
+	flatbuffers_uint8_vec_ref_t field_value_ref;
+	journal_Field_ref_t field_ref;
+	journal_Field_vec_ref_t fields_ref;
+	journal_FullEntry_ref_t entry_ref;
+	journal_FullEntry_vec_ref_t entries_ref;
 	void *chunk_buf = NULL;
 	size_t chunk_size_raw;
 	FILE *fp = NULL;
@@ -157,16 +176,27 @@ int main(void)
 	flatcc_builder_init(&B);
 	message_ref = flatbuffers_string_create_str(&B, "hello smoke");
 	unit_ref = flatbuffers_string_create_str(&B, "smoke.service");
+	field_name_ref = flatbuffers_string_create_str(&B, "CUSTOM_FIELD");
+	{
+		const uint8_t value[] = {0x00, 0xff, 0x7f};
+		field_value_ref = flatbuffers_uint8_vec_create(&B, value, sizeof(value));
+	}
+	journal_Field_start(&B);
+	journal_Field_name_add(&B, field_name_ref);
+	journal_Field_value_add(&B, field_value_ref);
+	field_ref = journal_Field_end(&B);
+	fields_ref = journal_Field_vec_create(&B, &field_ref, 1);
 
-	journal_Entry_start(&B);
-	journal_Entry_realtime_ts_add(&B, 1234);
-	journal_Entry_monotonic_ts_add(&B, 5678);
-	journal_Entry_priority_add(&B, 5);
-	journal_Entry_message_add(&B, message_ref);
-	journal_Entry_unit_add(&B, unit_ref);
-	entry_ref = journal_Entry_end(&B);
+	journal_FullEntry_start(&B);
+	journal_FullEntry_realtime_ts_add(&B, 1234);
+	journal_FullEntry_monotonic_ts_add(&B, 5678);
+	journal_FullEntry_priority_add(&B, 5);
+	journal_FullEntry_message_add(&B, message_ref);
+	journal_FullEntry_unit_add(&B, unit_ref);
+	journal_FullEntry_fields_add(&B, fields_ref);
+	entry_ref = journal_FullEntry_end(&B);
 
-	entries_ref = journal_Entry_vec_create(&B, &entry_ref, 1);
+	entries_ref = journal_FullEntry_vec_create(&B, &entry_ref, 1);
 	if (!entries_ref || !journal_Chunk_create_as_root(&B, entries_ref)) {
 		fprintf(stderr, "smoke: build chunk failed\n");
 		fclose(fp);

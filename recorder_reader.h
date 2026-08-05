@@ -19,25 +19,61 @@
 #endif
 
 
-typedef const struct journal_Entry_table *journal_Entry_table_t;
-typedef struct journal_Entry_table *journal_Entry_mutable_table_t;
-typedef const flatbuffers_uoffset_t *journal_Entry_vec_t;
-typedef flatbuffers_uoffset_t *journal_Entry_mutable_vec_t;
+typedef const struct journal_Field_table *journal_Field_table_t;
+typedef struct journal_Field_table *journal_Field_mutable_table_t;
+typedef const flatbuffers_uoffset_t *journal_Field_vec_t;
+typedef flatbuffers_uoffset_t *journal_Field_mutable_vec_t;
+typedef const struct journal_CompactEntry_table *journal_CompactEntry_table_t;
+typedef struct journal_CompactEntry_table *journal_CompactEntry_mutable_table_t;
+typedef const flatbuffers_uoffset_t *journal_CompactEntry_vec_t;
+typedef flatbuffers_uoffset_t *journal_CompactEntry_mutable_vec_t;
+typedef const struct journal_FullEntry_table *journal_FullEntry_table_t;
+typedef struct journal_FullEntry_table *journal_FullEntry_mutable_table_t;
+typedef const flatbuffers_uoffset_t *journal_FullEntry_vec_t;
+typedef flatbuffers_uoffset_t *journal_FullEntry_mutable_vec_t;
 typedef const struct journal_Chunk_table *journal_Chunk_table_t;
 typedef struct journal_Chunk_table *journal_Chunk_mutable_table_t;
 typedef const flatbuffers_uoffset_t *journal_Chunk_vec_t;
 typedef flatbuffers_uoffset_t *journal_Chunk_mutable_vec_t;
-#ifndef journal_Entry_file_identifier
-#define journal_Entry_file_identifier 0
+typedef const struct journal_DefaultChunk_table *journal_DefaultChunk_table_t;
+typedef struct journal_DefaultChunk_table *journal_DefaultChunk_mutable_table_t;
+typedef const flatbuffers_uoffset_t *journal_DefaultChunk_vec_t;
+typedef flatbuffers_uoffset_t *journal_DefaultChunk_mutable_vec_t;
+#ifndef journal_Field_file_identifier
+#define journal_Field_file_identifier 0
 #endif
-/* deprecated, use journal_Entry_file_identifier */
-#ifndef journal_Entry_identifier
-#define journal_Entry_identifier 0
+/* deprecated, use journal_Field_file_identifier */
+#ifndef journal_Field_identifier
+#define journal_Field_identifier 0
 #endif
-#define journal_Entry_type_hash ((flatbuffers_thash_t)0xc9603ca)
-#define journal_Entry_type_identifier "\xca\x03\x96\x0c"
-#ifndef journal_Entry_file_extension
-#define journal_Entry_file_extension "bin"
+#define journal_Field_type_hash ((flatbuffers_thash_t)0x91d62986)
+#define journal_Field_type_identifier "\x86\x29\xd6\x91"
+#ifndef journal_Field_file_extension
+#define journal_Field_file_extension "bin"
+#endif
+#ifndef journal_CompactEntry_file_identifier
+#define journal_CompactEntry_file_identifier 0
+#endif
+/* deprecated, use journal_CompactEntry_file_identifier */
+#ifndef journal_CompactEntry_identifier
+#define journal_CompactEntry_identifier 0
+#endif
+#define journal_CompactEntry_type_hash ((flatbuffers_thash_t)0x630c3e21)
+#define journal_CompactEntry_type_identifier "\x21\x3e\x0c\x63"
+#ifndef journal_CompactEntry_file_extension
+#define journal_CompactEntry_file_extension "bin"
+#endif
+#ifndef journal_FullEntry_file_identifier
+#define journal_FullEntry_file_identifier 0
+#endif
+/* deprecated, use journal_FullEntry_file_identifier */
+#ifndef journal_FullEntry_identifier
+#define journal_FullEntry_identifier 0
+#endif
+#define journal_FullEntry_type_hash ((flatbuffers_thash_t)0xf49c9745)
+#define journal_FullEntry_type_identifier "\x45\x97\x9c\xf4"
+#ifndef journal_FullEntry_file_extension
+#define journal_FullEntry_file_extension "bin"
 #endif
 #ifndef journal_Chunk_file_identifier
 #define journal_Chunk_file_identifier 0
@@ -51,30 +87,69 @@ typedef flatbuffers_uoffset_t *journal_Chunk_mutable_vec_t;
 #ifndef journal_Chunk_file_extension
 #define journal_Chunk_file_extension "bin"
 #endif
+#ifndef journal_DefaultChunk_file_identifier
+#define journal_DefaultChunk_file_identifier 0
+#endif
+/* deprecated, use journal_DefaultChunk_file_identifier */
+#ifndef journal_DefaultChunk_identifier
+#define journal_DefaultChunk_identifier 0
+#endif
+#define journal_DefaultChunk_type_hash ((flatbuffers_thash_t)0x3f471f54)
+#define journal_DefaultChunk_type_identifier "\x54\x1f\x47\x3f"
+#ifndef journal_DefaultChunk_file_extension
+#define journal_DefaultChunk_file_extension "bin"
+#endif
 
 
 
-struct journal_Entry_table { uint8_t unused__; };
+struct journal_Field_table { uint8_t unused__; };
 
-static inline size_t journal_Entry_vec_len(journal_Entry_vec_t vec)
+static inline size_t journal_Field_vec_len(journal_Field_vec_t vec)
 __flatbuffers_vec_len(vec)
-static inline journal_Entry_table_t journal_Entry_vec_at(journal_Entry_vec_t vec, size_t i)
-__flatbuffers_offset_vec_at(journal_Entry_table_t, vec, i, 0)
-__flatbuffers_table_as_root(journal_Entry)
+static inline journal_Field_table_t journal_Field_vec_at(journal_Field_vec_t vec, size_t i)
+__flatbuffers_offset_vec_at(journal_Field_table_t, vec, i, 0)
+__flatbuffers_table_as_root(journal_Field)
 
-__flatbuffers_define_scalar_field(0, journal_Entry, realtime_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
-__flatbuffers_define_scalar_field(1, journal_Entry, monotonic_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
-__flatbuffers_define_scalar_field(2, journal_Entry, priority, flatbuffers_uint8, uint8_t, UINT8_C(0))
-__flatbuffers_define_string_field(3, journal_Entry, message, 0)
-__flatbuffers_define_string_field(4, journal_Entry, message_id, 0)
-__flatbuffers_define_string_field(5, journal_Entry, unit, 0)
-__flatbuffers_define_scalar_field(6, journal_Entry, pid, flatbuffers_uint32, uint32_t, UINT32_C(0))
-__flatbuffers_define_scalar_field(7, journal_Entry, uid, flatbuffers_uint32, uint32_t, UINT32_C(0))
-__flatbuffers_define_scalar_field(8, journal_Entry, gid, flatbuffers_uint32, uint32_t, UINT32_C(0))
-__flatbuffers_define_string_field(9, journal_Entry, hostname, 0)
-__flatbuffers_define_string_field(10, journal_Entry, comm, 0)
-__flatbuffers_define_string_field(11, journal_Entry, exe, 0)
-__flatbuffers_define_scalar_field(12, journal_Entry, errno, flatbuffers_uint16, uint16_t, UINT16_C(0))
+__flatbuffers_define_string_field(0, journal_Field, name, 0)
+__flatbuffers_define_vector_field(1, journal_Field, value, flatbuffers_uint8_vec_t, 0)
+
+struct journal_CompactEntry_table { uint8_t unused__; };
+
+static inline size_t journal_CompactEntry_vec_len(journal_CompactEntry_vec_t vec)
+__flatbuffers_vec_len(vec)
+static inline journal_CompactEntry_table_t journal_CompactEntry_vec_at(journal_CompactEntry_vec_t vec, size_t i)
+__flatbuffers_offset_vec_at(journal_CompactEntry_table_t, vec, i, 0)
+__flatbuffers_table_as_root(journal_CompactEntry)
+
+__flatbuffers_define_scalar_field(0, journal_CompactEntry, realtime_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
+__flatbuffers_define_scalar_field(1, journal_CompactEntry, monotonic_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
+__flatbuffers_define_scalar_field(2, journal_CompactEntry, priority, flatbuffers_uint8, uint8_t, UINT8_C(0))
+__flatbuffers_define_string_field(3, journal_CompactEntry, message, 0)
+__flatbuffers_define_scalar_field(4, journal_CompactEntry, pid, flatbuffers_uint32, uint32_t, UINT32_C(0))
+__flatbuffers_define_string_field(5, journal_CompactEntry, unit, 0)
+
+struct journal_FullEntry_table { uint8_t unused__; };
+
+static inline size_t journal_FullEntry_vec_len(journal_FullEntry_vec_t vec)
+__flatbuffers_vec_len(vec)
+static inline journal_FullEntry_table_t journal_FullEntry_vec_at(journal_FullEntry_vec_t vec, size_t i)
+__flatbuffers_offset_vec_at(journal_FullEntry_table_t, vec, i, 0)
+__flatbuffers_table_as_root(journal_FullEntry)
+
+__flatbuffers_define_scalar_field(0, journal_FullEntry, realtime_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
+__flatbuffers_define_scalar_field(1, journal_FullEntry, monotonic_ts, flatbuffers_uint64, uint64_t, UINT64_C(0))
+__flatbuffers_define_scalar_field(2, journal_FullEntry, priority, flatbuffers_uint8, uint8_t, UINT8_C(0))
+__flatbuffers_define_string_field(3, journal_FullEntry, message, 0)
+__flatbuffers_define_vector_field(4, journal_FullEntry, fields, journal_Field_vec_t, 0)
+__flatbuffers_define_string_field(5, journal_FullEntry, message_id, 0)
+__flatbuffers_define_string_field(6, journal_FullEntry, unit, 0)
+__flatbuffers_define_scalar_field(7, journal_FullEntry, pid, flatbuffers_uint32, uint32_t, UINT32_C(0))
+__flatbuffers_define_scalar_field(8, journal_FullEntry, uid, flatbuffers_uint32, uint32_t, UINT32_C(0))
+__flatbuffers_define_scalar_field(9, journal_FullEntry, gid, flatbuffers_uint32, uint32_t, UINT32_C(0))
+__flatbuffers_define_string_field(10, journal_FullEntry, hostname, 0)
+__flatbuffers_define_string_field(11, journal_FullEntry, comm, 0)
+__flatbuffers_define_string_field(12, journal_FullEntry, exe, 0)
+__flatbuffers_define_scalar_field(13, journal_FullEntry, errno, flatbuffers_uint16, uint16_t, UINT16_C(0))
 
 struct journal_Chunk_table { uint8_t unused__; };
 
@@ -84,7 +159,17 @@ static inline journal_Chunk_table_t journal_Chunk_vec_at(journal_Chunk_vec_t vec
 __flatbuffers_offset_vec_at(journal_Chunk_table_t, vec, i, 0)
 __flatbuffers_table_as_root(journal_Chunk)
 
-__flatbuffers_define_vector_field(0, journal_Chunk, entries, journal_Entry_vec_t, 0)
+__flatbuffers_define_vector_field(0, journal_Chunk, entries, journal_FullEntry_vec_t, 0)
+
+struct journal_DefaultChunk_table { uint8_t unused__; };
+
+static inline size_t journal_DefaultChunk_vec_len(journal_DefaultChunk_vec_t vec)
+__flatbuffers_vec_len(vec)
+static inline journal_DefaultChunk_table_t journal_DefaultChunk_vec_at(journal_DefaultChunk_vec_t vec, size_t i)
+__flatbuffers_offset_vec_at(journal_DefaultChunk_table_t, vec, i, 0)
+__flatbuffers_table_as_root(journal_DefaultChunk)
+
+__flatbuffers_define_vector_field(0, journal_DefaultChunk, entries, journal_CompactEntry_vec_t, 0)
 
 
 #include "flatcc/flatcc_epilogue.h"
