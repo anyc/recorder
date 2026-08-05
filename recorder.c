@@ -4,6 +4,7 @@
 #include <dirent.h>
 #include <errno.h>
 #include <fcntl.h>
+#include <getopt.h>
 #include <inttypes.h>
 #include <jansson.h>
 #include <limits.h>
@@ -13,9 +14,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/file.h>
 #include <sys/stat.h>
+#include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
+
+#include <linux/magic.h>
 
 #include <flatcc/flatcc_builder.h>
 #include <systemd/sd-journal.h>
@@ -41,7 +46,7 @@
 #define DEFAULT_SEGMENT_MAX_AGE_SEC 900u
 #define DEFAULT_DURABLE_PRIORITY_MAX 3
 #define DEFAULT_DURABILITY_FLUSH_FRAMES 32
-#define DEFAULT_DURABILITY_FLUSH_INTERVAL_SEC 5
+#define DEFAULT_DURABILITY_FLUSH_INTERVAL_SEC 60
 #define DEFAULT_LOG_MAX_BYTES (64ULL * 1024ULL * 1024ULL)
 #define DEFAULT_COMPRESS_ENABLED 1
 #define DEFAULT_COMPRESS_MIN_FRAME_BYTES 256
@@ -54,10 +59,13 @@
 #define DEFAULT_CAPTURE_PID 0
 #define DEFAULT_CAPTURE_UID 0
 #define DEFAULT_CAPTURE_GID 0
+#define DEFAULT_SANITIZE_OUTPUT 1
 #define JOURNAL_WAIT_USEC (5 * 1000000ULL)
 #define TIME_DELTA_ROTATE_THRESHOLD_USEC (10000ULL)
 #define MAX_PRIORITY_GROUPS 8
 #define MAX_GROUP_NAME_LEN 63
+#define RECORDER_CURSOR_PATH "/run/recorder/journal.cursor"
+#define RECORDER_CURSOR_MAX_BYTES 512
 
 typedef struct {
 	char name[MAX_GROUP_NAME_LEN + 1];
@@ -79,6 +87,7 @@ typedef struct {
 	int capture_pid;
 	int capture_uid;
 	int capture_gid;
+	int sanitize_output;
 	int durable_priority_max;
 	unsigned durability_flush_frames;
 	unsigned durability_flush_interval_sec;
@@ -107,6 +116,11 @@ typedef struct {
 } BootRegistry;
 
 typedef struct {
+	const char *data;
+	size_t len;
+} JournalField;
+
+typedef struct {
 	uint64_t realtime_ts;
 	uint64_t monotonic_ts;
 	uint32_t pid;
@@ -115,13 +129,13 @@ typedef struct {
 	uint32_t boot_seq;
 	uint8_t priority;
 	uint16_t errno_value;
-	const char *boot_id;
-	const char *message;
-	const char *message_id;
-	const char *hostname;
-	const char *unit;
-	const char *comm;
-	const char *exe;
+	char boot_id[RECORDER_BOOT_ID_SIZE + 1];
+	JournalField message;
+	JournalField message_id;
+	JournalField hostname;
+	JournalField unit;
+	JournalField comm;
+	JournalField exe;
 } LogEntry;
 
 typedef struct {
@@ -143,6 +157,7 @@ typedef struct {
 	uint64_t last_monotonic_ts;
 	int64_t initial_time_delta;
 	time_t opened_mono_sec;
+	time_t last_chunk_flush_mono_sec;
 	time_t last_sync_mono_sec;
 	unsigned unsynced_frames;
 	int compress_enabled;
@@ -166,6 +181,11 @@ typedef struct {
 	uint64_t next_segment_seq;
 	int verbose;
 	int current_entry_pending;
+	int cursor_enabled;
+	int persistent_cursor_enabled;
+	char cursor_path[PATH_MAX];
+	char persistent_cursor_path[PATH_MAX];
+	char *pending_cursor;
 	PriorityWriter writers[MAX_PRIORITY_GROUPS];
 } Recorder;
 
@@ -195,8 +215,25 @@ static volatile sig_atomic_t g_shutdown = 0;
 
 static void on_signal(int sig)
 {
+	static const char message[] = "recorder: shutdown requested, flushing pending entries\n";
+
 	(void)sig;
 	g_shutdown = 1;
+	(void)write(STDERR_FILENO, message, sizeof(message) - 1);
+}
+
+static int install_signal_handlers(void)
+{
+	struct sigaction action;
+
+	memset(&action, 0, sizeof(action));
+	action.sa_handler = on_signal;
+	sigemptyset(&action.sa_mask);
+	if (sigaction(SIGINT, &action, NULL) != 0 ||
+		sigaction(SIGTERM, &action, NULL) != 0) {
+		return -1;
+	}
+	return 0;
 }
 
 static void recorder_config_init(RecorderConfig *cfg)
@@ -212,6 +249,7 @@ static void recorder_config_init(RecorderConfig *cfg)
 	cfg->capture_pid = DEFAULT_CAPTURE_PID;
 	cfg->capture_uid = DEFAULT_CAPTURE_UID;
 	cfg->capture_gid = DEFAULT_CAPTURE_GID;
+	cfg->sanitize_output = DEFAULT_SANITIZE_OUTPUT;
 	cfg->durable_priority_max = DEFAULT_DURABLE_PRIORITY_MAX;
 	cfg->durability_flush_frames = DEFAULT_DURABILITY_FLUSH_FRAMES;
 	cfg->durability_flush_interval_sec = DEFAULT_DURABILITY_FLUSH_INTERVAL_SEC;
@@ -297,7 +335,7 @@ static RotateDecision writer_should_rotate(const Recorder *r, const PriorityWrit
 	if (!w->open) {
 		return decision;
 	}
-	if (w->boot_id[0] != '\0' && entry->boot_id && entry->boot_id[0] != '\0' &&
+	if (w->boot_id[0] != '\0' && entry->boot_id[0] != '\0' &&
 		strcmp(w->boot_id, entry->boot_id) != 0) {
 		decision.reason = ROTATE_REASON_BOOT_ID;
 		return decision;
@@ -438,6 +476,30 @@ static int json_get_uint_default(json_t *root, const char *key, unsigned *dst)
 	value = json_integer_value(node);
 	if (value < 0 || value > UINT_MAX) {
 		fprintf(stderr, "recorder: config key '%s' out of range\n", key);
+		return -1;
+	}
+	*dst = (unsigned)value;
+	return 0;
+}
+
+static int json_get_group_uint_default(json_t *group, const char *group_name,
+										const char *key, unsigned *dst)
+{
+	json_t *node = json_object_get(group, key);
+	json_int_t value;
+
+	if (!node) {
+		return 0;
+	}
+	if (!json_is_integer(node)) {
+		fprintf(stderr, "recorder: priority group '%s' key '%s' must be integer\n",
+				group_name, key);
+		return -1;
+	}
+	value = json_integer_value(node);
+	if (value < 0 || value > UINT_MAX) {
+		fprintf(stderr, "recorder: priority group '%s' key '%s' out of range\n",
+				group_name, key);
 		return -1;
 	}
 	*dst = (unsigned)value;
@@ -619,6 +681,16 @@ static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 		strncpy(cfg->groups[i].name, json_string_value(name), MAX_GROUP_NAME_LEN);
 		cfg->groups[i].name[MAX_GROUP_NAME_LEN] = '\0';
 		cfg->groups[i].min_priority = 255;
+		cfg->groups[i].durability_flush_frames = cfg->durability_flush_frames;
+		cfg->groups[i].durability_flush_interval_sec = cfg->durability_flush_interval_sec;
+		if (json_get_group_uint_default(group, cfg->groups[i].name,
+										"durability_flush_frames",
+										&cfg->groups[i].durability_flush_frames) != 0 ||
+			json_get_group_uint_default(group, cfg->groups[i].name,
+										"durability_flush_interval_sec",
+										&cfg->groups[i].durability_flush_interval_sec) != 0) {
+			return -1;
+		}
 
 		for (j = 0; j < i; j++) {
 			if (strcmp(cfg->groups[j].name, cfg->groups[i].name) == 0) {
@@ -700,6 +772,7 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		json_get_bool_default(root, "capture_pid", &cfg->capture_pid) != 0 ||
 		json_get_bool_default(root, "capture_uid", &cfg->capture_uid) != 0 ||
 		json_get_bool_default(root, "capture_gid", &cfg->capture_gid) != 0 ||
+		json_get_bool_default(root, "sanitize_output", &cfg->sanitize_output) != 0 ||
 		json_get_int_default(root, "durable_priority_max", -1, 7, &cfg->durable_priority_max) != 0 ||
 		json_get_uint_default(root, "durability_flush_frames", &cfg->durability_flush_frames) != 0 ||
 		json_get_uint_default(root, "durability_flush_interval_sec", &cfg->durability_flush_interval_sec) != 0 ||
@@ -728,8 +801,6 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 			const char *dict_path = NULL;
 			int durable_per_frame = 0;
 
-			cfg->groups[i].durability_flush_frames = cfg->durability_flush_frames;
-			cfg->groups[i].durability_flush_interval_sec = cfg->durability_flush_interval_sec;
 			for (j = 0; j < cfg->groups[i].priority_count; j++) {
 				uint8_t prio = cfg->groups[i].priorities[j];
 				const char *candidate = cfg->static_dict_paths[prio];
@@ -762,23 +833,38 @@ out:
 	return rc;
 }
 
-static const char *journal_get(sd_journal *j, const char *field)
+static JournalField journal_get_field(sd_journal *j, const char *field)
 {
 	const void *data;
 	size_t len;
 	const char *eq;
+	JournalField value = {0};
 
 	if (sd_journal_get_data(j, field, &data, &len) < 0) {
-		return NULL;
+		return value;
 	}
 	eq = memchr(data, '=', len);
-	return eq ? eq + 1 : NULL;
+	if (!eq) {
+		return value;
+	}
+	value.data = eq + 1;
+	value.len = len - (size_t)(eq + 1 - (const char *)data);
+	return value;
 }
 
 static uint64_t journal_get_u64(sd_journal *j, const char *field)
 {
-	const char *v = journal_get(j, field);
-	return v ? strtoull(v, NULL, 10) : 0;
+	JournalField v = journal_get_field(j, field);
+	char buf[32];
+	size_t len;
+
+	if (!v.data || v.len == 0) {
+		return 0;
+	}
+	len = v.len < sizeof(buf) - 1 ? v.len : sizeof(buf) - 1;
+	memcpy(buf, v.data, len);
+	buf[len] = '\0';
+	return strtoull(buf, NULL, 10);
 }
 
 static uint32_t journal_get_u32(sd_journal *j, const char *field)
@@ -786,14 +872,69 @@ static uint32_t journal_get_u32(sd_journal *j, const char *field)
 	return (uint32_t)journal_get_u64(j, field);
 }
 
-static const char *nonempty_or_null(const char *s)
+static JournalField journal_field_nonempty(JournalField value)
 {
-	return (s && s[0] != '\0') ? s : NULL;
+	if (!value.data || value.len == 0) {
+		value.data = NULL;
+		value.len = 0;
+	}
+	return value;
 }
 
 static uint16_t clamp_u16(uint64_t value)
 {
 	return value > UINT16_MAX ? UINT16_MAX : (uint16_t)value;
+}
+
+static void copy_journal_field(char *dst, size_t dst_size, JournalField value)
+{
+	size_t len;
+
+	if (dst_size == 0) {
+		return;
+	}
+	if (!value.data || value.len == 0) {
+		dst[0] = '\0';
+		return;
+	}
+	len = value.len < dst_size - 1 ? value.len : dst_size - 1;
+	memcpy(dst, value.data, len);
+	dst[len] = '\0';
+}
+
+static void print_journal_field(JournalField value, int sanitize)
+{
+	size_t i;
+
+	if (!value.data) {
+		return;
+	}
+	for (i = 0; i < value.len; i++) {
+		unsigned char c = (unsigned char)value.data[i];
+
+		if (sanitize && ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7f)) {
+			printf("\\x%02X", c);
+		} else {
+			putchar(c);
+		}
+	}
+}
+
+static JournalField journal_basename_field(JournalField value)
+{
+	size_t i;
+
+	if (!value.data || value.len == 0) {
+		return value;
+	}
+	for (i = value.len; i > 0; i--) {
+		if (value.data[i - 1] == '/') {
+			value.data += i;
+			value.len -= i;
+			break;
+		}
+	}
+	return value;
 }
 
 static void boot_registry_init(BootRegistry *r)
@@ -873,6 +1014,11 @@ static void build_state_segment_seq_path(char *buf, size_t bufsz)
 static void build_state_boots_path(char *buf, size_t bufsz)
 {
 	snprintf(buf, bufsz, LOG_DIR "/state/boots");
+}
+
+static void build_state_lock_path(char *buf, size_t bufsz)
+{
+	snprintf(buf, bufsz, LOG_DIR "/state/store.lock");
 }
 
 static int atomic_write_text_file(const char *path, const char *text);
@@ -1028,6 +1174,175 @@ static int atomic_write_text_file(const char *path, const char *text)
 		return -1;
 	}
 	return fsync_dir_path(dir_path);
+}
+
+static int path_is_tmpfs(const char *path)
+{
+	struct statfs fs;
+
+	return statfs(path, &fs) == 0 &&
+		(unsigned long)fs.f_type == (unsigned long)TMPFS_MAGIC;
+}
+
+static int select_runtime_cursor_path(char *path, size_t path_size)
+{
+	const char *user_runtime_dir = getenv("XDG_RUNTIME_DIR");
+
+	if (path_is_tmpfs("/run") &&
+		(access("/run/recorder", W_OK | X_OK) == 0 ||
+		 access("/run", W_OK | X_OK) == 0)) {
+		return snprintf(path, path_size, "%s", RECORDER_CURSOR_PATH) <
+			(int)path_size ? 0 : -1;
+	}
+	if (user_runtime_dir && path_is_tmpfs(user_runtime_dir) &&
+		access(user_runtime_dir, W_OK | X_OK) == 0) {
+		return snprintf(path, path_size, "%s/recorder/journal.cursor",
+				user_runtime_dir) < (int)path_size ? 0 : -1;
+	}
+	return -1;
+}
+
+static char *read_journal_cursor(const char *path)
+{
+	int fd;
+	ssize_t n;
+	char *cursor;
+
+	fd = open(path, O_RDONLY | O_CLOEXEC);
+	if (fd < 0) {
+		if (errno != ENOENT) {
+			fprintf(stderr, "recorder: failed to open cursor path %s: %m\n", path);
+		}
+		return NULL;
+	}
+	cursor = malloc(RECORDER_CURSOR_MAX_BYTES + 1);
+	if (!cursor) {
+		close(fd);
+		return NULL;
+	}
+	n = read(fd, cursor, RECORDER_CURSOR_MAX_BYTES);
+	close(fd);
+	if (n <= 0 || !memchr(cursor, '\0', (size_t)n)) {
+		free(cursor);
+		return NULL;
+	}
+	cursor[n] = '\0';
+	if (cursor[0] == '\0') {
+		free(cursor);
+		return NULL;
+	}
+	return cursor;
+}
+
+static int ensure_cursor_parent(const char *path)
+{
+	char parent[PATH_MAX];
+	const char *slash = strrchr(path, '/');
+	size_t len;
+
+	if (!slash) {
+		return 0;
+	}
+	len = (size_t)(slash - path);
+	if (len == 0) {
+		len = 1;
+	}
+	if (len >= sizeof(parent)) {
+		return -1;
+	}
+	memcpy(parent, path, len);
+	parent[len] = '\0';
+	return mkdir_p(parent);
+}
+
+static int write_journal_cursor(const char *path, const char *cursor)
+{
+	struct stat st;
+	ssize_t written;
+	int fd;
+	size_t len;
+
+	len = strlen(cursor) + 1;
+	if (len > RECORDER_CURSOR_MAX_BYTES) {
+		return -1;
+	}
+	if (ensure_cursor_parent(path) != 0) {
+		return -1;
+	}
+	fd = open(path, O_WRONLY | O_CLOEXEC);
+	if (fd < 0 && errno == ENOENT) {
+		fd = open(path, O_WRONLY | O_CREAT | O_EXCL | O_CLOEXEC, 0644);
+	}
+	if (fd < 0) {
+		return -1;
+	}
+	if (fstat(fd, &st) != 0 || lseek(fd, 0, SEEK_SET) < 0) {
+		close(fd);
+		return -1;
+	}
+	written = write(fd, cursor, len);
+	if (written != (ssize_t)len) {
+		close(fd);
+		return -1;
+	}
+	if (S_ISREG(st.st_mode) && ftruncate(fd, (off_t)len) != 0) {
+		close(fd);
+		return -1;
+	}
+	if (fsync(fd) != 0) {
+		close(fd);
+		return -1;
+	}
+	if (close(fd) != 0) {
+		return -1;
+	}
+	return 0;
+}
+
+static int persist_journal_cursor_at(const Recorder *r, const char *path)
+{
+	if (!r->cursor_enabled || !r->pending_cursor) {
+		return 0;
+	}
+	return write_journal_cursor(path, r->pending_cursor);
+}
+
+static int persist_journal_cursor(const Recorder *r)
+{
+	int rc = persist_journal_cursor_at(r, r->cursor_path);
+
+	if (rc != 0) {
+		fprintf(stderr, "recorder: failed to write journal cursor %s: %m\n",
+				r->cursor_path);
+	}
+	return rc;
+}
+
+static int recorder_acquire_store_lock(void)
+{
+	char path[512];
+	char dir[256];
+	int fd;
+
+	snprintf(dir, sizeof(dir), LOG_DIR "/state");
+	if (mkdir_p(LOG_DIR) != 0 || mkdir_p(dir) != 0) {
+		return -1;
+	}
+	build_state_lock_path(path, sizeof(path));
+	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
+	if (fd < 0) {
+		return -1;
+	}
+	if (flock(fd, LOCK_EX | LOCK_NB) != 0) {
+		if (errno == EWOULDBLOCK || errno == EAGAIN) {
+			fprintf(stderr, "recorder: another recorder is already using %s\n", LOG_DIR);
+		} else {
+			fprintf(stderr, "recorder: failed to lock %s: %m\n", path);
+		}
+		close(fd);
+		return -1;
+	}
+	return fd;
 }
 
 static void cleanup_segment_dir_cb(const char *dir_name, void *ctx)
@@ -1546,44 +1861,106 @@ out:
 static void extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 							BootRegistry *boots)
 {
-	const char *boot_id = nonempty_or_null(journal_get(j, "_BOOT_ID"));
+	JournalField boot_id = journal_field_nonempty(journal_get_field(j, "_BOOT_ID"));
 	uint64_t monotonic_ts = 0;
 	sd_id128_t monotonic_boot_id;
 
 	memset(entry, 0, sizeof(*entry));
+	copy_journal_field(entry->boot_id, sizeof(entry->boot_id), boot_id);
 	sd_journal_get_realtime_usec(j, &entry->realtime_ts);
 	if (sd_journal_get_monotonic_usec(j, &monotonic_ts, &monotonic_boot_id) >= 0) {
 		entry->monotonic_ts = monotonic_ts;
 	}
 	entry->priority = (uint8_t)journal_get_u32(j, "PRIORITY");
 	entry->errno_value = clamp_u16(journal_get_u64(j, "ERRNO"));
-	entry->boot_id = boot_id ? boot_id : "";
-	entry->boot_seq = boot_registry_seq(boots, boot_id);
+	entry->boot_seq = boot_registry_seq(boots, entry->boot_id[0] ? entry->boot_id : NULL);
 	{
 		BootEntry *boot = boot_registry_get(boots, entry->boot_id);
 		if (boot && boot->first_realtime_ts == 0) {
 			boot->first_realtime_ts = entry->realtime_ts;
 		}
 	}
-	entry->message = nonempty_or_null(journal_get(j, "MESSAGE"));
-	entry->message_id = cfg->capture_message_id ? nonempty_or_null(journal_get(j, "MESSAGE_ID")) : NULL;
-	entry->unit = cfg->capture_unit ? nonempty_or_null(journal_get(j, "_SYSTEMD_UNIT")) : NULL;
-	entry->hostname = cfg->capture_hostname ? nonempty_or_null(journal_get(j, "_HOSTNAME")) : NULL;
-	entry->comm = cfg->capture_comm ? nonempty_or_null(journal_get(j, "_COMM")) : NULL;
-	entry->exe = cfg->capture_exe ? nonempty_or_null(journal_get(j, "_EXE")) : NULL;
+	entry->message = journal_field_nonempty(journal_get_field(j, "MESSAGE"));
+	entry->message_id = cfg->capture_message_id ?
+						journal_field_nonempty(journal_get_field(j, "MESSAGE_ID")) : (JournalField){0};
+	entry->unit = cfg->capture_unit ?
+					journal_field_nonempty(journal_get_field(j, "_SYSTEMD_UNIT")) : (JournalField){0};
+	entry->hostname = cfg->capture_hostname ?
+						journal_field_nonempty(journal_get_field(j, "_HOSTNAME")) : (JournalField){0};
+	entry->comm = cfg->capture_comm ?
+					journal_field_nonempty(journal_get_field(j, "_COMM")) : (JournalField){0};
+	entry->exe = cfg->capture_exe ?
+					journal_field_nonempty(journal_get_field(j, "_EXE")) : (JournalField){0};
 	entry->pid = cfg->capture_pid ? journal_get_u32(j, "_PID") : 0;
 	entry->uid = cfg->capture_uid ? journal_get_u32(j, "_UID") : 0;
 	entry->gid = cfg->capture_gid ? journal_get_u32(j, "_GID") : 0;
 }
 
+static void recorder_print_received_entry(sd_journal *j, int sanitize_output)
+{
+	JournalField hostname = journal_field_nonempty(journal_get_field(j, "_HOSTNAME"));
+	JournalField identifier = journal_field_nonempty(journal_get_field(j, "_COMM"));
+	JournalField unit = journal_field_nonempty(journal_get_field(j, "_SYSTEMD_UNIT"));
+	JournalField exe = journal_field_nonempty(journal_get_field(j, "_EXE"));
+	JournalField message = journal_field_nonempty(journal_get_field(j, "MESSAGE"));
+	uint64_t realtime_ts = 0;
+	uint32_t pid = journal_get_u32(j, "_PID");
+	char ts[32];
+	time_t sec;
+	struct tm tm;
+
+	if (!identifier.data) {
+		identifier = unit;
+	}
+	if (!identifier.data && exe.data) {
+		identifier = journal_basename_field(exe);
+	}
+	sd_journal_get_realtime_usec(j, &realtime_ts);
+	sec = (time_t)(realtime_ts / 1000000u);
+	if (localtime_r(&sec, &tm)) {
+		strftime(ts, sizeof(ts), "%b %d %H:%M:%S", &tm);
+	} else {
+		snprintf(ts, sizeof(ts), "%" PRIu64, realtime_ts);
+	}
+	printf("%s", ts);
+	if (hostname.data) {
+		printf(" ");
+		print_journal_field(hostname, sanitize_output);
+	}
+	if (identifier.data && pid != 0) {
+		printf(" ");
+		print_journal_field(identifier, sanitize_output);
+		printf("[%u]: ", pid);
+		print_journal_field(message, sanitize_output);
+		printf("\n");
+	} else if (identifier.data) {
+		printf(" ");
+		print_journal_field(identifier, sanitize_output);
+		printf(": ");
+		print_journal_field(message, sanitize_output);
+		printf("\n");
+	} else {
+		printf(" ");
+		print_journal_field(message, sanitize_output);
+		printf("\n");
+	}
+	fflush(stdout);
+}
+
+static flatbuffers_string_ref_t create_journal_string(flatcc_builder_t *B,
+														JournalField value)
+{
+	return value.data ? flatbuffers_string_create(B, value.data, value.len) : 0;
+}
+
 static journal_Entry_ref_t serialize_entry(flatcc_builder_t *B, const LogEntry *entry)
 {
-	flatbuffers_string_ref_t message_ref = entry->message ? flatbuffers_string_create_str(B, entry->message) : 0;
-	flatbuffers_string_ref_t message_id_ref = entry->message_id ? flatbuffers_string_create_str(B, entry->message_id) : 0;
-	flatbuffers_string_ref_t unit_ref = entry->unit ? flatbuffers_string_create_str(B, entry->unit) : 0;
-	flatbuffers_string_ref_t hostname_ref = entry->hostname ? flatbuffers_string_create_str(B, entry->hostname) : 0;
-	flatbuffers_string_ref_t comm_ref = entry->comm ? flatbuffers_string_create_str(B, entry->comm) : 0;
-	flatbuffers_string_ref_t exe_ref = entry->exe ? flatbuffers_string_create_str(B, entry->exe) : 0;
+	flatbuffers_string_ref_t message_ref = create_journal_string(B, entry->message);
+	flatbuffers_string_ref_t message_id_ref = create_journal_string(B, entry->message_id);
+	flatbuffers_string_ref_t unit_ref = create_journal_string(B, entry->unit);
+	flatbuffers_string_ref_t hostname_ref = create_journal_string(B, entry->hostname);
+	flatbuffers_string_ref_t comm_ref = create_journal_string(B, entry->comm);
+	flatbuffers_string_ref_t exe_ref = create_journal_string(B, entry->exe);
 
 	if (journal_Entry_start(B)) {
 		return 0;
@@ -1639,7 +2016,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	memset(&header, 0, sizeof(header));
 	header.segment_seq = w->segment_seq;
 	header.boot_seq = entry->boot_seq;
-	strncpy(header.boot_id, entry->boot_id ? entry->boot_id : "", RECORDER_BOOT_ID_SIZE);
+	strncpy(header.boot_id, entry->boot_id, RECORDER_BOOT_ID_SIZE);
 	current_timezone_string(header.timezone);
 	header.first_realtime_ts = entry->realtime_ts;
 	header.first_monotonic_ts = entry->monotonic_ts;
@@ -1691,6 +2068,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	w->last_monotonic_ts = entry->monotonic_ts;
 	w->initial_time_delta = (int64_t)entry->realtime_ts - (int64_t)entry->monotonic_ts;
 	w->opened_mono_sec = monotonic_now_sec();
+	w->last_chunk_flush_mono_sec = w->opened_mono_sec;
 	w->last_sync_mono_sec = w->opened_mono_sec;
 	w->unsynced_frames = 0;
 	w->compress_enabled = r->config.compress_enabled;
@@ -1771,6 +2149,9 @@ static int writer_flush_chunk(PriorityWriter *w)
 	if (segment_write_frame(w->fp, frame_flags, stored_buf, stored_size32, raw_size32) != 0) {
 		goto out;
 	}
+	if (fflush(w->fp) != 0) {
+		goto out;
+	}
 	w->bytes_written += 16 + stored_size + 4;
 	w->unsynced_frames++;
 	if (w->durable_per_frame ||
@@ -1795,6 +2176,7 @@ out:
 		w->builder_live = 0;
 	}
 	w->count = 0;
+	w->last_chunk_flush_mono_sec = monotonic_now_sec();
 	return rv;
 }
 
@@ -1896,7 +2278,8 @@ static uint64_t recorder_segment_limit(const Recorder *r)
 	return r->config.segment_max_bytes ? r->config.segment_max_bytes : DEFAULT_SEGMENT_MAX_BYTES;
 }
 
-static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg, int verbose)
+static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
+						int verbose, const char *cursor_path)
 {
 	uint8_t prio;
 	uint64_t scanned_next;
@@ -1907,6 +2290,28 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg, 
 	r->j = j;
 	r->config = *cfg;
 	r->verbose = verbose;
+	r->persistent_cursor_enabled = 1;
+	if (snprintf(r->persistent_cursor_path, sizeof(r->persistent_cursor_path),
+				 "%s/state/journal.cursor", LOG_DIR) >=
+		(int)sizeof(r->persistent_cursor_path)) {
+		return -1;
+	}
+	if (cursor_path) {
+		if (snprintf(r->cursor_path, sizeof(r->cursor_path), "%s", cursor_path) >=
+			(int)sizeof(r->cursor_path)) {
+			return -1;
+		}
+		r->cursor_enabled = 1;
+	} else if (select_runtime_cursor_path(r->cursor_path,
+										 sizeof(r->cursor_path)) == 0) {
+		r->cursor_enabled = 1;
+		if (verbose >= 1) {
+			fprintf(stderr, "recorder: using journal cursor path %s\n", r->cursor_path);
+		}
+	}
+	if (verbose >= 1 && !r->cursor_enabled) {
+		fprintf(stderr, "recorder: /run is not tmpfs; journal cursor checkpoint disabled\n");
+	}
 	boot_registry_init(&r->boots);
 	mkdir_p(LOG_DIR);
 	for (prio = 0; prio < r->config.group_count; prio++) {
@@ -1956,7 +2361,7 @@ static int recorder_ensure_writer(Recorder *r, const LogEntry *entry)
 			recorder_verbose_log(r,
 									"rotating segment seq=%" PRIu64 " group=%s because %s (current_boot_id=%s, segment_boot_id=%s)",
 									w->segment_seq, w->group_name, reason_text,
-									entry->boot_id ? entry->boot_id : "(null)",
+									entry->boot_id[0] ? entry->boot_id : "(empty)",
 									w->boot_id[0] ? w->boot_id : "(empty)");
 			break;
 		case ROTATE_REASON_TIMEZONE:
@@ -2074,19 +2479,39 @@ static size_t recorder_step(Recorder *r)
 			fprintf(stderr, "recorder: failed to store entry\n");
 			break;
 		}
+		if (r->cursor_enabled || r->persistent_cursor_enabled) {
+			char *cursor = NULL;
+
+			if (sd_journal_get_cursor(r->j, &cursor) < 0) {
+				fprintf(stderr, "recorder: failed to read journal cursor\n");
+				break;
+			}
+			free(r->pending_cursor);
+			r->pending_cursor = cursor;
+		}
+		if (r->verbose >= 2) {
+			recorder_print_received_entry(r->j, r->config.sanitize_output);
+		}
 		processed++;
 	}
 	return processed;
 }
 
-static void recorder_flush_all(Recorder *r)
+static int recorder_flush_all(Recorder *r, int checkpoint_cursor)
 {
 	size_t i;
 
 	for (i = 0; i < r->config.group_count; i++) {
-		writer_flush_chunk(&r->writers[i]);
-		writer_sync_if_due(&r->writers[i]);
+		if (writer_flush_chunk(&r->writers[i]) != 0 ||
+			writer_sync_if_due(&r->writers[i]) != 0) {
+			return -1;
+		}
 	}
+	if (checkpoint_cursor && persist_journal_cursor(r) != 0) {
+		fprintf(stderr, "recorder: failed to persist journal cursor; disabling cursor checkpointing\n");
+		r->cursor_enabled = 0;
+	}
+	return 0;
 }
 
 static void recorder_shutdown(Recorder *r)
@@ -2094,10 +2519,18 @@ static void recorder_shutdown(Recorder *r)
 	size_t i;
 	uint64_t max_last_rt[MAX_PRIORITY_GROUPS] = {0};
 	char boot_ids[MAX_PRIORITY_GROUPS][RECORDER_BOOT_ID_SIZE + 1];
+	char closed_paths[MAX_PRIORITY_GROUPS][512];
+	uint64_t closed_seqs[MAX_PRIORITY_GROUPS] = {0};
+	int closed_segments[MAX_PRIORITY_GROUPS] = {0};
+	int close_ok = 1;
 
 	memset(boot_ids, 0, sizeof(boot_ids));
 
-	recorder_flush_all(r);
+	fprintf(stderr, "recorder: flushing pending entries\n");
+	if (recorder_flush_all(r, 0) != 0) {
+		fprintf(stderr, "recorder: failed to flush pending entries during shutdown\n");
+		close_ok = 0;
+	}
 	for (i = 0; i < r->config.group_count; i++) {
 		if (r->writers[i].open &&
 			r->writers[i].last_realtime_ts > max_last_rt[i]) {
@@ -2105,8 +2538,40 @@ static void recorder_shutdown(Recorder *r)
 		}
 		strncpy(boot_ids[i], r->writers[i].boot_id, RECORDER_BOOT_ID_SIZE);
 		boot_ids[i][RECORDER_BOOT_ID_SIZE] = '\0';
-		recorder_close_writer(r, &r->writers[i], "shutdown");
+		if (r->writers[i].open) {
+			strncpy(closed_paths[i], r->writers[i].path, sizeof(closed_paths[i]) - 1);
+			closed_paths[i][sizeof(closed_paths[i]) - 1] = '\0';
+			closed_seqs[i] = r->writers[i].segment_seq;
+			if (writer_close_segment(r, &r->writers[i], "shutdown") != 0) {
+				close_ok = 0;
+			} else {
+				closed_segments[i] = 1;
+			}
+		}
 	}
+	if (close_ok && r->pending_cursor) {
+		if (r->cursor_enabled && persist_journal_cursor(r) != 0) {
+			fprintf(stderr, "recorder: failed to persist volatile journal cursor during shutdown\n");
+			r->cursor_enabled = 0;
+		}
+		if (r->persistent_cursor_enabled &&
+			write_journal_cursor(r->persistent_cursor_path, r->pending_cursor) != 0) {
+			fprintf(stderr, "recorder: failed to persist journal cursor to %s: %m\n",
+					r->persistent_cursor_path);
+		}
+	}
+	free(r->pending_cursor);
+	r->pending_cursor = NULL;
+	for (i = 0; i < r->config.group_count; i++) {
+		if (closed_segments[i]) {
+			char idx_path[512];
+
+			build_index_path(idx_path, sizeof(idx_path), r->writers[i].group_name,
+							 closed_seqs[i]);
+			index_rebuild_for_segment(closed_paths[i], idx_path);
+		}
+	}
+	retention_enforce(r);
 	for (i = 0; i < r->config.group_count; i++) {
 		if (boot_ids[i][0] != '\0') {
 			BootEntry *boot = boot_registry_get(&r->boots, boot_ids[i]);
@@ -2117,6 +2582,7 @@ static void recorder_shutdown(Recorder *r)
 	}
 	persist_boot_state(&r->boots);
 	persist_next_segment_seq(r->next_segment_seq);
+	fprintf(stderr, "recorder: shutdown complete\n");
 }
 
 int main(int argc, char **argv)
@@ -2125,17 +2591,31 @@ int main(int argc, char **argv)
 	Recorder r;
 	RecorderConfig cfg;
 	const char *cfg_path;
+	const char *cursor_path = NULL;
 	int verbose = 0;
+	int start_last = 0;
+	int lock_fd = -1;
 	int opt;
+	static const struct option options[] = {
+		{ "last", no_argument, NULL, '1' },
+		{ "cursor", required_argument, NULL, 'c' },
+		{ NULL, 0, NULL, 0 }
+	};
 
 	opterr = 0;
-	while ((opt = getopt(argc, argv, "v")) != -1) {
+	while ((opt = getopt_long(argc, argv, "v1c:", options, NULL)) != -1) {
 		switch (opt) {
 		case 'v':
-			verbose = 1;
+			verbose++;
+			break;
+		case '1':
+			start_last = 1;
+			break;
+		case 'c':
+			cursor_path = optarg;
 			break;
 		default:
-			fprintf(stderr, "usage: %s [-v]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [-1|--last] [-c PATH|--cursor PATH]\n", argv[0]);
 			return 1;
 		}
 	}
@@ -2147,31 +2627,97 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
+	lock_fd = recorder_acquire_store_lock();
+	if (lock_fd < 0) {
+		recorder_config_destroy(&cfg);
+		return 1;
+	}
+
 	if (sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY) < 0) {
 		fprintf(stderr, "recorder: failed to open journal\n");
+		close(lock_fd);
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
 
-	signal(SIGINT, on_signal);
-	signal(SIGTERM, on_signal);
-
-	recorder_init(&r, j, &cfg, verbose);
-	if (sd_journal_seek_tail(j) < 0) {
-		fprintf(stderr, "recorder: failed to seek to journal tail\n");
+	if (install_signal_handlers() != 0) {
+		fprintf(stderr, "recorder: failed to install signal handlers\n");
 		sd_journal_close(j);
+		close(lock_fd);
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
-	r.current_entry_pending = sd_journal_previous(j) > 0;
+
+	if (recorder_init(&r, j, &cfg, verbose, cursor_path) != 0) {
+		fprintf(stderr, "recorder: failed to initialize cursor path\n");
+		sd_journal_close(j);
+		close(lock_fd);
+		recorder_config_destroy(&cfg);
+		return 1;
+	}
+	if (!start_last) {
+		char *cursor = r.cursor_enabled ? read_journal_cursor(r.cursor_path) : NULL;
+		int resumed = 0;
+
+		if (!cursor && r.persistent_cursor_enabled) {
+			cursor = read_journal_cursor(r.persistent_cursor_path);
+		}
+		if (cursor) {
+			int n = sd_journal_seek_cursor(j, cursor);
+
+			if (n >= 0) {
+				n = sd_journal_next(j);
+				if (n >= 0) {
+					r.current_entry_pending = n > 0;
+					resumed = 1;
+				} else {
+					fprintf(stderr, "recorder: failed to seek after journal cursor; importing available entries\n");
+				}
+			} else {
+				fprintf(stderr, "recorder: journal cursor is unavailable; importing available entries\n");
+			}
+			free(cursor);
+		}
+		if (!resumed) {
+			if (sd_journal_seek_head(j) < 0) {
+				fprintf(stderr, "recorder: failed to seek to journal head\n");
+				sd_journal_close(j);
+				close(lock_fd);
+				recorder_config_destroy(&cfg);
+				return 1;
+			}
+		}
+	} else if (start_last) {
+		if (sd_journal_seek_tail(j) < 0) {
+			fprintf(stderr, "recorder: failed to seek to journal tail\n");
+			sd_journal_close(j);
+			close(lock_fd);
+			recorder_config_destroy(&cfg);
+			return 1;
+		}
+		r.current_entry_pending = sd_journal_previous(j) > 0;
+	} else if (sd_journal_seek_head(j) < 0) {
+		fprintf(stderr, "recorder: failed to seek to journal head\n");
+		sd_journal_close(j);
+		close(lock_fd);
+		recorder_config_destroy(&cfg);
+		return 1;
+	}
 
 	while (!g_shutdown) {
 		size_t n = recorder_step(&r);
 
 		if (n > 0) {
+			if (recorder_flush_all(&r, 1) != 0) {
+				fprintf(stderr, "recorder: failed to flush stored entries\n");
+				break;
+			}
 			continue;
 		}
-		recorder_flush_all(&r);
+		if (recorder_flush_all(&r, 1) != 0) {
+			fprintf(stderr, "recorder: failed to flush stored entries\n");
+			break;
+		}
 		if (sd_journal_wait(j, JOURNAL_WAIT_USEC) < 0) {
 			break;
 		}
@@ -2179,6 +2725,7 @@ int main(int argc, char **argv)
 
 	recorder_shutdown(&r);
 	sd_journal_close(j);
+	close(lock_fd);
 	recorder_config_destroy(&cfg);
 	return 0;
 }

@@ -50,6 +50,21 @@ Run the recorder:
 ./recorder
 ```
 
+By default, recorder resumes after the last journal cursor checkpoint stored
+under `/run` when that directory is `tmpfs`-backed. A cursor from the last
+clean shutdown is also stored in the log directory's `state/journal.cursor`
+and is used as a fallback after reboot. If no checkpoint exists, it imports
+all journal entries still available. To start with only the current last
+journal entry, use:
+
+```sh
+./recorder --last
+```
+
+An explicit cursor path can be selected with `--cursor PATH` (or `-c PATH`).
+When specified, recorder uses that path regardless of its filesystem type and
+updates an existing file or device in place. A missing path is created.
+
 Run the player on one segment:
 
 ```sh
@@ -63,6 +78,8 @@ Run the player on a whole recorder directory:
 ```
 
 `player` scans all subdirectories under the given log root and reads any valid `.seg` files it finds.
+Player output sanitizes terminal control characters by default. Use
+`--no-sanitize-output` when raw stored fields are required.
 
 ## Configuration
 
@@ -152,6 +169,8 @@ The config file is JSON. Before parsing, lines starting with `#` are removed, so
   Store `_UID` when present.
 - `capture_gid`
   Store `_GID` when present.
+- `sanitize_output`
+  Escape terminal control characters in `recorder -vv` output. Enabled by default.
 - `priority_groups`
   Optional grouping of priorities into named segment directories. Each priority `0..7` must appear exactly once.
 - `static_dict_paths`
@@ -179,6 +198,7 @@ Inside the log directory, recorder creates:
 - one subdirectory per priority group
 - `state/segment_seq`
 - `state/boots`
+- `state/journal.cursor` (last cursor from a clean shutdown)
 
 Example:
 
@@ -194,6 +214,7 @@ Example:
   state/
     segment_seq
     boots
+    journal.cursor
 ```
 
 ## Retention

@@ -12,6 +12,8 @@
 
 #include "segment.h"
 
+#define FOLLOW_INITIAL_ENTRY_COUNT 10
+
 typedef struct {
 	char path[512];
 	uint64_t segment_seq;
@@ -27,8 +29,24 @@ typedef struct {
 	int have_since;
 	int have_until;
 	uint64_t min_frame_offset;
-	size_t printed_entries;
+	uint64_t follow_start_ts;
+	int initial_follow_scan;
+	struct PlayerEntry *entries;
+	size_t entry_count;
+	size_t entry_capacity;
 } PrintContext;
+
+typedef struct PlayerEntry {
+	uint64_t realtime_ts;
+	uint64_t order;
+	int follow_new;
+	uint32_t pid;
+	char *hostname;
+	char *comm;
+	char *unit;
+	char *exe;
+	char *message;
+} PlayerEntry;
 
 typedef struct {
 	char path[512];
@@ -51,7 +69,9 @@ typedef struct {
 	int have_since;
 	int have_until;
 	int follow;
+	uint64_t follow_start_ts;
 	int list_boots;
+	int sanitize_output;
 } PlayerOptions;
 
 typedef struct {
@@ -251,21 +271,128 @@ static int parse_time_arg(const char *text, uint64_t *value_out)
 	return 0;
 }
 
-static void print_entry(journal_Entry_table_t entry)
+static void free_player_entries(PlayerEntry *entries, size_t count)
 {
-	const char *hostname = journal_Entry_hostname(entry);
-	const char *comm = journal_Entry_comm(entry);
-	const char *unit = journal_Entry_unit(entry);
-	const char *exe = journal_Entry_exe(entry);
-	const char *message = journal_Entry_message(entry);
+	size_t i;
+
+	for (i = 0; i < count; i++) {
+		free(entries[i].hostname);
+		free(entries[i].comm);
+		free(entries[i].unit);
+		free(entries[i].exe);
+		free(entries[i].message);
+	}
+	free(entries);
+}
+
+static int copy_player_entry(PlayerEntry *dst, journal_Entry_table_t src)
+{
+	const char *hostname = journal_Entry_hostname(src);
+	const char *comm = journal_Entry_comm(src);
+	const char *unit = journal_Entry_unit(src);
+	const char *exe = journal_Entry_exe(src);
+	const char *message = journal_Entry_message(src);
+
+	memset(dst, 0, sizeof(*dst));
+	dst->realtime_ts = journal_Entry_realtime_ts(src);
+	dst->order = 0;
+	dst->pid = journal_Entry_pid(src);
+	dst->hostname = hostname ? strdup(hostname) : NULL;
+	dst->comm = comm ? strdup(comm) : NULL;
+	dst->unit = unit ? strdup(unit) : NULL;
+	dst->exe = exe ? strdup(exe) : NULL;
+	dst->message = message ? strdup(message) : NULL;
+	if ((hostname && !dst->hostname) || (comm && !dst->comm) ||
+		(unit && !dst->unit) || (exe && !dst->exe) ||
+		(message && !dst->message)) {
+		free(dst->hostname);
+		free(dst->comm);
+		free(dst->unit);
+		free(dst->exe);
+		free(dst->message);
+		memset(dst, 0, sizeof(*dst));
+		return -1;
+	}
+	return 0;
+}
+
+static int append_player_entry(PrintContext *pc, journal_Entry_table_t entry)
+{
+	PlayerEntry *tmp;
+	size_t new_capacity;
+
+	if (pc->entry_count == pc->entry_capacity) {
+		new_capacity = pc->entry_capacity ? pc->entry_capacity * 2 : 64;
+		tmp = realloc(pc->entries, new_capacity * sizeof(*tmp));
+		if (!tmp) {
+			return -1;
+		}
+		pc->entries = tmp;
+		pc->entry_capacity = new_capacity;
+	}
+	if (copy_player_entry(&pc->entries[pc->entry_count], entry) != 0) {
+		return -1;
+	}
+	pc->entries[pc->entry_count].order = pc->entry_count;
+	pc->entries[pc->entry_count].follow_new = pc->initial_follow_scan &&
+			journal_Entry_realtime_ts(entry) >= pc->follow_start_ts;
+	pc->entry_count++;
+	return 0;
+}
+
+static int compare_player_entries(const void *lhs, const void *rhs)
+{
+	const PlayerEntry *a = lhs;
+	const PlayerEntry *b = rhs;
+
+	if (a->realtime_ts < b->realtime_ts) {
+		return -1;
+	}
+	if (a->realtime_ts > b->realtime_ts) {
+		return 1;
+	}
+	if (a->order < b->order) {
+		return -1;
+	}
+	if (a->order > b->order) {
+		return 1;
+	}
+	return 0;
+}
+
+static void print_player_field(const char *value, int sanitize)
+{
+	size_t i;
+
+	if (!value) {
+		return;
+	}
+	for (i = 0; value[i] != '\0'; i++) {
+		unsigned char c = (unsigned char)value[i];
+
+		if (sanitize && ((c < 0x20 && c != '\n' && c != '\t') || c == 0x7f)) {
+			printf("\\x%02X", c);
+		} else {
+			putchar(c);
+		}
+	}
+}
+
+static void print_entry(const PlayerEntry *entry, int sanitize_output)
+{
+	const char *hostname = entry->hostname;
+	const char *comm = entry->comm;
+	const char *unit = entry->unit;
+	const char *exe = entry->exe;
+	const char *message = entry->message;
 	const char *identifier = comm;
 	const char *slash;
 	char ts[32];
-	uint32_t pid = journal_Entry_pid(entry);
+	uint32_t pid = entry->pid;
 	int have_hostname;
 	int have_identifier;
 
-	format_realtime(journal_Entry_realtime_ts(entry), ts, sizeof(ts));
+	format_realtime(entry->realtime_ts, ts, sizeof(ts));
 	if (!identifier || !identifier[0]) {
 		identifier = unit;
 	}
@@ -280,14 +407,25 @@ static void print_entry(journal_Entry_table_t entry)
 	have_identifier = identifier && identifier[0];
 	printf("%s", ts);
 	if (have_hostname) {
-		printf(" %s", hostname);
+		printf(" ");
+		print_player_field(hostname, sanitize_output);
 	}
 	if (have_identifier && pid != 0) {
-		printf(" %s[%u]: %s\n", identifier, pid, message);
+		printf(" ");
+		print_player_field(identifier, sanitize_output);
+		printf("[%u]: ", pid);
+		print_player_field(message, sanitize_output);
+		printf("\n");
 	} else if (have_identifier) {
-		printf(" %s: %s\n", identifier, message);
+		printf(" ");
+		print_player_field(identifier, sanitize_output);
+		printf(": ");
+		print_player_field(message, sanitize_output);
+		printf("\n");
 	} else {
-		printf(" %s\n", message);
+		printf(" ");
+		print_player_field(message, sanitize_output);
+		printf("\n");
 	}
 }
 
@@ -311,32 +449,34 @@ static int print_frame(const SegmentHeader *header,
 		journal_Entry_table_t e = journal_Entry_vec_at(entries, i);
 
 		if (entry_matches(pc, e)) {
-			print_entry(e);
-			pc->printed_entries++;
+			if (append_player_entry(pc, e) != 0) {
+				return -1;
+			}
 		}
 	}
 	return 0;
 }
 
-static int scan_segment_file(const char *path, const PlayerOptions *opts,
-								uint64_t min_frame_offset, uint64_t *committed_end_out)
+static int scan_segment_file_with_context(const char *path, const PlayerOptions *opts,
+								uint64_t min_frame_offset, PrintContext *ctx,
+								uint64_t *committed_end_out)
 {
 	SegmentHeader header;
 	SegmentFooter footer;
-	PrintContext ctx;
 	size_t committed_end = 0;
 
-	memset(&ctx, 0, sizeof(ctx));
-	ctx.unit_filter = opts->unit_filter;
-	ctx.boot_id_filter = opts->boot_id_filter;
-	ctx.boot_seq_filter = opts->boot_seq_filter;
-	ctx.have_boot_seq_filter = opts->have_boot_seq_filter;
-	ctx.since_ts = opts->since_ts;
-	ctx.until_ts = opts->until_ts;
-	ctx.have_since = opts->have_since;
-	ctx.have_until = opts->have_until;
-	ctx.min_frame_offset = min_frame_offset;
-	if (segment_scan_path(path, print_frame, &ctx, &header, &footer, &committed_end) != 0) {
+	ctx->unit_filter = opts->unit_filter;
+	ctx->boot_id_filter = opts->boot_id_filter;
+	ctx->boot_seq_filter = opts->boot_seq_filter;
+	ctx->have_boot_seq_filter = opts->have_boot_seq_filter;
+	ctx->since_ts = opts->since_ts;
+	ctx->until_ts = opts->until_ts;
+	ctx->have_since = opts->have_since;
+	ctx->have_until = opts->have_until;
+	ctx->min_frame_offset = min_frame_offset;
+	ctx->follow_start_ts = opts->follow_start_ts;
+	ctx->initial_follow_scan = opts->follow && opts->follow_start_ts != 0;
+	if (segment_scan_path(path, print_frame, ctx, &header, &footer, &committed_end) != 0) {
 		fprintf(stderr, "player: failed to scan %s\n", path);
 		return -1;
 	}
@@ -701,6 +841,10 @@ static int scan_log_once(const PlayerOptions *opts, SeenSegment **seen,
 	size_t cap = 0;
 	size_t i;
 	int rc = 0;
+	PrintContext output;
+	int initial_follow_scan = opts->follow && *seen_count == 0;
+
+	memset(&output, 0, sizeof(output));
 
 	if (collect_log_segments(opts->path, &items, &count, &cap) != 0) {
 		return 1;
@@ -711,12 +855,38 @@ static int scan_log_once(const PlayerOptions *opts, SeenSegment **seen,
 		uint64_t min_offset = seen_item ? seen_item->committed_end : 0;
 		uint64_t committed_end = min_offset;
 
-		if (scan_segment_file(items[i].path, opts, min_offset, &committed_end) != 0 ||
+		/* Each scan uses the same buffer so output can be globally ordered. */
+		if (scan_segment_file_with_context(items[i].path, opts, min_offset,
+										&output, &committed_end) != 0 ||
 			remember_seen_segment(seen, seen_count, seen_cap, items[i].path, committed_end) != 0) {
 			rc = 1;
 			break;
 		}
 	}
+	if (rc == 0) {
+		size_t old_count = 0;
+		size_t old_seen = 0;
+
+		qsort(output.entries, output.entry_count, sizeof(*output.entries),
+				compare_player_entries);
+		if (initial_follow_scan) {
+			for (i = 0; i < output.entry_count; i++) {
+				if (!output.entries[i].follow_new) {
+					old_count++;
+				}
+			}
+		}
+		for (i = 0; i < output.entry_count; i++) {
+			if (!initial_follow_scan || output.entries[i].follow_new ||
+				(old_count - old_seen <= FOLLOW_INITIAL_ENTRY_COUNT)) {
+				print_entry(&output.entries[i], opts->sanitize_output);
+			}
+			if (initial_follow_scan && !output.entries[i].follow_new) {
+				old_seen++;
+			}
+		}
+	}
+	free_player_entries(output.entries, output.entry_count);
 	free(items);
 	return rc;
 }
@@ -744,7 +914,8 @@ static void usage(const char *prog)
 {
 	fprintf(stderr,
 			"usage: %s [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
-			"[--since TIME] [--until TIME] [--list-boots]\n",
+			"[--since TIME] [--until TIME] [--list-boots] "
+			"[--sanitize-output|--no-sanitize-output]\n",
 			prog);
 	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, or YYYY-MM-DD HH:MM[:SS]\n");
 }
@@ -754,6 +925,7 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	int i;
 
 	memset(opts, 0, sizeof(*opts));
+	opts->sanitize_output = 1;
 	for (i = 1; i < argc; i++) {
 		const char *arg = argv[i];
 
@@ -789,6 +961,10 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->boot_filter = arg + 2;
 		} else if (strcmp(arg, "--list-boots") == 0) {
 			opts->list_boots = 1;
+		} else if (strcmp(arg, "--sanitize-output") == 0) {
+			opts->sanitize_output = 1;
+		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
+			opts->sanitize_output = 0;
 		} else if (strcmp(arg, "--since") == 0) {
 			if (++i >= argc) {
 				return -1;
@@ -839,6 +1015,7 @@ int main(int argc, char **argv)
 {
 	PlayerOptions opts;
 	struct stat st;
+	struct timespec now;
 
 	if (parse_options(argc, argv, &opts) != 0) {
 		usage(argv[0]);
@@ -855,6 +1032,10 @@ int main(int argc, char **argv)
 	if (resolve_boot_filter(&opts) != 0) {
 		return 1;
 	}
+	if (opts.follow && clock_gettime(CLOCK_REALTIME, &now) == 0) {
+		opts.follow_start_ts = (uint64_t)now.tv_sec * 1000000ull +
+			(uint64_t)now.tv_nsec / 1000ull;
+	}
 	if (S_ISDIR(st.st_mode)) {
 		return scan_log_root(&opts);
 	}
@@ -870,5 +1051,21 @@ int main(int argc, char **argv)
 		fprintf(stderr, "player: -f requires a log directory\n");
 		return 1;
 	}
-	return scan_segment_file(opts.path, &opts, 0, NULL) == 0 ? 0 : 1;
+	{
+		PrintContext output;
+		size_t i;
+
+		memset(&output, 0, sizeof(output));
+		if (scan_segment_file_with_context(opts.path, &opts, 0, &output, NULL) != 0) {
+			free_player_entries(output.entries, output.entry_count);
+			return 1;
+		}
+		qsort(output.entries, output.entry_count, sizeof(*output.entries),
+				compare_player_entries);
+		for (i = 0; i < output.entry_count; i++) {
+			print_entry(&output.entries[i], opts.sanitize_output);
+		}
+		free_player_entries(output.entries, output.entry_count);
+	}
+	return 0;
 }

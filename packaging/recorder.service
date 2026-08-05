@@ -9,6 +9,8 @@ Type=simple
 ExecStart=/usr/bin/recorder
 Restart=always
 RestartSec=2
+RuntimeDirectory=recorder
+RuntimeDirectoryMode=0755
 
 [Install]
 WantedBy=multi-user.target

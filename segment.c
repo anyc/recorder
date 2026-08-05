@@ -139,9 +139,16 @@ static int decompress_payload(const SegmentHeader *header,
 	size_t rv;
 
 	if ((frame->flags & SEGMENT_FRAME_FLAG_ZSTD) == 0) {
-		*chunk_out = (void *)payload;
+		/* The frame payload may start at an unaligned mmap offset. */
+		void *aligned = malloc(frame->stored_len);
+
+		if (!aligned) {
+			return -1;
+		}
+		memcpy(aligned, payload, frame->stored_len);
+		*chunk_out = aligned;
 		*chunk_size_out = frame->stored_len;
-		return 0;
+		return 1;
 	}
 
 	decoded = malloc(frame->uncompressed_len);
@@ -233,13 +240,14 @@ static int segment_scan_impl(const void *buf, size_t size, segment_frame_cb cb,
 	committed_end = offset;
 	memset(&footer, 0, sizeof(footer));
 
-	while (offset + SEGMENT_FOOTER_BODY_SIZE + SEGMENT_FOOTER_TRAILER_SIZE <= size) {
+	while (offset < size) {
 		const unsigned char *p = (const unsigned char *)buf + offset;
 		uint32_t total_len;
 		uint32_t stored_crc;
 		SegmentFrameInfo frame;
 
-		if (memcmp(p + 36, RECORDER_SEGMENT_FOOTER_MAGIC, 8) == 0 &&
+		if (offset + SEGMENT_FOOTER_BODY_SIZE + SEGMENT_FOOTER_TRAILER_SIZE <= size &&
+			memcmp(p + 36, RECORDER_SEGMENT_FOOTER_MAGIC, 8) == 0 &&
 			read_u32_le(p + 32) == RECORDER_SEGMENT_VERSION) {
 			uint32_t expect_crc = read_u32_le(p + 28);
 			unsigned char tmp[SEGMENT_FOOTER_BODY_SIZE + SEGMENT_FOOTER_TRAILER_SIZE];

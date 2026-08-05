@@ -4,7 +4,7 @@
   "segment_max_age_sec": 900,
   "durable_priority_max": 3,
   "durability_flush_frames": 32,
-  "durability_flush_interval_sec": 5,
+  "durability_flush_interval_sec": 60,
   "compress_enabled": true,
   "compress_min_frame_bytes": 256,
   "compress_if_smaller": true,
@@ -16,6 +16,7 @@
   "capture_pid": false,
   "capture_uid": false,
   "capture_gid": false,
+  "sanitize_output": true,
   "priority_groups": [
     { "name": "p0", "priorities": [0] },
     { "name": "p1", "priorities": [1] },

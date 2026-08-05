@@ -14,6 +14,66 @@ typedef struct {
 	int seen;
 } SmokeContext;
 
+static int check_active_unclosed_tiny_frame(void)
+{
+	FILE *fp = NULL;
+	SegmentHeader header;
+	SegmentFooter footer;
+	char path[] = "/tmp/recorder-active-segment-smoke-XXXXXX";
+	size_t committed_end = 0;
+	size_t expect_end;
+	int fd;
+	unsigned char payload = 0;
+
+	fd = mkstemp(path);
+	if (fd < 0) {
+		perror("mkstemp");
+		return -1;
+	}
+	fp = fdopen(fd, "wb");
+	if (!fp) {
+		perror("fdopen");
+		close(fd);
+		unlink(path);
+		return -1;
+	}
+
+	memset(&header, 0, sizeof(header));
+	header.segment_seq = 8;
+	header.boot_seq = 3;
+	strcpy(header.boot_id, "boot-a");
+	strcpy(header.timezone, "+0000");
+	header.first_realtime_ts = 1234;
+	header.first_monotonic_ts = 5678;
+	if (segment_write_header(fp, &header, NULL, 0) != 0 ||
+		segment_write_frame(fp, 0, &payload, 0, 0) != 0 ||
+		fflush(fp) != 0) {
+		fprintf(stderr, "smoke: write active segment failed\n");
+		fclose(fp);
+		unlink(path);
+		return -1;
+	}
+
+	memset(&footer, 0, sizeof(footer));
+	if (segment_scan_path(path, NULL, NULL, &header, &footer, &committed_end) != 0) {
+		fprintf(stderr, "smoke: scan active segment failed\n");
+		fclose(fp);
+		unlink(path);
+		return -1;
+	}
+	expect_end = segment_header_encoded_size() + 16 + 4;
+	if (committed_end != expect_end) {
+		fprintf(stderr, "smoke: active segment committed_end=%zu want=%zu\n",
+				committed_end, expect_end);
+		fclose(fp);
+		unlink(path);
+		return -1;
+	}
+	fclose(fp);
+	unlink(path);
+	return 0;
+}
+
 static int check_frame(const SegmentHeader *header,
 						const SegmentFrameInfo *frame,
 						const void *chunk_buf, size_t chunk_size,
@@ -63,9 +123,13 @@ int main(void)
 	int fd;
 	size_t committed_end = 0;
 
+	if (check_active_unclosed_tiny_frame() != 0) {
+		return 1;
+	}
+
 	fd = mkstemp(path);
 	if (fd < 0) {
-		perror("mkstemps");
+		perror("mkstemp");
 		return 1;
 	}
 	fp = fdopen(fd, "wb");
