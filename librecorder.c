@@ -28,6 +28,7 @@ struct RecorderPlayer {
 	size_t current;
 	int entries_loaded;
 	char *data;
+	SegmentDecryptor *decryptor;
 };
 
 typedef struct StoredEntry {
@@ -408,9 +409,24 @@ void rec_player_close(RecorderPlayer *reader)
 	if (!reader) return;
 	if (reader->inotify_fd >= 0) close(reader->inotify_fd);
 	clear_entries(reader);
+	segment_decryptor_free(reader->decryptor);
 	free(reader->data);
 	free(reader->path);
 	free(reader);
+}
+
+int rec_player_set_private_key(RecorderPlayer *reader, const char *path)
+{
+	SegmentDecryptor *decryptor = NULL;
+
+	if (!reader) return -1;
+	if (path && (!path[0] || segment_decryptor_create(path, &decryptor) != 0)) {
+		return -1;
+	}
+	clear_entries(reader);
+	segment_decryptor_free(reader->decryptor);
+	reader->decryptor = decryptor;
+	return 0;
 }
 
 int rec_player_scan_file(RecorderPlayer *reader, const char *path,
@@ -427,7 +443,8 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 	ctx.callback = callback;
 	ctx.userdata = userdata;
 	ctx.min_frame_offset = min_frame_offset;
-	if (segment_scan_path(path, scan_frame, &ctx, &header, &footer, &committed_end) != 0) return -1;
+	if (segment_scan_path(path, reader->decryptor, scan_frame, &ctx, &header,
+						  &footer, &committed_end) != 0) return -1;
 	if (committed_end_out) *committed_end_out = committed_end;
 	return 0;
 }

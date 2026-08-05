@@ -37,6 +37,11 @@ enum {
 };
 
 int rec_player_open(RecorderPlayer **reader, const char *path);
+/*
+ * Configure the PEM private key used for encrypted segments. This invalidates
+ * any entries already loaded by the iterator. Pass NULL to clear the key.
+ */
+int rec_player_set_private_key(RecorderPlayer *reader, const char *path);
 void rec_player_close(RecorderPlayer *reader);
 
 /*

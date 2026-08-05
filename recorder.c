@@ -48,6 +48,7 @@ typedef void sd_journal;
 #endif
 #include "recorder_builder.h"
 #include "segment.h"
+#include "index.h"
 #ifdef RECORDER_RESTORE_ERRNO
 #pragma pop_macro("errno")
 #undef RECORDER_RESTORE_ERRNO
@@ -76,7 +77,8 @@ typedef void sd_journal;
 #define DEFAULT_ENTRY_FORMAT 0
 #define DEFAULT_SANITIZE_OUTPUT 1
 #define JOURNAL_WAIT_USEC (300 * 1000ULL)
-#define TIME_DELTA_ROTATE_THRESHOLD_USEC (10000ULL)
+#define CLOCK_BACKWARD_JUMP_THRESHOLD_USEC (1000LL)
+#define CLOCK_FORWARD_JUMP_THRESHOLD_USEC (1000000LL)
 #define MAX_PRIORITY_GROUPS 8
 #define MAX_GROUP_NAME_LEN 63
 #define MAX_MODIFIER_REROUTES 8
@@ -165,6 +167,7 @@ typedef struct {
 	int compress_enabled;
 	unsigned compress_min_frame_bytes;
 	int compress_if_smaller;
+	char *encryption_public_key;
 	char *static_dict_paths[8];
 	ModifierList modifiers;
 	PriorityGroup groups[MAX_PRIORITY_GROUPS];
@@ -231,13 +234,13 @@ typedef struct {
 	char timezone[RECORDER_SEGMENT_TZ_SIZE];
 	uint32_t boot_seq;
 	uint64_t segment_seq;
+	uint64_t clock_jump_seen_seq;
 	uint64_t bytes_written;
 	uint64_t entry_count;
 	uint64_t first_realtime_ts;
 	uint64_t first_monotonic_ts;
 	uint64_t last_realtime_ts;
 	uint64_t last_monotonic_ts;
-	int64_t initial_time_delta;
 	time_t opened_mono_sec;
 	time_t last_chunk_flush_mono_sec;
 	time_t last_sync_mono_sec;
@@ -245,6 +248,9 @@ typedef struct {
 	int compress_enabled;
 	unsigned compress_min_frame_bytes;
 	int compress_if_smaller;
+	SegmentEncryptor *encryptor;
+	IndexWriter *index_writer;
+	SegmentHeader index_header;
 	int durable_per_frame;
 	unsigned durability_flush_frames;
 	unsigned durability_flush_interval_sec;
@@ -272,6 +278,10 @@ typedef struct {
 	char persistent_cursor_path[PATH_MAX];
 	char *pending_cursor;
 	PriorityWriter writers[MAX_PRIORITY_GROUPS];
+	uint64_t clock_jump_seq;
+	int64_t clock_jump_usec;
+	int clock_offset_initialized;
+	int64_t last_clock_offset_usec;
 } Recorder;
 
 typedef struct {
@@ -286,7 +296,8 @@ typedef enum {
 	ROTATE_REASON_NONE = 0,
 	ROTATE_REASON_BOOT_ID,
 	ROTATE_REASON_TIMEZONE,
-	ROTATE_REASON_TIME_DELTA,
+	ROTATE_REASON_CLOCK_BACKWARD,
+	ROTATE_REASON_CLOCK_FORWARD,
 	ROTATE_REASON_AGE,
 	ROTATE_REASON_SIZE,
 } RotateReason;
@@ -297,6 +308,8 @@ typedef struct {
 } RotateDecision;
 
 static volatile sig_atomic_t g_shutdown = 0;
+
+static void recorder_verbose_log(const Recorder *r, const char *fmt, ...);
 
 static void on_signal(int sig)
 {
@@ -386,6 +399,8 @@ static void recorder_config_destroy(RecorderConfig *cfg)
 		cfg->static_dict_paths[i] = NULL;
 		modifier_list_destroy(&cfg->groups[i].modifiers);
 	}
+	free(cfg->encryption_public_key);
+	cfg->encryption_public_key = NULL;
 	modifier_list_destroy(&cfg->modifiers);
 	for (i = 0; i < cfg->capture_fields_whitelist_count; i++) {
 		free(cfg->capture_fields_whitelist[i]);
@@ -428,8 +443,10 @@ static const char *rotate_reason_text(RotateReason reason)
 		return "boot_id changed";
 	case ROTATE_REASON_TIMEZONE:
 		return "timezone changed";
-	case ROTATE_REASON_TIME_DELTA:
-		return "realtime/monotonic delta changed beyond threshold";
+	case ROTATE_REASON_CLOCK_BACKWARD:
+		return "realtime clock jumped backwards";
+	case ROTATE_REASON_CLOCK_FORWARD:
+		return "realtime clock jumped forwards";
 	case ROTATE_REASON_AGE:
 		return "segment age limit reached";
 	case ROTATE_REASON_SIZE:
@@ -448,13 +465,18 @@ static RotateDecision writer_should_rotate(const Recorder *r, const PriorityWrit
 											const LogEntry *entry)
 {
 	char timezone[RECORDER_SEGMENT_TZ_SIZE];
-	int64_t current_delta;
 	RotateDecision decision;
 
 	decision.reason = ROTATE_REASON_NONE;
 	decision.delta_diff = 0;
 
 	if (!w->open) {
+		return decision;
+	}
+	if (w->clock_jump_seen_seq != r->clock_jump_seq) {
+		decision.delta_diff = r->clock_jump_usec;
+		decision.reason = decision.delta_diff < 0 ? ROTATE_REASON_CLOCK_BACKWARD :
+			ROTATE_REASON_CLOCK_FORWARD;
 		return decision;
 	}
 	if (w->boot_id[0] != '\0' && entry->boot_id[0] != '\0' &&
@@ -465,12 +487,6 @@ static RotateDecision writer_should_rotate(const Recorder *r, const PriorityWrit
 	current_timezone_string(timezone);
 	if (strcmp(w->timezone, timezone) != 0) {
 		decision.reason = ROTATE_REASON_TIMEZONE;
-		return decision;
-	}
-	current_delta = (int64_t)entry->realtime_ts - (int64_t)entry->monotonic_ts;
-	decision.delta_diff = current_delta - w->initial_time_delta;
-	if (llabs(decision.delta_diff) > (long long)TIME_DELTA_ROTATE_THRESHOLD_USEC) {
-		decision.reason = ROTATE_REASON_TIME_DELTA;
 		return decision;
 	}
 	if (r->config.segment_max_age_sec != 0 &&
@@ -729,6 +745,25 @@ static int json_get_size_default(json_t *root, const char *key, uint64_t *dst)
 	}
 	fprintf(stderr, "recorder: config key '%s' must be integer or size string\n", key);
 	return -1;
+}
+
+static int json_get_optional_nonempty_string(json_t *root, const char *key,
+									  char **dst)
+{
+	json_t *node = json_object_get(root, key);
+	const char *value;
+	char *copy;
+
+	if (!node) return 0;
+	if (!json_is_string(node) || !(value = json_string_value(node)) || !value[0]) {
+		fprintf(stderr, "recorder: config key '%s' must be a non-empty string\n", key);
+		return -1;
+	}
+	copy = strdup(value);
+	if (!copy) return -1;
+	free(*dst);
+	*dst = copy;
+	return 0;
 }
 
 static int json_get_string_array(json_t *root, const char *key,
@@ -1155,9 +1190,16 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		json_get_bool_default(root, "compress_enabled", &cfg->compress_enabled) != 0 ||
 		json_get_uint_default(root, "compress_min_frame_bytes", &cfg->compress_min_frame_bytes) != 0 ||
 		json_get_bool_default(root, "compress_if_smaller", &cfg->compress_if_smaller) != 0 ||
+		json_get_optional_nonempty_string(root, "encryption_public_key",
+									  &cfg->encryption_public_key) != 0 ||
 		json_get_static_dict_paths(root, cfg) != 0 ||
 		json_get_modifier_list(root, "top-level config", &cfg->modifiers) != 0 ||
 		json_get_priority_groups(root, cfg) != 0) {
+		goto out;
+	}
+	if (cfg->encryption_public_key && access(cfg->encryption_public_key, R_OK) != 0) {
+		fprintf(stderr, "recorder: encryption public key is not readable: %s\n",
+				cfg->encryption_public_key);
 		goto out;
 	}
 	if (cfg->capture_all_fields && cfg->entry_format != 1) {
@@ -1387,6 +1429,50 @@ static time_t monotonic_now_sec(void)
 
 	clock_gettime(CLOCK_MONOTONIC, &ts);
 	return ts.tv_sec;
+}
+
+static int64_t clock_usec(clockid_t clock_id)
+{
+	struct timespec ts;
+
+	if (clock_gettime(clock_id, &ts) != 0) return -1;
+	return (int64_t)ts.tv_sec * 1000000LL + ts.tv_nsec / 1000;
+}
+
+/* BOOTTIME includes suspend time, preventing suspend/resume from looking
+ * like a realtime jump. */
+static void recorder_sample_clock(Recorder *r)
+{
+	int64_t realtime;
+	int64_t boot1;
+	int64_t boot2;
+	int64_t offset;
+	int64_t jump;
+
+#ifdef CLOCK_BOOTTIME
+	boot1 = clock_usec(CLOCK_BOOTTIME);
+	realtime = clock_usec(CLOCK_REALTIME);
+	boot2 = clock_usec(CLOCK_BOOTTIME);
+#else
+	boot1 = clock_usec(CLOCK_MONOTONIC);
+	realtime = clock_usec(CLOCK_REALTIME);
+	boot2 = boot1;
+#endif
+	if (realtime < 0 || boot1 < 0 || boot2 < 0) return;
+	offset = realtime - (boot1 + (boot2 - boot1) / 2);
+	if (!r->clock_offset_initialized) {
+		r->last_clock_offset_usec = offset;
+		r->clock_offset_initialized = 1;
+		return;
+	}
+	jump = offset - r->last_clock_offset_usec;
+	r->last_clock_offset_usec = offset;
+	if (jump < -CLOCK_BACKWARD_JUMP_THRESHOLD_USEC ||
+		jump > CLOCK_FORWARD_JUMP_THRESHOLD_USEC) {
+		r->clock_jump_usec = jump;
+		r->clock_jump_seq++;
+		recorder_verbose_log(r, "detected realtime clock jump: diff=%" PRId64 " usec", jump);
+	}
 }
 
 static int is_state_dir_name(const char *name)
@@ -1876,7 +1962,7 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 			}
 			continue;
 		}
-		if (segment_scan_path(path, NULL, NULL, &header, &footer, &committed_end) != 0) {
+		if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 			char idx_path[512];
 
 			build_index_path(idx_path, sizeof(idx_path), dir_name, seq);
@@ -1902,7 +1988,8 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 			struct stat idx_st;
 
 			build_index_path(idx_path, sizeof(idx_path), dir_name, header.segment_seq);
-			if (stat(idx_path, &idx_st) != 0 || idx_st.st_mtime < st.st_mtime) {
+			if ((header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 &&
+				(stat(idx_path, &idx_st) != 0 || idx_st.st_mtime < st.st_mtime)) {
 				index_rebuild_for_segment(path, idx_path);
 			}
 		}
@@ -2082,7 +2169,7 @@ static void collect_closed_segments_cb(const char *dir_name, void *ctx)
 			SegmentFooter footer;
 			size_t committed_end = 0;
 
-			if (segment_scan_path(path, NULL, NULL, &header, &footer, &committed_end) == 0) {
+			if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) == 0) {
 				size_t i;
 				for (i = 0; i < 8; i++) {
 					if (collect->recorder->config.priority_to_group[i] >= 0) {
@@ -2198,7 +2285,7 @@ static void boot_registry_rebuild_from_segments_cb(const char *dir_name, void *c
 			continue;
 		}
 		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
-		if (segment_scan_path(path, NULL, NULL, &header, &footer, &committed_end) != 0) {
+		if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 			continue;
 		}
 		boot = boot_registry_get(rebuild->boots, header.boot_id);
@@ -2904,6 +2991,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 {
 	SegmentHeader header;
 	char dir[256];
+	char idx_path[512];
 	char *dict_buf = NULL;
 	size_t dict_len = 0;
 
@@ -2922,6 +3010,15 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 		fprintf(stderr, "recorder: fopen(%s): %m\n", w->tmp_path);
 		return -1;
 	}
+	if (r->config.encryption_public_key &&
+		segment_encryptor_create(r->config.encryption_public_key, &w->encryptor) != 0) {
+		fprintf(stderr, "recorder: failed to initialize encryption for segment %s\n",
+				w->path);
+		fclose(w->fp);
+		unlink(w->tmp_path);
+		w->fp = NULL;
+		return -1;
+	}
 
 	memset(&header, 0, sizeof(header));
 	header.segment_seq = w->segment_seq;
@@ -2933,37 +3030,67 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	if (r->config.entry_format == 0) {
 		header.flags |= SEGMENT_FLAG_COMPACT_ENTRIES;
 	}
+	if (w->encryptor) {
+		header.flags |= SEGMENT_FLAG_ENCRYPTED;
+	}
 	if (r->config.groups[w->group_index].static_dict_path) {
 		dict_buf = slurp_file(r->config.groups[w->group_index].static_dict_path, &dict_len);
 		if (!dict_buf || dict_len == 0) {
 			free(dict_buf);
 			fclose(w->fp);
 			unlink(w->tmp_path);
+			segment_encryptor_free(w->encryptor);
+			w->encryptor = NULL;
 			w->fp = NULL;
 			return -1;
 		}
 		header.flags |= SEGMENT_FLAG_HAS_STATIC_DICT;
 	}
-	if (segment_write_header(w->fp, &header, dict_buf, dict_len) != 0) {
+	if (segment_write_header(w->fp, &header, dict_buf, dict_len, w->encryptor) != 0) {
 		fclose(w->fp);
 		free(dict_buf);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		return -1;
 	}
+	build_index_path(idx_path, sizeof(idx_path), w->group_name, w->segment_seq);
+	if (index_writer_open(idx_path, header.segment_seq, header.flags, &w->index_writer) != 0) {
+		fclose(w->fp);
+		free(dict_buf);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
+		w->fp = NULL;
+		unlink(w->tmp_path);
+		return -1;
+	}
+	w->index_header = header;
 	if (flush_and_sync_file(w->fp) != 0) {
 		fclose(w->fp);
+		index_writer_abort(w->index_writer, 1);
+		w->index_writer = NULL;
 		unlink(w->tmp_path);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		return -1;
 	}
 	if (rename(w->tmp_path, w->path) != 0) {
 		fclose(w->fp);
+		index_writer_abort(w->index_writer, 1);
+		w->index_writer = NULL;
 		unlink(w->tmp_path);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		return -1;
 	}
 	if (fsync_dir_path(dir) != 0) {
 		fclose(w->fp);
+		index_writer_abort(w->index_writer, 1);
+		w->index_writer = NULL;
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		return -1;
 	}
@@ -2973,13 +3100,26 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	strncpy(w->timezone, header.timezone, sizeof(w->timezone) - 1);
 	w->timezone[sizeof(w->timezone) - 1] = '\0';
 	w->boot_seq = entry->boot_seq;
-	w->bytes_written = segment_header_encoded_size();
+	{
+		off_t pos = ftello(w->fp);
+		if (pos < 0) {
+			fclose(w->fp);
+			index_writer_abort(w->index_writer, 1);
+			w->index_writer = NULL;
+			segment_encryptor_free(w->encryptor);
+			w->encryptor = NULL;
+			w->fp = NULL;
+			w->open = 0;
+			return -1;
+		}
+		w->bytes_written = (uint64_t)pos;
+	}
 	w->entry_count = 0;
 	w->first_realtime_ts = entry->realtime_ts;
 	w->first_monotonic_ts = entry->monotonic_ts;
 	w->last_realtime_ts = entry->realtime_ts;
 	w->last_monotonic_ts = entry->monotonic_ts;
-	w->initial_time_delta = (int64_t)entry->realtime_ts - (int64_t)entry->monotonic_ts;
+	w->clock_jump_seen_seq = r->clock_jump_seq;
 	w->opened_mono_sec = monotonic_now_sec();
 	w->last_chunk_flush_mono_sec = w->opened_mono_sec;
 	w->last_sync_mono_sec = w->opened_mono_sec;
@@ -3011,6 +3151,8 @@ static int writer_flush_chunk(PriorityWriter *w)
 	uint32_t raw_size32;
 	uint32_t stored_size32;
 	uint32_t frame_flags = SEGMENT_FRAME_FLAG_NONE;
+	SegmentFrameInfo frame_info;
+	off_t frame_offset;
 	int rv = -1;
 
 	if (!w->builder_live || w->count == 0) {
@@ -3069,13 +3211,26 @@ static int writer_flush_chunk(PriorityWriter *w)
 	}
 
 	stored_size32 = (uint32_t)stored_size;
-	if (segment_write_frame(w->fp, frame_flags, stored_buf, stored_size32, raw_size32) != 0) {
+	frame_offset = ftello(w->fp);
+	if (frame_offset < 0) goto out;
+	if (segment_write_frame(w->fp, w->encryptor, frame_flags, stored_buf,
+						stored_size32, raw_size32) != 0) {
 		goto out;
 	}
-	if (fflush(w->fp) != 0) {
-		goto out;
+	if (fflush(w->fp) != 0) goto out;
+	memset(&frame_info, 0, sizeof(frame_info));
+	frame_info.flags = frame_flags;
+	frame_info.stored_len = stored_size32;
+	frame_info.uncompressed_len = raw_size32;
+	frame_info.file_offset = (uint64_t)frame_offset;
+	frame_info.frame_len = 16u + stored_size32 + 4u + (w->encryptor ? 16u : 0u);
+	if (index_writer_append(w->index_writer, &w->index_header, &frame_info,
+						raw_buf, raw_size) != 0) goto out;
+	{
+		off_t pos = ftello(w->fp);
+		if (pos < 0) goto out;
+		w->bytes_written = (uint64_t)pos;
 	}
-	w->bytes_written += 16 + stored_size + 4;
 	w->unsynced_frames++;
 	if (w->durable_per_frame ||
 		(w->durability_flush_frames != 0 && w->unsynced_frames >= w->durability_flush_frames) ||
@@ -3103,7 +3258,8 @@ out:
 	return rv;
 }
 
-static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reason)
+static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reason,
+							uint32_t rotation_reason)
 {
 	SegmentFooter footer;
 
@@ -3114,23 +3270,43 @@ static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reas
 		return -1;
 	}
 	memset(&footer, 0, sizeof(footer));
+	footer.rotation_reason = rotation_reason;
 	footer.entry_count = w->entry_count;
 	footer.last_realtime_ts = w->last_realtime_ts;
 	footer.last_monotonic_ts = w->last_monotonic_ts;
 	if (segment_write_footer(w->fp, &footer) != 0) {
 		fclose(w->fp);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		w->open = 0;
 		return -1;
 	}
 	if (flush_and_sync_file(w->fp) != 0) {
 		fclose(w->fp);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
 		w->fp = NULL;
 		w->open = 0;
 		return -1;
 	}
-	w->bytes_written += segment_footer_encoded_size();
+	{
+		off_t pos = ftello(w->fp);
+		if (pos >= 0) w->bytes_written = (uint64_t)pos;
+	}
+	if (index_writer_close(w->index_writer, w->bytes_written) != 0) {
+		w->index_writer = NULL;
+		fclose(w->fp);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
+		w->fp = NULL;
+		w->open = 0;
+		return -1;
+	}
+	w->index_writer = NULL;
 	fclose(w->fp);
+	segment_encryptor_free(w->encryptor);
+	w->encryptor = NULL;
 	{
 		char dir[256];
 
@@ -3167,21 +3343,11 @@ static int writer_sync_if_due(PriorityWriter *w)
 	return 0;
 }
 
-static int recorder_close_writer(Recorder *r, PriorityWriter *w, const char *reason)
+static int recorder_close_writer(Recorder *r, PriorityWriter *w, const char *reason,
+							uint32_t rotation_reason)
 {
-	char seg_path[512];
-	char idx_path[512];
-	uint64_t segment_seq = w->segment_seq;
-	const char *group_name = w->group_name;
-
-	strncpy(seg_path, w->path, sizeof(seg_path) - 1);
-	seg_path[sizeof(seg_path) - 1] = '\0';
-	if (writer_close_segment(r, w, reason) != 0) {
+	if (writer_close_segment(r, w, reason, rotation_reason) != 0) {
 		return -1;
-	}
-	if (seg_path[0] != '\0') {
-		build_index_path(idx_path, sizeof(idx_path), group_name, segment_seq);
-		index_rebuild_for_segment(seg_path, idx_path);
 	}
 	retention_enforce(r);
 	return 0;
@@ -3311,14 +3477,12 @@ static int recorder_ensure_writer(Recorder *r, const LogEntry *entry)
 									w->segment_seq, w->group_name, reason_text,
 									timezone, w->timezone);
 			break;
-		case ROTATE_REASON_TIME_DELTA:
+		case ROTATE_REASON_CLOCK_BACKWARD:
+		case ROTATE_REASON_CLOCK_FORWARD:
 			recorder_verbose_log(r,
-									"rotating segment seq=%" PRIu64 " group=%s because %s (current_delta=%" PRId64 " usec, initial_delta=%" PRId64 " usec, diff=%" PRId64 " usec, threshold=%" PRIu64 " usec)",
+									"rotating segment seq=%" PRIu64 " group=%s because %s (jump=%" PRId64 " usec)",
 									w->segment_seq, w->group_name, reason_text,
-									(int64_t)entry->realtime_ts - (int64_t)entry->monotonic_ts,
-									w->initial_time_delta,
-									decision.delta_diff,
-									(uint64_t)TIME_DELTA_ROTATE_THRESHOLD_USEC);
+									decision.delta_diff);
 			break;
 		case ROTATE_REASON_AGE:
 			now_sec = monotonic_now_sec();
@@ -3343,7 +3507,7 @@ static int recorder_ensure_writer(Recorder *r, const LogEntry *entry)
 									w->segment_seq, w->group_name, reason_text);
 			break;
 		}
-		if (recorder_close_writer(r, w, reason_text) != 0) {
+		if (recorder_close_writer(r, w, reason_text, (uint32_t)decision.reason) != 0) {
 			return -1;
 		}
 	}
@@ -3398,7 +3562,8 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 		}
 	}
 	if (w->bytes_written >= recorder_segment_limit(r)) {
-		if (recorder_close_writer(r, w, "segment size limit reached after write") != 0) {
+		if (recorder_close_writer(r, w, "segment size limit reached after write",
+							SEGMENT_ROTATION_REASON_SIZE) != 0) {
 			return -1;
 		}
 	}
@@ -3556,9 +3721,6 @@ static void recorder_shutdown(Recorder *r)
 	size_t i;
 	uint64_t max_last_rt[MAX_PRIORITY_GROUPS] = {0};
 	char boot_ids[MAX_PRIORITY_GROUPS][RECORDER_BOOT_ID_SIZE + 1];
-	char closed_paths[MAX_PRIORITY_GROUPS][512];
-	uint64_t closed_seqs[MAX_PRIORITY_GROUPS] = {0};
-	int closed_segments[MAX_PRIORITY_GROUPS] = {0};
 	int close_ok = 1;
 
 	memset(boot_ids, 0, sizeof(boot_ids));
@@ -3576,13 +3738,9 @@ static void recorder_shutdown(Recorder *r)
 		strncpy(boot_ids[i], r->writers[i].boot_id, RECORDER_BOOT_ID_SIZE);
 		boot_ids[i][RECORDER_BOOT_ID_SIZE] = '\0';
 		if (r->writers[i].open) {
-			strncpy(closed_paths[i], r->writers[i].path, sizeof(closed_paths[i]) - 1);
-			closed_paths[i][sizeof(closed_paths[i]) - 1] = '\0';
-			closed_seqs[i] = r->writers[i].segment_seq;
-			if (writer_close_segment(r, &r->writers[i], "shutdown") != 0) {
+			if (writer_close_segment(r, &r->writers[i], "shutdown",
+							SEGMENT_ROTATION_REASON_SHUTDOWN) != 0) {
 				close_ok = 0;
-			} else {
-				closed_segments[i] = 1;
 			}
 		}
 	}
@@ -3599,15 +3757,7 @@ static void recorder_shutdown(Recorder *r)
 	}
 	free(r->pending_cursor);
 	r->pending_cursor = NULL;
-	for (i = 0; i < r->config.group_count; i++) {
-		if (closed_segments[i]) {
-			char idx_path[512];
-
-			build_index_path(idx_path, sizeof(idx_path), r->writers[i].group_name,
-							 closed_seqs[i]);
-			index_rebuild_for_segment(closed_paths[i], idx_path);
-		}
-	}
+	/* Index files are appended while segments are written and finalized on close. */
 	retention_enforce(r);
 	for (i = 0; i < r->config.group_count; i++) {
 		if (boot_ids[i][0] != '\0') {
@@ -3825,6 +3975,7 @@ int main(int argc, char **argv)
 	#endif
 
 	while (!g_shutdown) {
+		recorder_sample_clock(&r);
 		size_t n = recorder_step(&r);
 
 		if (n > 0) {

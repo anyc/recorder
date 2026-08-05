@@ -7,14 +7,124 @@
 #include <unistd.h>
 
 #include <flatcc/flatcc_builder.h>
+#include <openssl/evp.h>
+#include <openssl/pem.h>
+#include <openssl/rsa.h>
 
 #include "recorder_builder.h"
+#include "helper.h"
 #include "librecorder.h"
 #include "segment.h"
 
 typedef struct {
 	int seen;
 } SmokeContext;
+
+static int create_rsa_keypair(char *private_path, char *public_path)
+{
+	EVP_PKEY_CTX *key_ctx = NULL;
+	EVP_PKEY *key = NULL;
+	FILE *private_fp = NULL;
+	FILE *public_fp = NULL;
+	int private_fd = -1;
+	int public_fd = -1;
+	int rv = -1;
+
+	private_fd = mkstemp(private_path);
+	public_fd = mkstemp(public_path);
+	if (private_fd < 0 || public_fd < 0) {
+		goto out;
+	}
+	private_fp = fdopen(private_fd, "wb");
+	if (!private_fp) {
+		goto out;
+	}
+	private_fd = -1;
+	public_fp = fdopen(public_fd, "wb");
+	if (!public_fp) {
+		goto out;
+	}
+	public_fd = -1;
+
+	key_ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_RSA, NULL);
+	if (!key_ctx || EVP_PKEY_keygen_init(key_ctx) <= 0 ||
+		EVP_PKEY_CTX_set_rsa_keygen_bits(key_ctx, 2048) <= 0 ||
+		EVP_PKEY_keygen(key_ctx, &key) <= 0 ||
+		PEM_write_PrivateKey(private_fp, key, NULL, NULL, 0, NULL, NULL) != 1 ||
+		PEM_write_PUBKEY(public_fp, key) != 1 ||
+		fclose(private_fp) != 0) {
+		goto out;
+	}
+	private_fp = NULL;
+	if (fclose(public_fp) != 0) {
+		public_fp = NULL;
+		goto out;
+	}
+	public_fp = NULL;
+	rv = 0;
+
+out:
+	if (private_fp) {
+		fclose(private_fp);
+	}
+	if (public_fp) {
+		fclose(public_fp);
+	}
+	if (private_fd >= 0) {
+		close(private_fd);
+	}
+	if (public_fd >= 0) {
+		close(public_fd);
+	}
+	EVP_PKEY_free(key);
+	EVP_PKEY_CTX_free(key_ctx);
+	if (rv != 0) {
+		unlink(private_path);
+		unlink(public_path);
+	}
+	return rv;
+}
+
+static int read_file(const char *path, unsigned char **buf_out, size_t *size_out)
+{
+	FILE *fp = NULL;
+	unsigned char *buf = NULL;
+	long end;
+	int rv = -1;
+
+	*buf_out = NULL;
+	*size_out = 0;
+	fp = fopen(path, "rb");
+	if (!fp || fseek(fp, 0, SEEK_END) != 0 || (end = ftell(fp)) < 0 ||
+		fseek(fp, 0, SEEK_SET) != 0) {
+		goto out;
+	}
+	buf = malloc(end ? (size_t)end : 1);
+	if (!buf || fread(buf, 1, (size_t)end, fp) != (size_t)end) {
+		goto out;
+	}
+	*buf_out = buf;
+	*size_out = (size_t)end;
+	buf = NULL;
+	rv = 0;
+
+out:
+	free(buf);
+	if (fp) {
+		fclose(fp);
+	}
+	return rv;
+}
+
+static void update_encrypted_frame_crc(unsigned char *frame)
+{
+	uint32_t stored_len = read_u32_le(frame + 4);
+	unsigned char *tag = frame + 16 + stored_len;
+	uint32_t crc = recorder_crc32(frame, 16) ^
+		recorder_crc32(frame + 16, stored_len) ^ recorder_crc32(tag, 16);
+
+	write_u32_le(tag + 16, crc);
+}
 
 static int check_active_unclosed_tiny_frame(void)
 {
@@ -47,8 +157,8 @@ static int check_active_unclosed_tiny_frame(void)
 	strcpy(header.timezone, "+0000");
 	header.first_realtime_ts = 1234;
 	header.first_monotonic_ts = 5678;
-	if (segment_write_header(fp, &header, NULL, 0) != 0 ||
-		segment_write_frame(fp, 0, &payload, 0, 0) != 0 ||
+	if (segment_write_header(fp, &header, NULL, 0, NULL) != 0 ||
+		segment_write_frame(fp, NULL, 0, &payload, 0, 0) != 0 ||
 		fflush(fp) != 0) {
 		fprintf(stderr, "smoke: write active segment failed\n");
 		fclose(fp);
@@ -57,7 +167,7 @@ static int check_active_unclosed_tiny_frame(void)
 	}
 
 	memset(&footer, 0, sizeof(footer));
-	if (segment_scan_path(path, NULL, NULL, &header, &footer, &committed_end) != 0) {
+	if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 		fprintf(stderr, "smoke: scan active segment failed\n");
 		fclose(fp);
 		unlink(path);
@@ -121,6 +231,150 @@ static int check_frame(const SegmentHeader *header,
 	}
 	sc->seen++;
 	return 0;
+}
+
+static int check_encrypted_segment(const void *chunk_buf, size_t chunk_size)
+{
+	char private_path[] = "/tmp/recorder-private-key-XXXXXX";
+	char public_path[] = "/tmp/recorder-public-key-XXXXXX";
+	char wrong_private_path[] = "/tmp/recorder-wrong-private-key-XXXXXX";
+	char wrong_public_path[] = "/tmp/recorder-wrong-public-key-XXXXXX";
+	char segment_path[] = "/tmp/recorder-encrypted-segment-XXXXXX";
+	SegmentEncryptor *encryptor = NULL;
+	SegmentDecryptor *decryptor = NULL;
+	SegmentDecryptor *wrong_decryptor = NULL;
+	SegmentHeader header;
+	SegmentFooter footer;
+	SmokeContext ctx;
+	unsigned char *segment_buf = NULL;
+	size_t segment_size = 0;
+	size_t frame_offset = 0;
+	size_t committed_end = 0;
+	uint32_t stored_len;
+	uint32_t frame_len;
+	FILE *fp = NULL;
+	int fd = -1;
+	int rv = -1;
+
+	if (create_rsa_keypair(private_path, public_path) != 0 ||
+		create_rsa_keypair(wrong_private_path, wrong_public_path) != 0 ||
+		segment_encryptor_create(public_path, &encryptor) != 0 ||
+		segment_decryptor_create(private_path, &decryptor) != 0 ||
+		segment_decryptor_create(wrong_private_path, &wrong_decryptor) != 0) {
+		fprintf(stderr, "smoke: create encryption keys failed\n");
+		goto out;
+	}
+
+	fd = mkstemp(segment_path);
+	if (fd < 0 || !(fp = fdopen(fd, "wb"))) {
+		fprintf(stderr, "smoke: create encrypted segment failed\n");
+		goto out;
+	}
+	fd = -1;
+	memset(&header, 0, sizeof(header));
+	header.flags = SEGMENT_FLAG_ENCRYPTED;
+	header.segment_seq = 9;
+	header.boot_seq = 3;
+	strcpy(header.boot_id, "boot-a");
+	strcpy(header.timezone, "+0000");
+	header.first_realtime_ts = 1234;
+	header.first_monotonic_ts = 5678;
+	memset(&footer, 0, sizeof(footer));
+	footer.entry_count = 1;
+	footer.last_realtime_ts = 1234;
+	footer.last_monotonic_ts = 5678;
+	if (segment_write_header(fp, &header, NULL, 0, encryptor) != 0 ||
+		segment_write_frame(fp, encryptor, 0, chunk_buf, (uint32_t)chunk_size,
+							(uint32_t)chunk_size) != 0 ||
+		segment_write_footer(fp, &footer) != 0 || fclose(fp) != 0) {
+		fprintf(stderr, "smoke: write encrypted segment failed\n");
+		fp = NULL;
+		goto out;
+	}
+	fp = NULL;
+
+	memset(&header, 0, sizeof(header));
+	memset(&footer, 0, sizeof(footer));
+	if (segment_scan_path(segment_path, NULL, NULL, NULL, &header, &footer,
+						  &committed_end) != 0 ||
+		(header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 ||
+		footer.entry_count != 1 || committed_end == 0) {
+		fprintf(stderr, "smoke: encrypted metadata-only scan failed\n");
+		goto out;
+	}
+	ctx.seen = 0;
+	if (segment_scan_path(segment_path, NULL, check_frame, &ctx, NULL, NULL,
+						  NULL) == 0) {
+		fprintf(stderr, "smoke: encrypted scan accepted missing key\n");
+		goto out;
+	}
+	ctx.seen = 0;
+	if (segment_scan_path(segment_path, wrong_decryptor, check_frame, &ctx,
+						  NULL, NULL, NULL) == 0) {
+		fprintf(stderr, "smoke: encrypted scan accepted wrong key\n");
+		goto out;
+	}
+	ctx.seen = 0;
+	if (segment_scan_path(segment_path, decryptor, check_frame, &ctx, &header,
+						  &footer, &committed_end) != 0 || ctx.seen != 1 ||
+		footer.entry_count != 1) {
+		fprintf(stderr, "smoke: encrypted round-trip failed\n");
+		goto out;
+	}
+
+	if (read_file(segment_path, &segment_buf, &segment_size) != 0 ||
+		segment_read_header(segment_buf, segment_size, &header, &frame_offset) != 0 ||
+		frame_offset + 16 > segment_size) {
+		fprintf(stderr, "smoke: read encrypted segment bytes failed\n");
+		goto out;
+	}
+	stored_len = read_u32_le(segment_buf + frame_offset + 4);
+	frame_len = read_u32_le(segment_buf + frame_offset + 12);
+	if (stored_len != chunk_size ||
+		frame_len != 16u + stored_len + 16u + 4u ||
+		frame_len > segment_size - frame_offset || stored_len == 0 ||
+		memcmp(segment_buf + frame_offset + 16, chunk_buf, stored_len) == 0) {
+		fprintf(stderr, "smoke: encrypted frame layout is invalid\n");
+		goto out;
+	}
+
+	/* Recompute the CRC so these mutations reach GCM authentication. */
+	segment_buf[frame_offset + 16] ^= 1;
+	update_encrypted_frame_crc(segment_buf + frame_offset);
+	ctx.seen = 0;
+	if (segment_scan_buffer(segment_buf, segment_size, decryptor, check_frame,
+							&ctx, NULL, NULL, NULL) == 0) {
+		fprintf(stderr, "smoke: encrypted scan accepted ciphertext tampering\n");
+		goto out;
+	}
+	segment_buf[frame_offset + 16] ^= 1;
+	segment_buf[frame_offset + 16 + stored_len] ^= 1;
+	update_encrypted_frame_crc(segment_buf + frame_offset);
+	ctx.seen = 0;
+	if (segment_scan_buffer(segment_buf, segment_size, decryptor, check_frame,
+							&ctx, NULL, NULL, NULL) == 0) {
+		fprintf(stderr, "smoke: encrypted scan accepted tag tampering\n");
+		goto out;
+	}
+	rv = 0;
+
+out:
+	if (fp) {
+		fclose(fp);
+	}
+	if (fd >= 0) {
+		close(fd);
+	}
+	free(segment_buf);
+	segment_encryptor_free(encryptor);
+	segment_decryptor_free(decryptor);
+	segment_decryptor_free(wrong_decryptor);
+	unlink(segment_path);
+	unlink(private_path);
+	unlink(public_path);
+	unlink(wrong_private_path);
+	unlink(wrong_public_path);
+	return rv;
 }
 
 static int check_reader_entry(const RecorderEntry *entry, void *ctx)
@@ -187,7 +441,7 @@ int main(void)
 	strcpy(header.timezone, "+0000");
 	header.first_realtime_ts = 1234;
 	header.first_monotonic_ts = 5678;
-	if (segment_write_header(fp, &header, NULL, 0) != 0) {
+	if (segment_write_header(fp, &header, NULL, 0, NULL) != 0) {
 		fprintf(stderr, "smoke: write header failed\n");
 		fclose(fp);
 		unlink(path);
@@ -231,7 +485,7 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
-	if (segment_write_frame(fp, 0, chunk_buf, (uint32_t)chunk_size_raw, (uint32_t)chunk_size_raw) != 0) {
+	if (segment_write_frame(fp, NULL, 0, chunk_buf, (uint32_t)chunk_size_raw, (uint32_t)chunk_size_raw) != 0) {
 		fprintf(stderr, "smoke: write frame failed\n");
 		free(chunk_buf);
 		fclose(fp);
@@ -249,12 +503,25 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
+	if (fclose(fp) != 0) {
+		fprintf(stderr, "smoke: close segment failed\n");
+		free(chunk_buf);
+		flatcc_builder_clear(&B);
+		unlink(path);
+		return 1;
+	}
+	fp = NULL;
+	if (check_encrypted_segment(chunk_buf, chunk_size_raw) != 0) {
+		free(chunk_buf);
+		flatcc_builder_clear(&B);
+		unlink(path);
+		return 1;
+	}
 	free(chunk_buf);
 	flatcc_builder_clear(&B);
-	fclose(fp);
 
 	ctx.seen = 0;
-	if (segment_scan_path(path, check_frame, &ctx, &header, &footer, &committed_end) != 0) {
+	if (segment_scan_path(path, NULL, check_frame, &ctx, &header, &footer, &committed_end) != 0) {
 		fprintf(stderr, "smoke: scan failed\n");
 		unlink(path);
 		return 1;

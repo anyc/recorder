@@ -14,6 +14,7 @@ REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
 FLATCC_PKG ?= flatccrt
 PCRE2_PKG ?= libpcre2-8
+OPENSSL_PKG ?= libcrypto
 PCRE2 ?= auto
 LIBC_REGEX ?= 1
 SYSTEMD ?= auto
@@ -42,6 +43,7 @@ endif
 CPPFLAGS += $(FLATCC_CPPFLAGS)
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags jansson)
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags libzstd)
+CPPFLAGS += $(shell $(PKG_CONFIG) --cflags $(OPENSSL_PKG))
 CPPFLAGS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --cflags libsystemd) -DHAVE_SYSTEMD)
 CPPFLAGS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --cflags $(PCRE2_PKG)) -DHAVE_PCRE2)
 CPPFLAGS += $(if $(filter 1 yes true,$(LIBC_REGEX)),-DHAVE_LIBC_REGEX)
@@ -50,6 +52,7 @@ CPPFLAGS += -DRECORDER_CONFIG_PATH=\"$(RECORDER_CONFIG_PATH)\"
 
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd)
+LDLIBS += $(shell $(PKG_CONFIG) --libs $(OPENSSL_PKG))
 LDLIBS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --libs libsystemd))
 LDLIBS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --libs $(PCRE2_PKG)))
 LDLIBS += $(FLATCC_LIBS)
@@ -61,16 +64,16 @@ all: recorder player librecorder.a
 repo:
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) all
 
-recorder: recorder.o fallback_source.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+recorder: recorder.o fallback_source.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-player: player.o librecorder.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+player: player.o librecorder.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-librecorder.a: librecorder.o segment.o $(FLATCC_RUNTIME_OBJS)
+librecorder.a: librecorder.o segment.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 	$(AR) rcs $@ $^
 
-smoke-test: smoke_test.o librecorder.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+smoke-test: smoke_test.o librecorder.o helper.o segment.o index.o recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 install: all

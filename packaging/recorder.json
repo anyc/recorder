@@ -8,6 +8,8 @@
   "compress_enabled": true,
   "compress_min_frame_bytes": 256,
   "compress_if_smaller": true,
+  # Optional PEM public key. When set, frame payloads are encrypted.
+  # "encryption_public_key": "/etc/recorder/encryption-public.pem",
   "capture_message_id": false,
   "capture_unit": true,
   "capture_hostname": false,

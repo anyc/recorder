@@ -10,7 +10,8 @@ Author: Mario Kicherer <dev@kicherer.org>
 
 - Reads from the local systemd journal.
 - Writes retained logs into segment files under a configurable log directory.
-- Rotates segments by size, age, boot changes, and some time metadata changes.
+- Rotates segments by size, age, boot changes, timezone changes, and significant
+  realtime clock jumps (backward jumps over 1 ms or forward jumps over 1 s).
 - Enforces a configurable total disk usage limit.
 - Can group multiple journal priorities into the same segment directory to
   reduce storage wear.
@@ -120,13 +121,20 @@ state, lock, and cursor files for that run.
 Run the player on one segment:
 
 ```sh
-./player /var/log/recorder/high/42.seg
+./player -i /var/log/recorder/high/42.seg
 ```
 
 Run the player on a whole recorder directory:
 
 ```sh
-./player /var/log/recorder
+./player -D /var/log/recorder
+```
+
+Encrypted segments require the corresponding PEM private key:
+
+```sh
+./player -D /var/log/recorder \
+  --encryption-private-key /path/to/encryption-private.pem
 ```
 
 ## Storage Comparison
@@ -377,6 +385,8 @@ modifiers would route it in a priority loop or after eight reroutes.
   Minimum uncompressed frame size before compression is attempted.
 - `compress_if_smaller`
   If `true`, compressed output is only kept when it is smaller than the original frame.
+- `encryption_public_key`
+  Optional path to a readable PEM public key. When set, recorder encrypts frame payloads in newly opened segments. The player must be given the matching private key with `--encryption-private-key`. Encrypted segments receive indexes while they are written; the player still needs the private key to read their payloads.
 - `capture_message_id`
   Store `MESSAGE_ID` when present.
 - `capture_unit`

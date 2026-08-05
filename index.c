@@ -9,12 +9,33 @@
 
 #define RECORDER_INDEX_MAGIC "RECIDX01"
 #define RECORDER_INDEX_VERSION 1u
+#define RECORDER_INDEX_HEADER_SIZE 24u
+#define RECORDER_INDEX_FOOTER_MAGIC "RECIF001"
+#define RECORDER_INDEX_FOOTER_SIZE 28u
 #define RECORDER_SERVICE_HASH_SLOTS 4u
 #define RECORDER_SERVICE_HASH_BYTES (RECORDER_SERVICE_HASH_SLOTS * sizeof(uint64_t))
 
 typedef struct {
 	FILE *fp;
 } IndexBuildContext;
+
+typedef struct {
+	IndexWriter *writer;
+} IndexWriterBuildContext;
+
+struct IndexWriter {
+	FILE *fp;
+	char *path;
+	uint64_t record_count;
+};
+
+static int append_index_frame_cb(const SegmentHeader *header,
+							 const SegmentFrameInfo *frame,
+							 const void *chunk_buf, size_t chunk_size, void *ctx)
+{
+	IndexWriterBuildContext *bc = ctx;
+	return index_writer_append(bc->writer, header, frame, chunk_buf, chunk_size);
+}
 
 static uint64_t fnv1a64(const char *s)
 {
@@ -137,49 +158,113 @@ static int write_index_frame(const SegmentHeader *header,
 	return ferror(ib->fp) ? -1 : 0;
 }
 
-int index_rebuild_for_segment(const char *segment_path, const char *index_path)
+int index_writer_open(const char *path, uint64_t segment_seq, uint32_t flags,
+					  IndexWriter **writer_out)
 {
-	char tmp_path[512];
-	FILE *fp;
-	SegmentHeader header;
-	SegmentFooter footer;
-	unsigned char head[8 + 4 + 8 + 8 + 8];
-	IndexBuildContext ctx;
-	int rc = -1;
-	size_t committed_end = 0;
-
-	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", index_path);
-	fp = fopen(tmp_path, "wb");
-	if (!fp) {
-		return -1;
-	}
-	if (segment_scan_path(segment_path, NULL, NULL, &header, &footer, &committed_end) != 0) {
-		fclose(fp);
-		unlink(tmp_path);
+	IndexWriter *writer;
+	unsigned char head[RECORDER_INDEX_HEADER_SIZE];
+	if (!path || !writer_out) return -1;
+	writer = calloc(1, sizeof(*writer));
+	if (!writer) return -1;
+	writer->path = strdup(path);
+	if (!writer->path) { free(writer); return -1; }
+	writer->fp = fopen(path, "w+b");
+	if (!writer->fp) { free(writer->path); free(writer); return -1; }
+	/* Indexes are advisory and intentionally not forced to storage. Keep the
+	 * stream unbuffered so the active final-path file remains readable. */
+	if (setvbuf(writer->fp, NULL, _IONBF, 0) != 0) {
+		fclose(writer->fp);
+		unlink(path);
+		free(writer->path);
+		free(writer);
 		return -1;
 	}
 	memcpy(head, RECORDER_INDEX_MAGIC, 8);
 	write_u32_le(head + 8, RECORDER_INDEX_VERSION);
-	write_u64_le(head + 12, header.segment_seq);
-	write_u64_le(head + 20, (uint64_t)footer.entry_count);
-	write_u64_le(head + 28, (uint64_t)committed_end);
-	if (fwrite(head, 1, sizeof(head), fp) != sizeof(head)) {
-		fclose(fp);
+	write_u64_le(head + 12, segment_seq);
+	write_u32_le(head + 20, flags);
+	if (fwrite(head, 1, sizeof(head), writer->fp) != sizeof(head)) {
+		fclose(writer->fp); unlink(path); free(writer->path); free(writer); return -1;
+	}
+	*writer_out = writer;
+	return 0;
+}
+
+int index_writer_append(IndexWriter *writer, const SegmentHeader *header,
+						const SegmentFrameInfo *frame,
+						const void *chunk_buf, size_t chunk_size)
+{
+	IndexBuildContext ctx;
+	if (!writer || !writer->fp || !header || !frame || !chunk_buf) return -1;
+	ctx.fp = writer->fp;
+	if (write_index_frame(header, frame, chunk_buf, chunk_size, &ctx) != 0) return -1;
+	writer->record_count++;
+	return 0;
+}
+
+int index_writer_close(IndexWriter *writer, uint64_t segment_committed_end)
+{
+	unsigned char body[RECORDER_INDEX_FOOTER_SIZE];
+	unsigned char *all = NULL;
+	long end;
+	uint32_t crc;
+	int rc = -1;
+	if (!writer || !writer->fp) return -1;
+	if (fseek(writer->fp, 0, SEEK_END) != 0 || (end = ftell(writer->fp)) < 0) goto out;
+	if ((uint64_t)end > SIZE_MAX) goto out;
+	all = malloc((size_t)end);
+	if (!all || fseek(writer->fp, 0, SEEK_SET) != 0 ||
+		fread(all, 1, (size_t)end, writer->fp) != (size_t)end) goto out;
+	crc = recorder_crc32(all, (size_t)end);
+	memcpy(body, RECORDER_INDEX_FOOTER_MAGIC, 8);
+	write_u64_le(body + 8, writer->record_count);
+	write_u64_le(body + 16, segment_committed_end);
+	write_u32_le(body + 24, crc);
+	if (fseek(writer->fp, 0, SEEK_END) != 0 ||
+		fwrite(body, 1, sizeof(body), writer->fp) != sizeof(body)) goto out;
+	rc = 0;
+out:
+	free(all);
+	fclose(writer->fp);
+	free(writer->path);
+	free(writer);
+	return rc;
+}
+
+void index_writer_abort(IndexWriter *writer, int unlink_path)
+{
+	if (!writer) return;
+	if (writer->fp) fclose(writer->fp);
+	if (unlink_path && writer->path) unlink(writer->path);
+	free(writer->path);
+	free(writer);
+}
+
+int index_rebuild_for_segment(const char *segment_path, const char *index_path)
+{
+	char tmp_path[512];
+	SegmentHeader header;
+	SegmentFooter footer;
+	IndexWriter *writer = NULL;
+	IndexWriterBuildContext ctx;
+	int rc = -1;
+	size_t committed_end = 0;
+
+	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", index_path);
+	if (segment_scan_path(segment_path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 		unlink(tmp_path);
 		return -1;
 	}
-	ctx.fp = fp;
-	if (segment_scan_path(segment_path, write_index_frame, &ctx, NULL, NULL, NULL) != 0) {
-		fclose(fp);
+	if (index_writer_open(tmp_path, header.segment_seq, header.flags, &writer) != 0) return -1;
+	ctx.writer = writer;
+	if (segment_scan_path(segment_path, NULL, append_index_frame_cb, &ctx, NULL, NULL, NULL) != 0) {
+		index_writer_abort(writer, 1);
+		return -1;
+	}
+	if (index_writer_close(writer, committed_end) != 0) {
 		unlink(tmp_path);
 		return -1;
 	}
-	if (fflush(fp) != 0 || fsync(fileno(fp)) != 0) {
-		fclose(fp);
-		unlink(tmp_path);
-		return -1;
-	}
-	fclose(fp);
 	rc = rename(tmp_path, index_path);
 	if (rc != 0) {
 		unlink(tmp_path);

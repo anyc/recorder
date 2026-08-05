@@ -63,6 +63,7 @@ typedef struct {
 	const char *boot_filter;
 	const char *since_arg;
 	const char *until_arg;
+	const char *encryption_private_key;
 	const char *boot_id_filter;
 	uint32_t boot_seq_filter;
 	int have_boot_seq_filter;
@@ -694,7 +695,7 @@ static int collect_boots_from_segments(const SegmentPath *items, size_t count,
 		SegmentFooter footer;
 		size_t committed_end;
 
-		if (segment_scan_path(items[i].path, NULL, NULL, &header, &footer,
+		if (segment_scan_path(items[i].path, NULL, NULL, NULL, &header, &footer,
 								&committed_end) != 0) {
 			fprintf(stderr, "player: failed to scan %s\n", items[i].path);
 			free(*boots);
@@ -895,6 +896,13 @@ static int scan_log_root(const PlayerOptions *opts)
 		fprintf(stderr, "player: failed to open %s\n", opts->path);
 		return 1;
 	}
+	if (opts->encryption_private_key &&
+		rec_player_set_private_key(reader, opts->encryption_private_key) != 0) {
+		fprintf(stderr, "player: failed to load encryption private key %s\n",
+				opts->encryption_private_key);
+		rec_player_close(reader);
+		return 1;
+	}
 	do {
 		rc = scan_log_once(reader, opts, &seen, &seen_count, &seen_cap);
 		if (rc != 0 || !opts->follow) {
@@ -913,6 +921,7 @@ static void usage(const char *prog)
 	fprintf(stderr,
 			"usage: %s [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
+			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
 			prog);
 	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, or YYYY-MM-DD HH:MM[:SS]\n");
@@ -977,6 +986,11 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->until_arg = argv[i];
 		} else if (strncmp(arg, "--until=", 8) == 0) {
 			opts->until_arg = arg + 8;
+		} else if (strcmp(arg, "--encryption-private-key") == 0) {
+			if (++i >= argc) return -1;
+			opts->encryption_private_key = argv[i];
+		} else if (strncmp(arg, "--encryption-private-key=", 25) == 0) {
+			opts->encryption_private_key = arg + 25;
 		} else if (arg[0] == '-') {
 			return -1;
 		} else {
@@ -1055,8 +1069,19 @@ int main(int argc, char **argv)
 		size_t i;
 
 		memset(&output, 0, sizeof(output));
-		if (rec_player_open(&reader, opts.path) != 0 ||
-			scan_segment_file_with_context(reader, opts.path, &opts, 0, &output, NULL) != 0) {
+		if (rec_player_open(&reader, opts.path) != 0) {
+			fprintf(stderr, "player: failed to open %s\n", opts.path);
+			return 1;
+		}
+		if (opts.encryption_private_key &&
+			rec_player_set_private_key(reader, opts.encryption_private_key) != 0) {
+			fprintf(stderr, "player: failed to load encryption private key %s\n",
+					opts.encryption_private_key);
+			rec_player_close(reader);
+			return 1;
+		}
+		if (scan_segment_file_with_context(reader, opts.path, &opts, 0, &output,
+										   NULL) != 0) {
 			free_player_entries(output.entries, output.entry_count);
 			rec_player_close(reader);
 			return 1;
