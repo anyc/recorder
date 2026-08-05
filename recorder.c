@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/file.h>
+#include <sys/random.h>
 #include <sys/stat.h>
 #include <sys/vfs.h>
 #include <time.h>
@@ -22,12 +23,24 @@
 
 #include <linux/magic.h>
 
+#ifdef HAVE_PCRE2
+#define PCRE2_CODE_UNIT_WIDTH 8
+#include <pcre2.h>
+#elif defined(HAVE_LIBC_REGEX)
+#include <regex.h>
+#endif
+
 #include <flatcc/flatcc_builder.h>
+#ifdef HAVE_SYSTEMD
 #include <systemd/sd-journal.h>
+#else
+typedef void sd_journal;
+#endif
 #include <zstd.h>
 
 #include "helper.h"
 #include "index.h"
+#include "fallback_source.h"
 #ifdef errno
 #pragma push_macro("errno")
 #undef errno
@@ -66,6 +79,7 @@
 #define TIME_DELTA_ROTATE_THRESHOLD_USEC (10000ULL)
 #define MAX_PRIORITY_GROUPS 8
 #define MAX_GROUP_NAME_LEN 63
+#define MAX_MODIFIER_REROUTES 8
 #define RECORDER_CURSOR_PATH "/run/recorder/journal.cursor"
 #define RECORDER_CURSOR_MAX_BYTES 512
 
@@ -84,6 +98,36 @@ static int build_log_path(char *path, size_t path_size, const char *suffix)
 	return 0;
 }
 
+typedef enum {
+	MODIFIER_MATCH_EXACT,
+	MODIFIER_MATCH_PRESENT,
+	MODIFIER_MATCH_REGEX,
+} ModifierMatchKind;
+
+typedef struct {
+	char *match_field;
+	ModifierMatchKind match_kind;
+	char *match_exact;
+	int match_present;
+	int negate;
+#ifdef HAVE_PCRE2
+	pcre2_code *match_regex;
+	pcre2_match_context *match_context;
+#elif defined(HAVE_LIBC_REGEX)
+	regex_t match_regex;
+	int match_regex_compiled;
+#endif
+	char *rewrite_field;
+	char *replacement;
+	int drop;
+	int set_priority;
+} EntryModifier;
+
+typedef struct {
+	EntryModifier *items;
+	size_t count;
+} ModifierList;
+
 typedef struct {
 	char name[MAX_GROUP_NAME_LEN + 1];
 	uint8_t priorities[8];
@@ -93,6 +137,7 @@ typedef struct {
 	unsigned durability_flush_frames;
 	unsigned durability_flush_interval_sec;
 	const char *static_dict_path;
+	ModifierList modifiers;
 } PriorityGroup;
 
 typedef struct {
@@ -121,6 +166,7 @@ typedef struct {
 	unsigned compress_min_frame_bytes;
 	int compress_if_smaller;
 	char *static_dict_paths[8];
+	ModifierList modifiers;
 	PriorityGroup groups[MAX_PRIORITY_GROUPS];
 	size_t group_count;
 	int priority_to_group[8];
@@ -164,6 +210,12 @@ typedef struct {
 	JournalField unit;
 	JournalField comm;
 	JournalField exe;
+	char *owned_message;
+	char *owned_message_id;
+	char *owned_hostname;
+	char *owned_unit;
+	char *owned_comm;
+	char *owned_exe;
 	JournalExtraField *extra_fields;
 	size_t extra_field_count;
 } LogEntry;
@@ -208,6 +260,7 @@ typedef struct {
 
 typedef struct {
 	sd_journal *j;
+	FallbackSource *fallback;
 	RecorderConfig config;
 	BootRegistry boots;
 	uint64_t next_segment_seq;
@@ -303,6 +356,27 @@ static void recorder_config_init(RecorderConfig *cfg)
 	cfg->group_count = 8;
 }
 
+static void modifier_list_destroy(ModifierList *list)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		free(list->items[i].match_field);
+		free(list->items[i].match_exact);
+#ifdef HAVE_PCRE2
+		pcre2_code_free(list->items[i].match_regex);
+		pcre2_match_context_free(list->items[i].match_context);
+#elif defined(HAVE_LIBC_REGEX)
+		if (list->items[i].match_regex_compiled) regfree(&list->items[i].match_regex);
+#endif
+		free(list->items[i].rewrite_field);
+		free(list->items[i].replacement);
+	}
+	free(list->items);
+	list->items = NULL;
+	list->count = 0;
+}
+
 static void recorder_config_destroy(RecorderConfig *cfg)
 {
 	size_t i;
@@ -310,7 +384,9 @@ static void recorder_config_destroy(RecorderConfig *cfg)
 	for (i = 0; i < 8; i++) {
 		free(cfg->static_dict_paths[i]);
 		cfg->static_dict_paths[i] = NULL;
+		modifier_list_destroy(&cfg->groups[i].modifiers);
 	}
+	modifier_list_destroy(&cfg->modifiers);
 	for (i = 0; i < cfg->capture_fields_whitelist_count; i++) {
 		free(cfg->capture_fields_whitelist[i]);
 	}
@@ -757,6 +833,174 @@ static int valid_group_name(const char *name)
 	return 1;
 }
 
+static int json_get_modifier_list(json_t *owner, const char *scope, ModifierList *list)
+{
+	json_t *node = json_object_get(owner, "modifiers");
+	size_t i;
+
+	if (!node) return 0;
+	if (!json_is_array(node)) {
+		fprintf(stderr, "recorder: modifiers in %s must be an array\n", scope);
+		return -1;
+	}
+	for (i = 0; i < json_array_size(node); i++) {
+		json_t *item = json_array_get(node, i);
+		json_t *match;
+		json_t *field;
+		json_t *regex;
+		json_t *exact;
+		json_t *present;
+		json_t *negate;
+		json_t *rewrite;
+		json_t *drop;
+		json_t *set_priority;
+		EntryModifier *modifier;
+		EntryModifier *tmp;
+
+		if (!json_is_object(item) || !(match = json_object_get(item, "match")) ||
+			!json_is_object(match) || ((field = json_object_get(match, "field")) &&
+			(!json_is_string(field) || !json_string_value(field)[0]))) {
+			fprintf(stderr, "recorder: modifier %zu in %s has an invalid match.field\n", i, scope);
+			return -1;
+		}
+		regex = json_object_get(match, "regex");
+		exact = json_object_get(match, "exact");
+		present = json_object_get(match, "present");
+		negate = json_object_get(match, "not");
+		if ((regex != NULL) + (exact != NULL) + (present != NULL) != 1 ||
+			(regex && !json_is_string(regex)) || (exact && !json_is_string(exact)) ||
+			(present && !json_is_boolean(present)) || (negate && !json_is_boolean(negate))) {
+			fprintf(stderr, "recorder: modifier %zu in %s needs exactly one of match.regex, match.exact, or match.present (and optional boolean match.not)\n", i, scope);
+			return -1;
+		}
+		tmp = realloc(list->items, (list->count + 1) * sizeof(*tmp));
+		if (!tmp) return -1;
+		list->items = tmp;
+		modifier = &list->items[list->count];
+		memset(modifier, 0, sizeof(*modifier));
+		modifier->set_priority = -1;
+		list->count++;
+		modifier->match_field = strdup(field ? json_string_value(field) : "MESSAGE");
+		if (!modifier->match_field) return -1;
+		modifier->negate = negate && json_is_true(negate);
+		if (exact) {
+			modifier->match_kind = MODIFIER_MATCH_EXACT;
+			modifier->match_exact = strdup(json_string_value(exact));
+			if (!modifier->match_exact) return -1;
+		} else if (present) {
+			modifier->match_kind = MODIFIER_MATCH_PRESENT;
+			modifier->match_present = json_is_true(present);
+		} else {
+			modifier->match_kind = MODIFIER_MATCH_REGEX;
+#ifdef HAVE_PCRE2
+			{
+				int error_code;
+				PCRE2_SIZE error_offset;
+				modifier->match_regex = pcre2_compile((PCRE2_SPTR)json_string_value(regex),
+					PCRE2_ZERO_TERMINATED, 0, &error_code, &error_offset, NULL);
+				if (!modifier->match_regex) {
+					PCRE2_UCHAR message[128];
+					pcre2_get_error_message(error_code, message, sizeof(message));
+					fprintf(stderr, "recorder: invalid modifier regex in %s: %s at offset %zu\n",
+						scope, (char *)message, (size_t)error_offset);
+					return -1;
+				}
+				modifier->match_context = pcre2_match_context_create(NULL);
+				if (!modifier->match_context) return -1;
+				pcre2_set_match_limit(modifier->match_context, 100000);
+				pcre2_set_depth_limit(modifier->match_context, 1000);
+				(void)pcre2_jit_compile(modifier->match_regex, PCRE2_JIT_COMPLETE);
+			}
+#elif defined(HAVE_LIBC_REGEX)
+			if (regcomp(&modifier->match_regex, json_string_value(regex), REG_EXTENDED | REG_NOSUB) != 0) {
+				fprintf(stderr, "recorder: invalid libc regex in modifier %zu in %s\n", i, scope);
+				return -1;
+			}
+			modifier->match_regex_compiled = 1;
+#else
+			fprintf(stderr, "recorder: modifier %zu in %s uses regex, but this build has no regex support\n", i, scope);
+			return -1;
+#endif
+		}
+		drop = json_object_get(item, "drop");
+		if (drop && !json_is_boolean(drop)) {
+			fprintf(stderr, "recorder: modifier %zu in %s has non-boolean drop\n", i, scope);
+			return -1;
+		}
+		modifier->drop = drop && json_is_true(drop);
+		set_priority = json_object_get(item, "set_priority");
+		if (set_priority) {
+			json_int_t value;
+			if (!json_is_integer(set_priority) || (value = json_integer_value(set_priority)) < 0 || value > 7) {
+				fprintf(stderr, "recorder: modifier %zu in %s has invalid set_priority\n", i, scope);
+				return -1;
+			}
+			modifier->set_priority = (int)value;
+		}
+		rewrite = json_object_get(item, "rewrite");
+		if (rewrite) {
+			json_t *rewrite_field = json_object_get(rewrite, "field");
+			json_t *replacement = json_object_get(rewrite, "replacement");
+			if (!json_is_object(rewrite) || !json_is_string(rewrite_field) ||
+				!json_is_string(replacement) || !json_string_value(rewrite_field)[0]) {
+				fprintf(stderr, "recorder: modifier %zu in %s has invalid rewrite\n", i, scope);
+				return -1;
+			}
+			modifier->rewrite_field = strdup(json_string_value(rewrite_field));
+			modifier->replacement = strdup(json_string_value(replacement));
+			if (!modifier->rewrite_field || !modifier->replacement) return -1;
+			if (modifier->match_kind != MODIFIER_MATCH_REGEX) {
+				fprintf(stderr, "recorder: modifier %zu in %s uses rewrite without a regex match\n", i, scope);
+				return -1;
+			}
+			if (modifier->negate) {
+				fprintf(stderr, "recorder: modifier %zu in %s uses rewrite with a negated match\n", i, scope);
+				return -1;
+			}
+#ifndef HAVE_PCRE2
+			fprintf(stderr, "recorder: modifier %zu in %s uses rewrite, which requires PCRE2 support\n", i, scope);
+			return -1;
+#endif
+		}
+		if (!modifier->drop && modifier->set_priority < 0 && !modifier->rewrite_field) {
+			fprintf(stderr, "recorder: modifier %zu in %s has no action\n", i, scope);
+			return -1;
+		}
+	}
+	return 0;
+}
+
+static int modifier_rewrite_field_is_supported(const char *field)
+{
+	return strcmp(field, "MESSAGE") == 0 || strcmp(field, "MESSAGE_ID") == 0 ||
+		strcmp(field, "_HOSTNAME") == 0 || strcmp(field, "_SYSTEMD_UNIT") == 0 ||
+		strcmp(field, "_COMM") == 0 || strcmp(field, "_EXE") == 0;
+}
+
+static int validate_modifier_list(const ModifierList *list, const RecorderConfig *cfg,
+						  const char *scope)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		const EntryModifier *modifier = &list->items[i];
+
+		if (!modifier->rewrite_field) continue;
+		if (!modifier_rewrite_field_is_supported(modifier->rewrite_field)) {
+			fprintf(stderr, "recorder: modifier %zu in %s rewrites unsupported field '%s'\n",
+				i, scope, modifier->rewrite_field);
+			return -1;
+		}
+		if (cfg->entry_format == 0 && strcmp(modifier->rewrite_field, "MESSAGE") != 0 &&
+			strcmp(modifier->rewrite_field, "_SYSTEMD_UNIT") != 0) {
+			fprintf(stderr, "recorder: modifier %zu in %s rewrites '%s', which requires entry_format 'full'\n",
+				i, scope, modifier->rewrite_field);
+			return -1;
+		}
+	}
+	return 0;
+}
+
 static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 {
 	json_t *node = json_object_get(root, "priority_groups");
@@ -806,6 +1050,10 @@ static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 			json_get_group_uint_default(group, cfg->groups[i].name,
 										"durability_flush_interval_sec",
 										&cfg->groups[i].durability_flush_interval_sec) != 0) {
+			return -1;
+		}
+		if (json_get_modifier_list(group, cfg->groups[i].name,
+				&cfg->groups[i].modifiers) != 0) {
 			return -1;
 		}
 
@@ -908,6 +1156,7 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		json_get_uint_default(root, "compress_min_frame_bytes", &cfg->compress_min_frame_bytes) != 0 ||
 		json_get_bool_default(root, "compress_if_smaller", &cfg->compress_if_smaller) != 0 ||
 		json_get_static_dict_paths(root, cfg) != 0 ||
+		json_get_modifier_list(root, "top-level config", &cfg->modifiers) != 0 ||
 		json_get_priority_groups(root, cfg) != 0) {
 		goto out;
 	}
@@ -919,6 +1168,9 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		(cfg->capture_message_id || cfg->capture_hostname || cfg->capture_comm || cfg->capture_exe ||
 		 cfg->capture_pid || cfg->capture_uid || cfg->capture_gid)) {
 		fprintf(stderr, "recorder: extended fixed-field capture requires entry_format 'full'\n");
+		goto out;
+	}
+	if (validate_modifier_list(&cfg->modifiers, cfg, "top-level config") != 0) {
 		goto out;
 	}
 	{
@@ -935,6 +1187,11 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 			size_t j;
 			const char *dict_path = NULL;
 			int durable_per_frame = 0;
+
+			if (validate_modifier_list(&cfg->groups[i].modifiers, cfg,
+					cfg->groups[i].name) != 0) {
+				goto out;
+			}
 
 			for (j = 0; j < cfg->groups[i].priority_count; j++) {
 				uint8_t prio = cfg->groups[i].priorities[j];
@@ -970,12 +1227,17 @@ out:
 
 static JournalField journal_get_field(sd_journal *j, const char *field)
 {
+	#ifndef HAVE_SYSTEMD
+	(void)j;
+	(void)field;
+	return (JournalField){0};
+	#else
 	const void *data;
 	size_t len;
 	const char *eq;
 	JournalField value = {0};
 
-	if (sd_journal_get_data(j, field, &data, &len) < 0) {
+	if (!j || sd_journal_get_data(j, field, &data, &len) < 0) {
 		return value;
 	}
 	eq = memchr(data, '=', len);
@@ -985,6 +1247,7 @@ static JournalField journal_get_field(sd_journal *j, const char *field)
 	value.data = eq + 1;
 	value.len = len - (size_t)(eq + 1 - (const char *)data);
 	return value;
+	#endif
 }
 
 static uint64_t journal_get_u64(sd_journal *j, const char *field)
@@ -1156,11 +1419,64 @@ static void build_state_lock_path(char *buf, size_t bufsz)
 	snprintf(buf, bufsz, "%s/state/store.lock", g_log_dir);
 }
 
+static void build_state_store_id_path(char *buf, size_t bufsz)
+{
+	snprintf(buf, bufsz, "%s/state/store-id", g_log_dir);
+}
+
 static int atomic_write_text_file(const char *path, const char *text);
 static int segment_seq_from_name(const char *name, uint64_t *seq_out);
 static int boot_registry_rebuild_from_segments(BootRegistry *boots);
 static int persist_boot_state(const BootRegistry *boots);
 static void for_each_segment_dir(void (*fn)(const char *dir_name, void *ctx), void *ctx);
+
+static int ensure_store_id(void)
+{
+	char path[PATH_MAX];
+	char text[32];
+	char *raw;
+	size_t raw_len = 0;
+	uint64_t random_value;
+	ssize_t n;
+
+	build_state_store_id_path(path, sizeof(path));
+	if (access(path, F_OK) == 0) {
+		char *end = NULL;
+		int valid;
+
+		raw = slurp_file(path, &raw_len);
+		if (!raw) {
+			fprintf(stderr, "recorder: failed to read store ID %s\n", path);
+			return -1;
+		}
+		errno = 0;
+		(void)strtoull(raw, &end, 16);
+		valid = errno == 0 && end && (*end == '\0' || *end == '\n') && raw_len == 17;
+		free(raw);
+		if (valid) {
+			return 0;
+		}
+		fprintf(stderr, "recorder: invalid store ID %s\n", path);
+		return -1;
+	}
+	if (errno != ENOENT) {
+		fprintf(stderr, "recorder: failed to read store ID %s: %m\n", path);
+		return -1;
+	}
+	do {
+		n = getrandom(&random_value, sizeof(random_value), 0);
+	} while (n < 0 && errno == EINTR);
+	if (n != (ssize_t)sizeof(random_value)) {
+		fprintf(stderr, "recorder: failed to generate store ID: %m\n");
+		return -1;
+	}
+	snprintf(text, sizeof(text), "%016" PRIx64 "\n", random_value);
+	if (atomic_write_text_file(path, text) != 0) {
+		fprintf(stderr, "recorder: failed to persist store ID %s: %m\n", path);
+		return -1;
+	}
+	return 0;
+}
 
 static void build_segment_path(char *buf, size_t bufsz, const char *dir_name,
 								uint64_t seq)
@@ -2037,6 +2353,12 @@ static int journal_field_name_is_listed(const char *name, size_t len,
 static int capture_extra_journal_fields(LogEntry *entry, sd_journal *j,
 								const RecorderConfig *cfg)
 {
+	#ifndef HAVE_SYSTEMD
+	(void)entry;
+	(void)j;
+	(void)cfg;
+	return 0;
+	#else
 	const void *data;
 	size_t len;
 
@@ -2077,6 +2399,7 @@ static int capture_extra_journal_fields(LogEntry *entry, sd_journal *j,
 		}
 	}
 	return 0;
+	#endif
 }
 
 static void free_extra_journal_fields(LogEntry *entry)
@@ -2084,6 +2407,28 @@ static void free_extra_journal_fields(LogEntry *entry)
 	free(entry->extra_fields);
 	entry->extra_fields = NULL;
 	entry->extra_field_count = 0;
+}
+
+static void free_owned_journal_fields(LogEntry *entry)
+{
+	free(entry->owned_message);
+	free(entry->owned_message_id);
+	free(entry->owned_hostname);
+	free(entry->owned_unit);
+	free(entry->owned_comm);
+	free(entry->owned_exe);
+	entry->owned_message = NULL;
+	entry->owned_message_id = NULL;
+	entry->owned_hostname = NULL;
+	entry->owned_unit = NULL;
+	entry->owned_comm = NULL;
+	entry->owned_exe = NULL;
+}
+
+static void free_log_entry(LogEntry *entry)
+{
+	free_extra_journal_fields(entry);
+	free_owned_journal_fields(entry);
 }
 
 static JournalField journal_field_for_capture(sd_journal *j, const char *name,
@@ -2097,6 +2442,13 @@ static JournalField journal_field_for_capture(sd_journal *j, const char *name,
 static int extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 								BootRegistry *boots)
 {
+	#ifndef HAVE_SYSTEMD
+	(void)entry;
+	(void)j;
+	(void)cfg;
+	(void)boots;
+	return -1;
+	#else
 	JournalField boot_id = journal_field_nonempty(journal_get_field(j, "_BOOT_ID"));
 	uint64_t monotonic_ts = 0;
 	sd_id128_t monotonic_boot_id;
@@ -2136,10 +2488,266 @@ static int extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 		return -1;
 	}
 	return 0;
+	#endif
 }
+
+static int set_owned_log_field(JournalField *field, char **owned, const char *value)
+{
+	if (!value || !value[0]) return 0;
+	*owned = strdup(value);
+	if (!*owned) return -1;
+	field->data = *owned;
+	field->len = strlen(*owned);
+	return 0;
+}
+
+static int extract_fallback_entry(LogEntry *entry, FallbackRecord *record,
+					  RecorderConfig *cfg, BootRegistry *boots)
+{
+	BootEntry *boot;
+
+	memset(entry, 0, sizeof(*entry));
+	entry->realtime_ts = record->realtime_ts;
+	entry->monotonic_ts = record->monotonic_ts;
+	entry->priority = record->priority <= 7 ? record->priority : 5;
+	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || cfg->entry_format == 0) ?
+		record->pid : 0;
+	entry->uid = (cfg->capture_all_fields || cfg->capture_uid) ? record->uid : 0;
+	entry->gid = (cfg->capture_all_fields || cfg->capture_gid) ? record->gid : 0;
+	if (snprintf(entry->boot_id, sizeof(entry->boot_id), "%s", record->boot_id) >=
+		(int)sizeof(entry->boot_id) ||
+		set_owned_log_field(&entry->message, &entry->owned_message, record->message) != 0 ||
+		((cfg->capture_all_fields || cfg->capture_hostname) &&
+		 set_owned_log_field(&entry->hostname, &entry->owned_hostname, record->hostname) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_comm) &&
+		 set_owned_log_field(&entry->comm, &entry->owned_comm, record->comm) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_exe) &&
+		 set_owned_log_field(&entry->exe, &entry->owned_exe, record->exe) != 0)) {
+		free_log_entry(entry);
+		return -1;
+	}
+	entry->boot_seq = boot_registry_seq(boots, entry->boot_id[0] ? entry->boot_id : NULL);
+	boot = boot_registry_get(boots, entry->boot_id);
+	if (boot && boot->first_realtime_ts == 0) boot->first_realtime_ts = entry->realtime_ts;
+	return 0;
+}
+
+static JournalField entry_field_for_modifier(const LogEntry *entry, const char *name)
+{
+	if (strcmp(name, "MESSAGE") == 0) return entry->message;
+	if (strcmp(name, "MESSAGE_ID") == 0) return entry->message_id;
+	if (strcmp(name, "_HOSTNAME") == 0) return entry->hostname;
+	if (strcmp(name, "_SYSTEMD_UNIT") == 0) return entry->unit;
+	if (strcmp(name, "_COMM") == 0) return entry->comm;
+	if (strcmp(name, "_EXE") == 0) return entry->exe;
+	return (JournalField){0};
+}
+
+#ifdef HAVE_PCRE2
+static JournalField *entry_field_for_rewrite(LogEntry *entry, const char *name, char ***owned_out)
+{
+	if (strcmp(name, "MESSAGE") == 0) {
+		*owned_out = &entry->owned_message;
+		return &entry->message;
+	}
+	if (strcmp(name, "MESSAGE_ID") == 0) {
+		*owned_out = &entry->owned_message_id;
+		return &entry->message_id;
+	}
+	if (strcmp(name, "_HOSTNAME") == 0) {
+		*owned_out = &entry->owned_hostname;
+		return &entry->hostname;
+	}
+	if (strcmp(name, "_SYSTEMD_UNIT") == 0) {
+		*owned_out = &entry->owned_unit;
+		return &entry->unit;
+	}
+	if (strcmp(name, "_COMM") == 0) {
+		*owned_out = &entry->owned_comm;
+		return &entry->comm;
+	}
+	if (strcmp(name, "_EXE") == 0) {
+		*owned_out = &entry->owned_exe;
+		return &entry->exe;
+	}
+	return NULL;
+}
+
+static int build_regex_replacement(const EntryModifier *modifier, JournalField subject,
+							 pcre2_match_data *match_data, char **result_out)
+{
+	PCRE2_SIZE *ovector = pcre2_get_ovector_pointer(match_data);
+	uint32_t ovector_count = pcre2_get_ovector_count(match_data);
+	const char *text = modifier->replacement;
+	char *result = NULL;
+	size_t result_len = 0;
+	size_t i;
+
+	for (i = 0; text[i]; i++) {
+		const char *part = &text[i];
+		size_t part_len = 1;
+		if (text[i] == '$' && text[i + 1] == '$') {
+			part = "$";
+			part_len = 1;
+			i++;
+		} else if (text[i] == '$' && text[i + 1] >= '0' && text[i + 1] <= '9') {
+			unsigned int group = (unsigned int)(text[++i] - '0');
+			if (group >= ovector_count || ovector[2 * group] == PCRE2_UNSET) {
+				continue;
+			}
+			part = subject.data + ovector[2 * group];
+			part_len = ovector[2 * group + 1] - ovector[2 * group];
+		}
+		if (part_len > SIZE_MAX - result_len - 1) {
+			free(result);
+			return -1;
+		}
+		{
+			char *tmp = realloc(result, result_len + part_len + 1);
+			if (!tmp) {
+				free(result);
+				return -1;
+			}
+			result = tmp;
+			memcpy(result + result_len, part, part_len);
+			result_len += part_len;
+			result[result_len] = '\0';
+		}
+	}
+	if (!result) {
+		result = strdup("");
+		if (!result) return -1;
+	}
+	*result_out = result;
+	return 0;
+}
+
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		const EntryModifier *modifier = &list->items[i];
+		JournalField subject = entry_field_for_modifier(entry, modifier->match_field);
+		pcre2_match_data *match_data = NULL;
+		int match_result;
+		int matched;
+
+		if (!subject.data) subject = journal_get_field(j, modifier->match_field);
+		if (modifier->match_kind == MODIFIER_MATCH_PRESENT) {
+			matched = (subject.data != NULL) == modifier->match_present;
+		} else if (modifier->match_kind == MODIFIER_MATCH_EXACT) {
+			matched = subject.data && subject.len == strlen(modifier->match_exact) &&
+				memcmp(subject.data, modifier->match_exact, subject.len) == 0;
+		} else {
+			matched = 0;
+			if (subject.data) {
+				match_data = pcre2_match_data_create_from_pattern(modifier->match_regex, NULL);
+				if (!match_data) return -1;
+				match_result = pcre2_match(modifier->match_regex, (PCRE2_SPTR)subject.data,
+					subject.len, 0, 0, match_data, modifier->match_context);
+				if (match_result < 0) {
+					pcre2_match_data_free(match_data);
+					if (match_result != PCRE2_ERROR_NOMATCH) return -1;
+					match_data = NULL;
+				} else {
+					matched = 1;
+				}
+			}
+		}
+		if (modifier->negate) matched = !matched;
+		if (!matched) continue;
+		if (modifier->rewrite_field) {
+			JournalField *target;
+			char **owned;
+			char *replacement;
+
+			target = entry_field_for_rewrite(entry, modifier->rewrite_field, &owned);
+			if (!target || build_regex_replacement(modifier, subject, match_data, &replacement) != 0) {
+				pcre2_match_data_free(match_data);
+				return -1;
+			}
+			free(*owned);
+			*owned = replacement;
+			target->data = replacement;
+			target->len = strlen(replacement);
+		}
+		if (match_data) pcre2_match_data_free(match_data);
+		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->drop) return 1;
+	}
+	return 0;
+}
+#elif defined(HAVE_LIBC_REGEX)
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		const EntryModifier *modifier = &list->items[i];
+		JournalField subject = entry_field_for_modifier(entry, modifier->match_field);
+		if (!subject.data) subject = journal_get_field(j, modifier->match_field);
+		int matched;
+
+		if (modifier->match_kind == MODIFIER_MATCH_PRESENT) {
+			matched = (subject.data != NULL) == modifier->match_present;
+		} else if (modifier->match_kind == MODIFIER_MATCH_EXACT) {
+			matched = subject.data && subject.len == strlen(modifier->match_exact) &&
+				memcmp(subject.data, modifier->match_exact, subject.len) == 0;
+		} else {
+			char *text;
+
+			matched = 0;
+			if (subject.data && !memchr(subject.data, '\0', subject.len)) {
+				text = malloc(subject.len + 1);
+				if (!text) return -1;
+				memcpy(text, subject.data, subject.len);
+				text[subject.len] = '\0';
+				matched = regexec(&modifier->match_regex, text, 0, NULL, 0) == 0;
+				free(text);
+			}
+		}
+		if (modifier->negate) matched = !matched;
+		if (!matched) continue;
+		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->drop) return 1;
+	}
+	return 0;
+}
+#else
+static int apply_modifier_list(const ModifierList *list, LogEntry *entry, sd_journal *j)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		const EntryModifier *modifier = &list->items[i];
+		JournalField subject = entry_field_for_modifier(entry, modifier->match_field);
+		if (!subject.data) subject = journal_get_field(j, modifier->match_field);
+		int matched;
+
+		if (modifier->match_kind == MODIFIER_MATCH_PRESENT) {
+			matched = (subject.data != NULL) == modifier->match_present;
+		} else if (modifier->match_kind == MODIFIER_MATCH_EXACT) {
+			matched = subject.data && subject.len == strlen(modifier->match_exact) &&
+				memcmp(subject.data, modifier->match_exact, subject.len) == 0;
+		} else {
+			return -1;
+		}
+		if (modifier->negate) matched = !matched;
+		if (!matched) continue;
+		if (modifier->set_priority >= 0) entry->priority = (uint8_t)modifier->set_priority;
+		if (modifier->drop) return 1;
+	}
+	return 0;
+}
+#endif
 
 static void recorder_print_received_entry(sd_journal *j, int sanitize_output)
 {
+	#ifndef HAVE_SYSTEMD
+	(void)j;
+	(void)sanitize_output;
+	#else
 	JournalField hostname = journal_field_nonempty(journal_get_field(j, "_HOSTNAME"));
 	JournalField identifier = journal_field_nonempty(journal_get_field(j, "_COMM"));
 	JournalField unit = journal_field_nonempty(journal_get_field(j, "_SYSTEMD_UNIT"));
@@ -2187,6 +2795,7 @@ static void recorder_print_received_entry(sd_journal *j, int sanitize_output)
 		printf("\n");
 	}
 	fflush(stdout);
+	#endif
 }
 
 static flatbuffers_string_ref_t create_journal_string(flatcc_builder_t *B,
@@ -2594,7 +3203,7 @@ static uint64_t recorder_segment_limit(const Recorder *r)
 
 static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 						int verbose, const char *cursor_path,
-						const char *journal_namespace)
+						const char *journal_namespace, int journal_mode)
 {
 	char runtime_cursor_path[PATH_MAX];
 	uint8_t prio;
@@ -2606,7 +3215,7 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 	r->j = j;
 	r->config = *cfg;
 	r->verbose = verbose;
-	r->persistent_cursor_enabled = 1;
+	r->persistent_cursor_enabled = journal_mode;
 	if (snprintf(r->persistent_cursor_path, sizeof(r->persistent_cursor_path),
 				 "%s/state/journal.cursor%s%s", g_log_dir,
 				 journal_namespace ? "." : "",
@@ -2614,7 +3223,9 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 		(int)sizeof(r->persistent_cursor_path)) {
 		return -1;
 	}
-	if (cursor_path) {
+	if (!journal_mode) {
+		/* Datagram and kmsg inputs have no replayable source cursor. */
+	} else if (cursor_path) {
 		if (snprintf(r->cursor_path, sizeof(r->cursor_path), "%s", cursor_path) >=
 			(int)sizeof(r->cursor_path)) {
 			return -1;
@@ -2636,11 +3247,13 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 			fprintf(stderr, "recorder: using journal cursor path %s\n", r->cursor_path);
 		}
 	}
-	if (verbose >= 1 && !r->cursor_enabled) {
+	if (journal_mode && verbose >= 1 && !r->cursor_enabled) {
 		fprintf(stderr, "recorder: /run is not tmpfs; journal cursor checkpoint disabled\n");
 	}
 	boot_registry_init(&r->boots);
-	mkdir_p(g_log_dir);
+	if (mkdir_p(g_log_dir) != 0 || ensure_store_id() != 0) {
+		return -1;
+	}
 	for (prio = 0; prio < r->config.group_count; prio++) {
 		writer_init(&r->writers[prio], &r->config.groups[prio], prio);
 	}
@@ -2792,13 +3405,87 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 	return 0;
 }
 
+static int apply_entry_modifiers(Recorder *r, LogEntry *entry)
+{
+	unsigned seen_priorities;
+	unsigned reroutes;
+	int result;
+
+	result = apply_modifier_list(&r->config.modifiers, entry, r->j);
+	if (result != 0) return result;
+	seen_priorities = 1u << entry->priority;
+	for (reroutes = 0; reroutes < MAX_MODIFIER_REROUTES; reroutes++) {
+		int group_index = r->config.priority_to_group[entry->priority];
+		uint8_t previous_priority = entry->priority;
+
+		if (group_index < 0 || (size_t)group_index >= r->config.group_count) return -1;
+		result = apply_modifier_list(&r->config.groups[group_index].modifiers, entry, r->j);
+		if (result != 0) return result;
+		if (entry->priority == previous_priority) return 0;
+		if (seen_priorities & (1u << entry->priority)) {
+			fprintf(stderr, "recorder: dropping entry because modifiers reroute priority in a loop\n");
+			return 1;
+		}
+		seen_priorities |= 1u << entry->priority;
+	}
+	fprintf(stderr, "recorder: dropping entry after too many modifier priority reroutes\n");
+	return 1;
+}
+
+static size_t recorder_step_fallback(Recorder *r)
+{
+	FallbackRecord record;
+	LogEntry entry;
+	uint32_t boot_count_before;
+	int source_result;
+	int modifier_result;
+
+	source_result = fallback_source_next(r->fallback, &record,
+							 (int)(JOURNAL_WAIT_USEC / 1000u));
+	if (source_result < 0) {
+		fprintf(stderr, "recorder: fallback source failed: %m\n");
+		g_shutdown = 1;
+		return 0;
+	}
+	if (source_result == 0) return 0;
+	boot_count_before = r->boots.count;
+	if (extract_fallback_entry(&entry, &record, &r->config, &r->boots) != 0) {
+		fprintf(stderr, "recorder: failed to extract fallback log fields\n");
+		fallback_record_destroy(&record);
+		return 0;
+	}
+	fallback_record_destroy(&record);
+	if (r->boots.count != boot_count_before) persist_boot_state(&r->boots);
+	modifier_result = apply_entry_modifiers(r, &entry);
+	if (modifier_result < 0) {
+		fprintf(stderr, "recorder: failed to apply entry modifiers\n");
+		free_log_entry(&entry);
+		return 0;
+	}
+	if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
+		fprintf(stderr, "recorder: failed to store entry\n");
+		free_log_entry(&entry);
+		return 0;
+	}
+	if (r->verbose >= 2 && entry.message.data) {
+		fprintf(stderr, "recorder: fallback priority=%u pid=%u message=%.*s\n",
+			entry.priority, entry.pid, (int)entry.message.len, entry.message.data);
+	}
+	free_log_entry(&entry);
+	return 1;
+}
+
 static size_t recorder_step(Recorder *r)
 {
 	size_t processed = 0;
 
+	if (r->fallback) return recorder_step_fallback(r);
+
+	#ifdef HAVE_SYSTEMD
 	while (processed < CHUNK_SIZE) {
 		LogEntry entry;
 		uint32_t boot_count_before = r->boots.count;
+		int modifier_result;
 
 		if (!r->current_entry_pending) {
 			if (sd_journal_next(r->j) <= 0) {
@@ -2809,15 +3496,21 @@ static size_t recorder_step(Recorder *r)
 		}
 		if (extract_entry(&entry, r->j, &r->config, &r->boots) != 0) {
 			fprintf(stderr, "recorder: failed to extract journal fields\n");
-			free_extra_journal_fields(&entry);
+			free_log_entry(&entry);
 			break;
 		}
 		if (r->boots.count != boot_count_before) {
 			persist_boot_state(&r->boots);
 		}
-		if (recorder_submit_entry(r, &entry) != 0) {
+		modifier_result = apply_entry_modifiers(r, &entry);
+		if (modifier_result < 0) {
+			fprintf(stderr, "recorder: failed to apply entry modifiers\n");
+			free_log_entry(&entry);
+			break;
+		}
+		if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
 			fprintf(stderr, "recorder: failed to store entry\n");
-			free_extra_journal_fields(&entry);
+			free_log_entry(&entry);
 			break;
 		}
 		if (r->cursor_enabled || r->persistent_cursor_enabled) {
@@ -2825,7 +3518,7 @@ static size_t recorder_step(Recorder *r)
 
 			if (sd_journal_get_cursor(r->j, &cursor) < 0) {
 				fprintf(stderr, "recorder: failed to read journal cursor\n");
-				free_extra_journal_fields(&entry);
+				free_log_entry(&entry);
 				break;
 			}
 			free(r->pending_cursor);
@@ -2834,9 +3527,10 @@ static size_t recorder_step(Recorder *r)
 		if (r->verbose >= 2) {
 			recorder_print_received_entry(r->j, r->config.sanitize_output);
 		}
-		free_extra_journal_fields(&entry);
+		free_log_entry(&entry);
 		processed++;
 	}
+	#endif
 	return processed;
 }
 
@@ -2930,14 +3624,19 @@ static void recorder_shutdown(Recorder *r)
 
 int main(int argc, char **argv)
 {
-	sd_journal *j;
+	sd_journal *j = NULL;
+	FallbackSource fallback_source;
 	Recorder r;
 	RecorderConfig cfg;
 	const char *cfg_path;
 	const char *cursor_path = NULL;
 	const char *journal_namespace = NULL;
+	const char *syslog_path = NULL;
+	const char *kernel_path = "/dev/kmsg";
 	int verbose = 0;
 	int start_last = 0;
+	int fallback_mode = 0;
+	int fallback_open = 0;
 	int lock_fd = -1;
 	int opt;
 	static const struct option options[] = {
@@ -2945,11 +3644,15 @@ int main(int argc, char **argv)
 		{ "cursor", required_argument, NULL, 'c' },
 		{ "namespace", required_argument, NULL, 'n' },
 		{ "log-dir", required_argument, NULL, 'l' },
+		{ "fallback", no_argument, NULL, 'F' },
+		{ "syslog-socket", required_argument, NULL, 's' },
+		{ "kernel-path", required_argument, NULL, 'k' },
+		{ "no-kmsg", no_argument, NULL, 'K' },
 		{ NULL, 0, NULL, 0 }
 	};
 
 	opterr = 0;
-	while ((opt = getopt_long(argc, argv, "v1c:n:l:", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "v1c:n:l:Fs:k:K", options, NULL)) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose++;
@@ -2970,11 +3673,36 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'F':
+			fallback_mode = 1;
+			break;
+		case 's':
+			fallback_mode = 1;
+			syslog_path = optarg;
+			break;
+		case 'k':
+			fallback_mode = 1;
+			kernel_path = optarg;
+			break;
+		case 'K':
+			fallback_mode = 1;
+			kernel_path = NULL;
+			break;
 		default:
-			fprintf(stderr, "usage: %s [-v] [-1|--last] [-c PATH|--cursor PATH] [-n NAME|--namespace NAME] [-l PATH|--log-dir PATH]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [-1|--last] [-c PATH|--cursor PATH] [-n NAME|--namespace NAME] [-l PATH|--log-dir PATH] [--fallback [--syslog-socket PATH] [--kernel-path PATH|--no-kmsg]]\n", argv[0]);
 			return 1;
 		}
 	}
+	if (fallback_mode && (start_last || cursor_path || journal_namespace)) {
+		fprintf(stderr, "recorder: --last, --cursor, and --namespace require journald input\n");
+		return 1;
+	}
+	#ifndef HAVE_SYSTEMD
+	if (!fallback_mode) {
+		fprintf(stderr, "recorder: this build has no journald input; use --fallback\n");
+		return 1;
+	}
+	#endif
 
 	recorder_config_init(&cfg);
 	cfg_path = recorder_config_path();
@@ -2989,7 +3717,18 @@ int main(int argc, char **argv)
 		return 1;
 	}
 
-	if ((journal_namespace ?
+	if (fallback_mode) {
+		if (!syslog_path) syslog_path = "/dev/log";
+		if (fallback_source_open(&fallback_source, syslog_path, kernel_path) != 0) {
+			fprintf(stderr, "recorder: failed to open fallback sources: %m\n");
+			close(lock_fd);
+			recorder_config_destroy(&cfg);
+			return 1;
+		}
+		fallback_open = 1;
+	}
+	#ifdef HAVE_SYSTEMD
+	else if ((journal_namespace ?
 		sd_journal_open_namespace(&j, journal_namespace, SD_JOURNAL_LOCAL_ONLY) :
 		sd_journal_open(&j, SD_JOURNAL_LOCAL_ONLY)) < 0) {
 		fprintf(stderr, "recorder: failed to open journal\n");
@@ -2997,23 +3736,33 @@ int main(int argc, char **argv)
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
+	#endif
 
 	if (install_signal_handlers() != 0) {
 		fprintf(stderr, "recorder: failed to install signal handlers\n");
-		sd_journal_close(j);
+		#ifdef HAVE_SYSTEMD
+		if (j) sd_journal_close(j);
+		#endif
+		if (fallback_open) fallback_source_close(&fallback_source);
 		close(lock_fd);
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
 
-	if (recorder_init(&r, j, &cfg, verbose, cursor_path, journal_namespace) != 0) {
+	if (recorder_init(&r, j, &cfg, verbose, cursor_path, journal_namespace,
+				  !fallback_mode) != 0) {
 		fprintf(stderr, "recorder: failed to initialize cursor path\n");
-		sd_journal_close(j);
+		#ifdef HAVE_SYSTEMD
+		if (j) sd_journal_close(j);
+		#endif
+		if (fallback_open) fallback_source_close(&fallback_source);
 		close(lock_fd);
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
-	if (!start_last) {
+	r.fallback = fallback_mode ? &fallback_source : NULL;
+	#ifdef HAVE_SYSTEMD
+	if (!fallback_mode && !start_last) {
 		char *cursor = r.cursor_enabled ? read_journal_cursor(r.cursor_path) : NULL;
 		int resumed = 0;
 
@@ -3057,7 +3806,7 @@ int main(int argc, char **argv)
 				return 1;
 			}
 		}
-	} else if (start_last) {
+	} else if (!fallback_mode && start_last) {
 		if (sd_journal_seek_tail(j) < 0) {
 			fprintf(stderr, "recorder: failed to seek to journal tail\n");
 			sd_journal_close(j);
@@ -3066,13 +3815,14 @@ int main(int argc, char **argv)
 			return 1;
 		}
 		r.current_entry_pending = sd_journal_previous(j) > 0;
-	} else if (sd_journal_seek_head(j) < 0) {
+	} else if (!fallback_mode && sd_journal_seek_head(j) < 0) {
 		fprintf(stderr, "recorder: failed to seek to journal head\n");
 		sd_journal_close(j);
 		close(lock_fd);
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
+	#endif
 
 	while (!g_shutdown) {
 		size_t n = recorder_step(&r);
@@ -3088,13 +3838,18 @@ int main(int argc, char **argv)
 			fprintf(stderr, "recorder: failed to flush stored entries\n");
 			break;
 		}
-		if (sd_journal_wait(j, JOURNAL_WAIT_USEC) < 0) {
+		#ifdef HAVE_SYSTEMD
+		if (!fallback_mode && sd_journal_wait(j, JOURNAL_WAIT_USEC) < 0) {
 			break;
 		}
+		#endif
 	}
 
 	recorder_shutdown(&r);
-	sd_journal_close(j);
+	#ifdef HAVE_SYSTEMD
+	if (j) sd_journal_close(j);
+	#endif
+	if (fallback_open) fallback_source_close(&fallback_source);
 	close(lock_fd);
 	recorder_config_destroy(&cfg);
 	return 0;

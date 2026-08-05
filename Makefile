@@ -1,15 +1,25 @@
 
 PREFIX ?= /usr
 bindir ?= $(PREFIX)/bin
+libdir ?= $(PREFIX)/lib
+includedir ?= $(PREFIX)/include
 sysconfdir ?= /etc
 localstatedir ?= /var
 systemd_system_unitdir ?= $(PREFIX)/lib/systemd/system
 PKG_CONFIG ?= pkg-config
+PYTHON ?= python3
 LOG_DIR ?= /var/log/recorder
 RECORDER_CONFIG_PATH ?= /etc/recorder.json
 REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
 FLATCC_PKG ?= flatccrt
+PCRE2_PKG ?= libpcre2-8
+PCRE2 ?= auto
+LIBC_REGEX ?= 1
+SYSTEMD ?= auto
+COMPARE_STORAGE_ARGS ?=
+BENCHMARK_STORAGE_ARGS ?=
+BENCHMARK_CAPACITY_ARGS ?=
 FLATCC_MODE ?= sysroot
 FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),\
 	flatcc/src/runtime/builder.o \
@@ -18,45 +28,95 @@ FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),\
 	flatcc/src/runtime/verifier.o,)
 FLATCC_CPPFLAGS = $(if $(filter repo,$(FLATCC_MODE)),-Iflatcc/include/,$(shell $(PKG_CONFIG) --cflags $(FLATCC_PKG)))
 FLATCC_LIBS = $(if $(filter repo,$(FLATCC_MODE)),,$(shell $(PKG_CONFIG) --libs $(FLATCC_PKG)))
+ifeq ($(PCRE2),auto)
+HAVE_PCRE2 := $(shell $(PKG_CONFIG) --exists $(PCRE2_PKG) && echo 1)
+else ifeq ($(PCRE2),1)
+HAVE_PCRE2 := 1
+endif
+ifeq ($(SYSTEMD),auto)
+HAVE_SYSTEMD := $(shell $(PKG_CONFIG) --exists libsystemd && echo 1)
+else ifeq ($(SYSTEMD),1)
+HAVE_SYSTEMD := 1
+endif
 
 CPPFLAGS += $(FLATCC_CPPFLAGS)
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags jansson)
 CPPFLAGS += $(shell $(PKG_CONFIG) --cflags libzstd)
-CPPFLAGS += $(shell $(PKG_CONFIG) --cflags libsystemd)
+CPPFLAGS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --cflags libsystemd) -DHAVE_SYSTEMD)
+CPPFLAGS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --cflags $(PCRE2_PKG)) -DHAVE_PCRE2)
+CPPFLAGS += $(if $(filter 1 yes true,$(LIBC_REGEX)),-DHAVE_LIBC_REGEX)
 CPPFLAGS += -DLOG_DIR=\"$(LOG_DIR)\"
 CPPFLAGS += -DRECORDER_CONFIG_PATH=\"$(RECORDER_CONFIG_PATH)\"
 
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd)
-LDLIBS += $(shell $(PKG_CONFIG) --libs libsystemd)
+LDLIBS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --libs libsystemd))
+LDLIBS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --libs $(PCRE2_PKG)))
 LDLIBS += $(FLATCC_LIBS)
 
-CFLAGS += -ggdb -Wall
+CFLAGS += -ggdb -Wall -MMD -MP
 
-all: recorder player
+all: recorder player librecorder.a
 
 repo:
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) all
 
-recorder: recorder.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+recorder: recorder.o fallback_source.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-player: player.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+player: player.o librecorder.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-smoke-test: smoke_test.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
+librecorder.a: librecorder.o segment.o $(FLATCC_RUNTIME_OBJS)
+	$(AR) rcs $@ $^
+
+smoke-test: smoke_test.o librecorder.o helper.o segment.o index.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
 install: all
 	install -d $(DESTDIR)$(bindir)
+	install -d $(DESTDIR)$(libdir)
+	install -d $(DESTDIR)$(includedir)
 	install -d $(DESTDIR)$(systemd_system_unitdir)
 	install -d $(DESTDIR)$(dir $(RECORDER_CONFIG_PATH))
 	install -m 0755 recorder $(DESTDIR)$(bindir)/recorder
 	install -m 0755 player $(DESTDIR)$(bindir)/player
+	install -m 0644 librecorder.a $(DESTDIR)$(libdir)/librecorder.a
+	install -m 0644 librecorder.h $(DESTDIR)$(includedir)/librecorder.h
 	install -m 0644 packaging/recorder.json $(DESTDIR)$(RECORDER_CONFIG_PATH)
 	install -m 0644 packaging/recorder.service $(DESTDIR)$(systemd_system_unitdir)/recorder.service
 
-.PHONY: all repo clean install
+test-fallback: recorder player
+	$(PYTHON) scripts/test_fallback.py --recorder ./recorder --player ./player
+
+test-python:
+	$(PYTHON) -m unittest scripts.test_benchmark_storage scripts.test_benchmark_capacity
+
+test-smoke: smoke-test
+	./smoke-test
+
+# Build test binaries against the repository's bundled FlatCC checkout and
+# sample configuration, then run every non-privileged test suite.
+test:
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-smoke
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-python
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-fallback
+
+# These workflows can interact with the live journal and may prompt for sudo.
+# Pass script options through the corresponding *_ARGS variable.
+benchmark-compare-storage:
+	$(PYTHON) scripts/compare_storage.py $(COMPARE_STORAGE_ARGS)
+
+benchmark-storage: repo
+	$(PYTHON) scripts/benchmark_storage.py interactive --recorder ./recorder --player ./player $(BENCHMARK_STORAGE_ARGS)
+
+benchmark-capacity: repo
+	$(PYTHON) scripts/benchmark_capacity.py --recorder ./recorder --player ./player $(BENCHMARK_CAPACITY_ARGS)
+
+.PHONY: all repo clean install test-fallback test-python test-smoke test \
+	benchmark-compare-storage benchmark-storage benchmark-capacity
 
 clean:
-	rm -f recorder player smoke-test *.o
+	rm -f recorder player smoke-test librecorder.a *.o *.d
+
+-include $(wildcard *.d)

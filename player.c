@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <inttypes.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -10,6 +11,7 @@
 #include <time.h>
 #include <unistd.h>
 
+#include "librecorder.h"
 #include "segment.h"
 
 #define FOLLOW_INITIAL_ENTRY_COUNT 10
@@ -145,19 +147,19 @@ static int parse_i32(const char *text, int *value_out)
 	return 0;
 }
 
-static int boot_matches(const PrintContext *pc, const SegmentHeader *header)
+static int boot_matches(const PrintContext *pc, uint32_t boot_seq, const char *boot_id)
 {
 	size_t filter_len;
 
 	if (pc->have_boot_seq_filter) {
-		return header->boot_seq == pc->boot_seq_filter;
+		return boot_seq == pc->boot_seq_filter;
 	}
 	if (!pc->boot_id_filter) {
 		return 1;
 	}
 	filter_len = strlen(pc->boot_id_filter);
 	return filter_len > 0 &&
-			strncmp(header->boot_id, pc->boot_id_filter, filter_len) == 0;
+			boot_id && strncmp(boot_id, pc->boot_id_filter, filter_len) == 0;
 }
 
 static int entry_matches_values(const PrintContext *pc, uint64_t realtime_ts,
@@ -173,19 +175,6 @@ static int entry_matches_values(const PrintContext *pc, uint64_t realtime_ts,
 		return 1;
 	}
 	return unit && strcmp(unit, pc->unit_filter) == 0;
-}
-
-static int entry_matches(const PrintContext *pc, journal_FullEntry_table_t entry)
-{
-	return entry_matches_values(pc, journal_FullEntry_realtime_ts(entry),
-							journal_FullEntry_unit(entry));
-}
-
-static int compact_entry_matches(const PrintContext *pc,
-							journal_CompactEntry_table_t entry)
-{
-	return entry_matches_values(pc, journal_CompactEntry_realtime_ts(entry),
-							journal_CompactEntry_unit(entry));
 }
 
 static void format_realtime(uint64_t realtime_ts, char *buf, size_t bufsz)
@@ -295,26 +284,20 @@ static void free_player_entries(PlayerEntry *entries, size_t count)
 	free(entries);
 }
 
-static int copy_player_entry(PlayerEntry *dst, journal_FullEntry_table_t src)
+static int copy_player_entry(PlayerEntry *dst, const RecorderEntry *src)
 {
-	const char *hostname = journal_FullEntry_hostname(src);
-	const char *comm = journal_FullEntry_comm(src);
-	const char *unit = journal_FullEntry_unit(src);
-	const char *exe = journal_FullEntry_exe(src);
-	const char *message = journal_FullEntry_message(src);
-
 	memset(dst, 0, sizeof(*dst));
-	dst->realtime_ts = journal_FullEntry_realtime_ts(src);
+	dst->realtime_ts = src->realtime_ts;
 	dst->order = 0;
-	dst->pid = journal_FullEntry_pid(src);
-	dst->hostname = hostname ? strdup(hostname) : NULL;
-	dst->comm = comm ? strdup(comm) : NULL;
-	dst->unit = unit ? strdup(unit) : NULL;
-	dst->exe = exe ? strdup(exe) : NULL;
-	dst->message = message ? strdup(message) : NULL;
-	if ((hostname && !dst->hostname) || (comm && !dst->comm) ||
-		(unit && !dst->unit) || (exe && !dst->exe) ||
-		(message && !dst->message)) {
+	dst->pid = src->pid;
+	dst->hostname = src->hostname ? strdup(src->hostname) : NULL;
+	dst->comm = src->comm ? strdup(src->comm) : NULL;
+	dst->unit = src->unit ? strdup(src->unit) : NULL;
+	dst->exe = src->exe ? strdup(src->exe) : NULL;
+	dst->message = src->message ? strdup(src->message) : NULL;
+	if ((src->hostname && !dst->hostname) || (src->comm && !dst->comm) ||
+		(src->unit && !dst->unit) || (src->exe && !dst->exe) ||
+		(src->message && !dst->message)) {
 		free(dst->hostname);
 		free(dst->comm);
 		free(dst->unit);
@@ -326,28 +309,7 @@ static int copy_player_entry(PlayerEntry *dst, journal_FullEntry_table_t src)
 	return 0;
 }
 
-static int copy_compact_player_entry(PlayerEntry *dst,
-							journal_CompactEntry_table_t src)
-{
-	const char *unit = journal_CompactEntry_unit(src);
-	const char *message = journal_CompactEntry_message(src);
-
-	memset(dst, 0, sizeof(*dst));
-	dst->realtime_ts = journal_CompactEntry_realtime_ts(src);
-	dst->order = 0;
-	dst->pid = journal_CompactEntry_pid(src);
-	dst->unit = unit ? strdup(unit) : NULL;
-	dst->message = message ? strdup(message) : NULL;
-	if ((unit && !dst->unit) || (message && !dst->message)) {
-		free(dst->unit);
-		free(dst->message);
-		memset(dst, 0, sizeof(*dst));
-		return -1;
-	}
-	return 0;
-}
-
-static int append_player_entry(PrintContext *pc, journal_FullEntry_table_t entry)
+static int append_player_entry(PrintContext *pc, const RecorderEntry *entry)
 {
 	PlayerEntry *tmp;
 	size_t new_capacity;
@@ -366,32 +328,7 @@ static int append_player_entry(PrintContext *pc, journal_FullEntry_table_t entry
 	}
 	pc->entries[pc->entry_count].order = pc->entry_count;
 	pc->entries[pc->entry_count].follow_new = pc->initial_follow_scan &&
-			journal_FullEntry_realtime_ts(entry) >= pc->follow_start_ts;
-	pc->entry_count++;
-	return 0;
-}
-
-static int append_compact_player_entry(PrintContext *pc,
-							journal_CompactEntry_table_t entry)
-{
-	PlayerEntry *tmp;
-	size_t new_capacity;
-
-	if (pc->entry_count == pc->entry_capacity) {
-		new_capacity = pc->entry_capacity ? pc->entry_capacity * 2 : 64;
-		tmp = realloc(pc->entries, new_capacity * sizeof(*tmp));
-		if (!tmp) {
-			return -1;
-		}
-		pc->entries = tmp;
-		pc->entry_capacity = new_capacity;
-	}
-	if (copy_compact_player_entry(&pc->entries[pc->entry_count], entry) != 0) {
-		return -1;
-	}
-	pc->entries[pc->entry_count].order = pc->entry_count;
-	pc->entries[pc->entry_count].follow_new = pc->initial_follow_scan &&
-			journal_CompactEntry_realtime_ts(entry) >= pc->follow_start_ts;
+			entry->realtime_ts >= pc->follow_start_ts;
 	pc->entry_count++;
 	return 0;
 }
@@ -485,54 +422,22 @@ static void print_entry(const PlayerEntry *entry, int sanitize_output)
 	}
 }
 
-static int print_frame(const SegmentHeader *header,
-						const SegmentFrameInfo *frame,
-						const void *chunk_buf, size_t chunk_size,
-						void *ctx)
+static int print_record(const RecorderEntry *entry, void *ctx)
 {
 	PrintContext *pc = ctx;
-	size_t i;
 
-	(void)chunk_size;
-
-	if (frame->file_offset < pc->min_frame_offset || !boot_matches(pc, header)) {
+	if (entry->frame_offset < pc->min_frame_offset ||
+		!boot_matches(pc, entry->boot_seq, entry->boot_id)) {
 		return 0;
 	}
-	if ((header->flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0) {
-		journal_DefaultChunk_table_t chunk = journal_DefaultChunk_as_root(chunk_buf);
-		flatbuffers_uint32_vec_t entries = journal_DefaultChunk_entries(chunk);
-		size_t n = flatbuffers_uint32_vec_len(entries);
-
-		for (i = 0; i < n; i++) {
-			journal_CompactEntry_table_t e = journal_CompactEntry_vec_at(entries, i);
-			if (compact_entry_matches(pc, e) &&
-				append_compact_player_entry(pc, e) != 0) {
-				return -1;
-			}
-		}
-	} else {
-		journal_Chunk_table_t chunk = journal_Chunk_as_root(chunk_buf);
-		flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
-		size_t n = flatbuffers_uint32_vec_len(entries);
-
-		for (i = 0; i < n; i++) {
-			journal_FullEntry_table_t e = journal_FullEntry_vec_at(entries, i);
-			if (entry_matches(pc, e) && append_player_entry(pc, e) != 0) {
-				return -1;
-			}
-		}
-	}
-	return 0;
+	return entry_matches_values(pc, entry->realtime_ts, entry->unit) ?
+		append_player_entry(pc, entry) : 0;
 }
 
-static int scan_segment_file_with_context(const char *path, const PlayerOptions *opts,
+static int scan_segment_file_with_context(RecorderPlayer *reader, const char *path, const PlayerOptions *opts,
 								uint64_t min_frame_offset, PrintContext *ctx,
 								uint64_t *committed_end_out)
 {
-	SegmentHeader header;
-	SegmentFooter footer;
-	size_t committed_end = 0;
-
 	ctx->unit_filter = opts->unit_filter;
 	ctx->boot_id_filter = opts->boot_id_filter;
 	ctx->boot_seq_filter = opts->boot_seq_filter;
@@ -544,12 +449,10 @@ static int scan_segment_file_with_context(const char *path, const PlayerOptions 
 	ctx->min_frame_offset = min_frame_offset;
 	ctx->follow_start_ts = opts->follow_start_ts;
 	ctx->initial_follow_scan = opts->follow && opts->follow_start_ts != 0;
-	if (segment_scan_path(path, print_frame, ctx, &header, &footer, &committed_end) != 0) {
+	if (rec_player_scan_file(reader, path, print_record, ctx,
+							  min_frame_offset, committed_end_out) != 0) {
 		fprintf(stderr, "player: failed to scan %s\n", path);
 		return -1;
-	}
-	if (committed_end_out) {
-		*committed_end_out = (uint64_t)committed_end;
 	}
 	return 0;
 }
@@ -901,7 +804,7 @@ static int resolve_boot_filter(PlayerOptions *opts)
 	return 0;
 }
 
-static int scan_log_once(const PlayerOptions *opts, SeenSegment **seen,
+static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, SeenSegment **seen,
 							size_t *seen_count, size_t *seen_cap)
 {
 	SegmentPath *items = NULL;
@@ -924,7 +827,7 @@ static int scan_log_once(const PlayerOptions *opts, SeenSegment **seen,
 		uint64_t committed_end = min_offset;
 
 		/* Each scan uses the same buffer so output can be globally ordered. */
-		if (scan_segment_file_with_context(items[i].path, opts, min_offset,
+		if (scan_segment_file_with_context(reader, items[i].path, opts, min_offset,
 										&output, &committed_end) != 0 ||
 			remember_seen_segment(seen, seen_count, seen_cap, items[i].path, committed_end) != 0) {
 			rc = 1;
@@ -959,22 +862,49 @@ static int scan_log_once(const PlayerOptions *opts, SeenSegment **seen,
 	return rc;
 }
 
+static void wait_for_reader_change(RecorderPlayer *reader)
+{
+	uint64_t deadline;
+	struct timespec now;
+	int timeout_ms = 1000;
+	int fd = rec_player_get_fd(reader);
+	struct pollfd pfd = {
+		.fd = fd,
+		.events = (short)rec_player_get_events(reader),
+	};
+
+	if (rec_player_get_timeout(reader, &deadline) == 0 &&
+		deadline != UINT64_MAX && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+		uint64_t current = (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
+		uint64_t wait_usec = deadline > current ? deadline - current : 0;
+		timeout_ms = (int)((wait_usec + 999) / 1000);
+	}
+	(void)poll(fd >= 0 ? &pfd : NULL, fd >= 0 ? 1 : 0, timeout_ms);
+	if (fd >= 0 && pfd.revents) (void)rec_player_process(reader);
+}
+
 static int scan_log_root(const PlayerOptions *opts)
 {
+	RecorderPlayer *reader = NULL;
 	SeenSegment *seen = NULL;
 	size_t seen_count = 0;
 	size_t seen_cap = 0;
 	int rc;
 
+	if (rec_player_open(&reader, opts->path) != 0) {
+		fprintf(stderr, "player: failed to open %s\n", opts->path);
+		return 1;
+	}
 	do {
-		rc = scan_log_once(opts, &seen, &seen_count, &seen_cap);
+		rc = scan_log_once(reader, opts, &seen, &seen_count, &seen_cap);
 		if (rc != 0 || !opts->follow) {
 			break;
 		}
 		fflush(stdout);
-		sleep(1);
+		wait_for_reader_change(reader);
 	} while (1);
 	free(seen);
+	rec_player_close(reader);
 	return rc;
 }
 
@@ -1120,12 +1050,15 @@ int main(int argc, char **argv)
 		return 1;
 	}
 	{
+		RecorderPlayer *reader = NULL;
 		PrintContext output;
 		size_t i;
 
 		memset(&output, 0, sizeof(output));
-		if (scan_segment_file_with_context(opts.path, &opts, 0, &output, NULL) != 0) {
+		if (rec_player_open(&reader, opts.path) != 0 ||
+			scan_segment_file_with_context(reader, opts.path, &opts, 0, &output, NULL) != 0) {
 			free_player_entries(output.entries, output.entry_count);
+			rec_player_close(reader);
 			return 1;
 		}
 		qsort(output.entries, output.entry_count, sizeof(*output.entries),
@@ -1134,6 +1067,7 @@ int main(int argc, char **argv)
 			print_entry(&output.entries[i], opts.sanitize_output);
 		}
 		free_player_entries(output.entries, output.entry_count);
+		rec_player_close(reader);
 	}
 	return 0;
 }

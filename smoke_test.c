@@ -3,11 +3,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <flatcc/flatcc_builder.h>
 
 #include "recorder_builder.h"
+#include "librecorder.h"
 #include "segment.h"
 
 typedef struct {
@@ -121,6 +123,20 @@ static int check_frame(const SegmentHeader *header,
 	return 0;
 }
 
+static int check_reader_entry(const RecorderEntry *entry, void *ctx)
+{
+	SmokeContext *sc = ctx;
+
+	if (entry->boot_seq != 3 || !entry->boot_id || strcmp(entry->boot_id, "boot-a") != 0 ||
+		!entry->message || strcmp(entry->message, "hello smoke") != 0 ||
+		!entry->unit || strcmp(entry->unit, "smoke.service") != 0 || entry->priority != 5) {
+		fprintf(stderr, "smoke: bad librecorder entry\n");
+		return -1;
+	}
+	sc->seen++;
+	return 0;
+}
+
 int main(void)
 {
 	flatcc_builder_t B;
@@ -139,6 +155,11 @@ int main(void)
 	SegmentFooter footer;
 	SmokeContext ctx;
 	char path[] = "/tmp/recorder-segment-smoke-XXXXXX";
+	char store_dir[] = "/tmp/recorder-store-smoke-XXXXXX";
+	char segment_path[512];
+	char state_path[512];
+	char group_path[512];
+	char store_id_path[512];
 	int fd;
 	size_t committed_end = 0;
 
@@ -243,7 +264,72 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
-	unlink(path);
+	if (!mkdtemp(store_dir) ||
+		snprintf(state_path, sizeof(state_path), "%s/state", store_dir) >= (int)sizeof(state_path) ||
+		snprintf(group_path, sizeof(group_path), "%s/p4", store_dir) >= (int)sizeof(group_path) ||
+		snprintf(segment_path, sizeof(segment_path), "%s/7.seg", group_path) >= (int)sizeof(segment_path) ||
+		snprintf(store_id_path, sizeof(store_id_path), "%s/store-id", state_path) >= (int)sizeof(store_id_path) ||
+		mkdir(state_path, 0755) != 0 || mkdir(group_path, 0755) != 0 || rename(path, segment_path) != 0) {
+		fprintf(stderr, "smoke: create reader store failed\n");
+		unlink(path);
+		return 1;
+	}
+	fp = fopen(store_id_path, "wb");
+	if (!fp || fputs("0123456789abcdef\n", fp) < 0) {
+		fprintf(stderr, "smoke: write store ID failed\n");
+		if (fp) fclose(fp);
+		unlink(segment_path);
+		rmdir(group_path);
+		rmdir(state_path);
+		rmdir(store_dir);
+		return 1;
+	}
+	if (fclose(fp) != 0) {
+		fprintf(stderr, "smoke: close store ID failed\n");
+		unlink(segment_path);
+		unlink(store_id_path);
+		rmdir(group_path);
+		rmdir(state_path);
+		rmdir(store_dir);
+		return 1;
+	}
+	{
+		RecorderPlayer *reader = NULL;
+		const void *data;
+		size_t data_size;
+		char *cursor = NULL;
+
+		ctx.seen = 0;
+		if (rec_player_open(&reader, store_dir) != 0 ||
+			rec_player_scan_file(reader, segment_path, check_reader_entry, &ctx, 0, NULL) != 0 ||
+			ctx.seen != 1) {
+			fprintf(stderr, "smoke: librecorder scan failed\n");
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
+			data_size != strlen("MESSAGE=hello smoke") ||
+			memcmp(data, "MESSAGE=hello smoke", data_size) != 0 ||
+			rec_player_get_cursor(reader, &cursor) != 0 ||
+			rec_player_test_cursor(reader, cursor) != 1 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_next(reader) != 1) {
+			fprintf(stderr, "smoke: librecorder iterator failed\n");
+			free(cursor);
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		free(cursor);
+		rec_player_close(reader);
+	}
+	unlink(segment_path);
+	unlink(store_id_path);
+	rmdir(group_path);
+	rmdir(state_path);
+	rmdir(store_dir);
 	printf("smoke ok\n");
 	return 0;
 }

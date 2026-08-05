@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,6 +64,34 @@ class CapacityBenchmarkTests(unittest.TestCase):
             path = Path(directory) / "cursor"
             path.write_bytes(b"s=cursor-value\0")
             self.assertEqual("s=cursor-value", capacity.read_cursor(path))
+
+    def test_journal_has_entries_after_cursor_uses_cursor_output(self) -> None:
+        original_run = capacity.run
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            del command, kwargs
+            return subprocess.CompletedProcess([], 0, "-- cursor: s=next\n", "")
+
+        capacity.run = fake_run
+        try:
+            self.assertTrue(capacity.journal_has_entries_after_cursor(
+                "bench", "s=current"))
+        finally:
+            capacity.run = original_run
+
+    def test_current_cursor_is_not_later_entry(self) -> None:
+        original_run = capacity.run
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            del command, kwargs
+            return subprocess.CompletedProcess([], 0, "-- cursor: s=current\n", "")
+
+        capacity.run = fake_run
+        try:
+            self.assertFalse(capacity.journal_has_entries_after_cursor(
+                "bench", "s=current"))
+        finally:
+            capacity.run = original_run
 
     def test_configs_apply_limits_and_disable_rate_limiting(self) -> None:
         journal = capacity.generated_journald_config("persistent", 20 * capacity.MIB)

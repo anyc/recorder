@@ -21,6 +21,7 @@
   "capture_fields_whitelist": [],
   "capture_fields_blacklist": [],
   "sanitize_output": true,
+  "modifiers": [],
   "priority_groups": [
     { "name": "p0", "priorities": [0] },
     { "name": "p1", "priorities": [1] },

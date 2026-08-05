@@ -23,12 +23,27 @@ Host build requirements:
 - `pkg-config`
 - `jansson`
 - `libsystemd`
+- optionally, `libpcre2-8` for regex modifiers
 - `zstd`
 
 Build with:
 
 ```sh
 make
+```
+
+`libsystemd` and journald input are enabled automatically when available. To
+build a fallback-only recorder with no `libsystemd` dependency, use:
+
+```sh
+make SYSTEMD=0
+```
+
+PCRE2 is autodetected. When it is unavailable, recorder can use POSIX libc
+regular expressions. To build without any regex-modifier support, use:
+
+```sh
+make PCRE2=0 LIBC_REGEX=0
 ```
 
 This produces `./recorder` and `./player`.
@@ -67,6 +82,36 @@ updates an existing file or device in place. A missing path is created.
 
 To read a systemd journal namespace instead of the default namespace, use
 `--namespace NAME` (or `-n NAME`).
+
+### Non-systemd fallback input
+
+On systems without a running journald instance, recorder can collect local
+syslog datagrams and kernel messages directly:
+
+```sh
+recorder --fallback
+```
+
+Fallback mode binds `/dev/log` and reads `/dev/kmsg`. It must own `/dev/log`;
+stop or configure any existing syslog daemon before starting it. Kernel access
+typically requires root or `CAP_SYSLOG`. Use `--no-kmsg` if kernel collection
+is unavailable, `--syslog-socket PATH` to use a different syslog socket, and
+`--kernel-path PATH` to use a different kernel-message source. The fallback
+collector records socket credentials and process metadata when available, but
+it cannot provide a systemd unit or journald-style replay cursor.
+
+Run its end-to-end test with:
+
+```sh
+make test-fallback
+```
+
+Run the smoke test, Python tests, and fallback integration test together with
+`make test`. The benchmark entry points are `make benchmark-compare-storage`,
+`make benchmark-storage`, and `make benchmark-capacity`; pass script options
+via `COMPARE_STORAGE_ARGS`, `BENCHMARK_STORAGE_ARGS`, or
+`BENCHMARK_CAPACITY_ARGS` respectively. The latter two operate on the live
+journal and may prompt for `sudo`.
 
 For isolated tests, recorder's storage directory can be overridden with
 `--log-dir PATH` (or `-l PATH`). This directory includes the segments, indexes,
@@ -226,6 +271,59 @@ The config file is JSON. Before parsing, lines starting with `#` are removed, so
   "log_max_bytes": "64M"
 }
 ```
+
+### Modifiers
+
+`modifiers` is an ordered list of transformations applied to every journal
+entry before it is assigned to a priority group. Each priority group may also
+have its own `modifiers` list. A modifier has one match predicate and one or
+more actions: `drop`, `set_priority`, and `rewrite`. `field` defaults to
+`MESSAGE`. `match.exact` and `match.present` work in every build;
+`match.regex` uses PCRE2 when available and otherwise POSIX libc regex.
+Capture-group `rewrite` requires PCRE2.
+
+```json
+{
+  "modifiers": [
+    {
+      "match": { "field": "MESSAGE", "regex": "^debug: (.*)$" },
+      "set_priority": 7,
+      "rewrite": { "field": "MESSAGE", "replacement": "$1" }
+    },
+    {
+      "match": { "field": "_SYSTEMD_UNIT", "regex": "^chatty\\.service$" },
+      "drop": true
+    }
+  ],
+  "priority_groups": [
+    {
+      "name": "important",
+      "priorities": [0, 1, 2, 3],
+      "modifiers": [
+        {
+          "match": { "field": "MESSAGE", "regex": "^retryable: (.*)$" },
+          "set_priority": 4
+        }
+      ]
+    }
+  ]
+}
+```
+
+Matches use the original journal field, including fields that are not stored.
+`match.present` is a boolean and can also match field absence with `false`.
+Set `match.not` to `true` to negate any predicate. Negated regex matches cannot
+be used with `rewrite`, because there are no capture groups when the expression
+does not match.
+`rewrite` replaces the complete target field using capture references `$0`
+through `$9`; `$$` inserts a literal dollar sign. Rewriting `MESSAGE` or
+`_SYSTEMD_UNIT` works with either entry format. Rewriting the other supported
+fixed fields (`MESSAGE_ID`, `_HOSTNAME`, `_COMM`, `_EXE`) requires
+`"entry_format": "full"`.
+
+Global modifiers run once. If a group modifier changes priority, recorder
+selects the new group and applies that group's modifiers. It drops an entry if
+modifiers would route it in a priority loop or after eight reroutes.
 
 ## Example Configuration
 

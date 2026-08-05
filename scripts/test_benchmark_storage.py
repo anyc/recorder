@@ -94,6 +94,34 @@ class StorageBenchmarkTests(unittest.TestCase):
             cursor.write_bytes(b"s=value\0")
             self.assertEqual("s=value", storage.read_cursor(cursor))
 
+    def test_journal_has_entries_after_cursor_uses_cursor_output(self) -> None:
+        original_run = storage.run
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            del command, kwargs
+            return subprocess.CompletedProcess([], 0, "-- cursor: s=next\n", "")
+
+        storage.run = fake_run
+        try:
+            self.assertTrue(storage.journal_has_entries_after_cursor(
+                "bench", "s=current"))
+        finally:
+            storage.run = original_run
+
+    def test_current_cursor_is_not_later_entry(self) -> None:
+        original_run = storage.run
+
+        def fake_run(command: list[str], **kwargs: object) -> subprocess.CompletedProcess:
+            del command, kwargs
+            return subprocess.CompletedProcess([], 0, "-- cursor: s=current\n", "")
+
+        storage.run = fake_run
+        try:
+            self.assertFalse(storage.journal_has_entries_after_cursor(
+                "bench", "s=current"))
+        finally:
+            storage.run = original_run
+
 
 if __name__ == "__main__":
     unittest.main()

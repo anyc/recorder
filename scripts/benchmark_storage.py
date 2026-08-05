@@ -362,6 +362,21 @@ def journal_tail_cursor(namespace: str) -> str:
     return match.group(1).strip()
 
 
+def journal_cursor_after(namespace: str, cursor: str) -> str:
+    command = ["sudo", "journalctl", "--namespace", namespace,
+               "--after-cursor", cursor, "-n", "1", "--show-cursor",
+               "--no-pager", "--quiet"]
+    result = run(command, stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                 text=True, quiet=True)
+    match = re.search(r"^-- cursor: (.+)$", result.stdout, re.MULTILINE)
+    return match.group(1).strip() if match else ""
+
+
+def journal_has_entries_after_cursor(namespace: str, cursor: str) -> bool:
+    next_cursor = journal_cursor_after(namespace, cursor)
+    return bool(next_cursor and next_cursor != cursor)
+
+
 def read_cursor(path: Path) -> str:
     try:
         return path.read_bytes().split(b"\0", 1)[0].decode().strip()
@@ -371,21 +386,20 @@ def read_cursor(path: Path) -> str:
 
 def wait_for_cursor(args: argparse.Namespace, namespace: str,
                     cursor_path: Path) -> None:
-    target = journal_tail_cursor(namespace)
     deadline = time.monotonic() + args.drain_timeout
     last_cursor = ""
     last_progress = time.monotonic()
     last_report = 0.0
-    print("Waiting for recorder to reach the fixed namespace-journal tail...")
+    print("Waiting for recorder to reach the namespace-journal tail...")
     while time.monotonic() < deadline:
         cursor = read_cursor(cursor_path)
-        if cursor == target:
-            print("Recorder reached the namespace-journal tail.")
-            return
         now = time.monotonic()
         if cursor and cursor != last_cursor:
             last_cursor = cursor
             last_progress = now
+        if cursor and not journal_has_entries_after_cursor(namespace, cursor):
+            print("Recorder reached the namespace-journal tail.")
+            return
         if now - last_report >= 5:
             print(f"  recorder is draining (last progress "
                   f"{now - last_progress:.1f}s ago)...")
