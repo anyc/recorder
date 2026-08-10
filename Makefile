@@ -11,6 +11,7 @@ PYTHON ?= python3
 LOG_DIR ?= $(localstatedir)/log/recorder
 RECORDER_CONFIG_PATH ?= /etc/recorder.json
 RECORDER_CONFIG_DIR ?= $(sysconfdir)/recorder.d
+RECORDER_TEST_FREE_BYTES ?=
 REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
 REPO_CONFIG_DIR ?= $(CURDIR)/packaging/recorder.d
@@ -52,6 +53,9 @@ CPPFLAGS += $(if $(filter 1 yes true,$(LIBC_REGEX)),-DHAVE_LIBC_REGEX)
 CPPFLAGS += -DLOG_DIR=\"$(LOG_DIR)\"
 CPPFLAGS += -DRECORDER_CONFIG_PATH=\"$(RECORDER_CONFIG_PATH)\"
 CPPFLAGS += -DRECORDER_CONFIG_DIR=\"$(RECORDER_CONFIG_DIR)\"
+ifneq ($(strip $(RECORDER_TEST_FREE_BYTES)),)
+CPPFLAGS += -DRECORDER_TEST_FREE_BYTES=$(RECORDER_TEST_FREE_BYTES)
+endif
 
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd)
@@ -97,6 +101,9 @@ install: all
 test-fallback: recorder player
 	$(PYTHON) scripts/test_fallback.py --recorder ./recorder --player ./player
 
+test-storage-policy: recorder
+	$(PYTHON) scripts/test_storage_policy.py
+
 test-python:
 	$(PYTHON) -m unittest scripts.test_benchmark_storage scripts.test_benchmark_capacity
 
@@ -109,6 +116,7 @@ test:
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) test-smoke
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-python
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-fallback
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) RECORDER_TEST_FREE_BYTES=0 test-storage-policy
 
 # These workflows can interact with the live journal and may prompt for sudo.
 # Pass script options through the corresponding *_ARGS variable.
@@ -121,7 +129,7 @@ benchmark-storage: repo
 benchmark-capacity: repo
 	$(PYTHON) scripts/benchmark_capacity.py --recorder ./recorder --player ./player $(BENCHMARK_CAPACITY_ARGS)
 
-.PHONY: all repo clean install test-fallback test-python test-smoke test \
+.PHONY: all repo clean install test-fallback test-storage-policy test-python test-smoke test \
 	benchmark-compare-storage benchmark-storage benchmark-capacity
 
 clean:
