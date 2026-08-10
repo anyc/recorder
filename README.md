@@ -271,6 +271,10 @@ At runtime, you can override the config file path with:
 RECORDER_CONFIG=/path/to/recorder.json ./recorder
 ```
 
+After loading the main config, recorder also loads every regular `*.json` file
+in `/etc/recorder.d`, in lexical filename order. Later files override earlier
+values, so drop-ins can customize the packaged defaults.
+
 The config file is JSON. Before parsing, lines starting with `#` are removed, so this is valid:
 
 ```json

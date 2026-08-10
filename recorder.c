@@ -84,6 +84,7 @@ typedef void sd_journal;
 #define MAX_MODIFIER_REROUTES 8
 #define RECORDER_CURSOR_PATH "/run/recorder/journal.cursor"
 #define RECORDER_CURSOR_MAX_BYTES 512
+#define RECORDER_CONFIG_DIR "/etc/recorder.d"
 
 static char g_log_dir[PATH_MAX] = LOG_DIR;
 
@@ -807,6 +808,10 @@ static int json_get_string_array(json_t *root, const char *key,
 			return -1;
 		}
 	}
+	for (i = 0; i < *count; i++) {
+		free((*dst)[i]);
+	}
+	free(*dst);
 	*dst = values;
 	*count = value_count;
 	return 0;
@@ -824,6 +829,10 @@ static int json_get_static_dict_paths(json_t *root, RecorderConfig *cfg)
 	if (!json_is_object(node)) {
 		fprintf(stderr, "recorder: config key 'static_dict_paths' must be an object\n");
 		return -1;
+	}
+	for (int i = 0; i < 8; i++) {
+		free(cfg->static_dict_paths[i]);
+		cfg->static_dict_paths[i] = NULL;
 	}
 	json_object_foreach(node, key, value)
 	{
@@ -876,6 +885,7 @@ static int json_get_modifier_list(json_t *owner, const char *scope, ModifierList
 		fprintf(stderr, "recorder: modifiers in %s must be an array\n", scope);
 		return -1;
 	}
+	modifier_list_destroy(list);
 	for (i = 0; i < json_array_size(node); i++) {
 		json_t *item = json_array_get(node, i);
 		json_t *match;
@@ -1119,6 +1129,9 @@ static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 		return -1;
 	}
 
+	for (i = 0; i < MAX_PRIORITY_GROUPS; i++) {
+		modifier_list_destroy(&cfg->groups[i].modifiers);
+	}
 	memset(cfg->groups, 0, sizeof(cfg->groups));
 	for (i = 0; i < 8; i++) {
 		cfg->priority_to_group[i] = -1;
@@ -1319,6 +1332,66 @@ out:
 	free(stripped);
 	free(raw);
 	return rc;
+}
+
+static int recorder_json_file_filter(const struct dirent *entry)
+{
+	size_t len = strlen(entry->d_name);
+
+	return len > 5 && strcmp(entry->d_name + len - 5, ".json") == 0;
+}
+
+static int recorder_config_load_dropins(RecorderConfig *cfg)
+{
+	struct dirent **entries = NULL;
+	int entry_count;
+	int i;
+
+	entry_count = scandir(RECORDER_CONFIG_DIR, &entries,
+			recorder_json_file_filter, alphasort);
+	if (entry_count < 0) {
+		if (errno == ENOENT) {
+			return 0;
+		}
+		fprintf(stderr, "recorder: cannot read config directory %s: %m\n",
+				RECORDER_CONFIG_DIR);
+		return -1;
+	}
+
+	for (i = 0; i < entry_count; i++) {
+		char path[PATH_MAX];
+		struct stat st;
+
+		if (snprintf(path, sizeof(path), "%s/%s", RECORDER_CONFIG_DIR,
+				entries[i]->d_name) >= (int)sizeof(path)) {
+			fprintf(stderr, "recorder: config path is too long: %s/%s\n",
+					RECORDER_CONFIG_DIR, entries[i]->d_name);
+			goto fail;
+		}
+		if (stat(path, &st) != 0) {
+			fprintf(stderr, "recorder: cannot stat config fragment %s: %m\n", path);
+			goto fail;
+		}
+		if (!S_ISREG(st.st_mode)) {
+			continue;
+		}
+		if (recorder_config_load(cfg, path) != 0) {
+			goto fail;
+		}
+	}
+
+	for (i = 0; i < entry_count; i++) {
+		free(entries[i]);
+	}
+	free(entries);
+	return 0;
+
+fail:
+	for (i = 0; i < entry_count; i++) {
+		free(entries[i]);
+	}
+	free(entries);
+	return -1;
 }
 
 static JournalField journal_get_field(sd_journal *j, const char *field)
@@ -4028,6 +4101,10 @@ int main(int argc, char **argv)
 	recorder_config_init(&cfg);
 	cfg_path = recorder_config_path();
 	if (recorder_config_load(&cfg, cfg_path) != 0) {
+		recorder_config_destroy(&cfg);
+		return 1;
+	}
+	if (recorder_config_load_dropins(&cfg) != 0) {
 		recorder_config_destroy(&cfg);
 		return 1;
 	}
