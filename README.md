@@ -49,6 +49,13 @@ make PCRE2=0 LIBC_REGEX=0
 
 This produces `./recorder` and `./player`.
 
+By default, it also builds the shared library `./librecorder.so` with SONAME
+`librecorder.so.1`. To build the static library instead, use:
+
+```sh
+make LIBRECORDER_STATIC=1
+```
+
 To build binaries that run directly from the repository checkout, use:
 
 ```sh
