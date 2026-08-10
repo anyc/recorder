@@ -325,9 +325,9 @@ be used with `rewrite`, because there are no capture groups when the expression
 does not match.
 `rewrite` replaces the complete target field using capture references `$0`
 through `$9`; `$$` inserts a literal dollar sign. Rewriting `MESSAGE` or
-`_SYSTEMD_UNIT` works with either entry format. Rewriting the other supported
-fixed fields (`MESSAGE_ID`, `_HOSTNAME`, `_COMM`, `_EXE`) requires
-`"entry_format": "full"`.
+`_SYSTEMD_UNIT` works with compact entries. Rewriting the other supported
+fixed fields (`MESSAGE_ID`, `_HOSTNAME`, `_COMM`, `_EXE`) automatically selects
+`FullEntry`.
 
 Global modifiers run once. If a group modifier changes priority, recorder
 selects the new group and applies that group's modifiers. It drops an entry if
@@ -382,11 +382,10 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
   "capture_hostname": false,
   "capture_comm": false,
   "capture_exe": false,
-  "capture_pid": false,
+  "capture_pid": true,
   "capture_uid": false,
   "capture_gid": false,
   "capture_all_fields": false,
-  "entry_format": "default",
   "capture_fields_whitelist": [],
   "capture_fields_blacklist": [],
   "priority_groups": [
@@ -437,12 +436,12 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 - `capture_all_fields`
   Store all optional fixed fields and arbitrary journald fields in the
   entry's `fields` vector. Field values are preserved as bytes.
-- `entry_format`
-  Select `default` for the compact entry representation or `full` for the
-  representation containing arbitrary journald fields. `capture_all_fields`
-  and `capture_message_id`, `capture_hostname`, `capture_comm`,
-  `capture_exe`, `capture_uid`, and `capture_gid` require `full`. Compact
-  entries always retain PID and support unit storage.
+- Entry format
+  Recorder uses `CompactEntry` by default. Enabling `capture_all_fields`,
+  `capture_message_id`, `capture_hostname`, `capture_comm`, `capture_exe`,
+  `capture_uid`, or `capture_gid` automatically selects `FullEntry`; no
+  explicit format setting is required. Compact entries always retain PID and
+  support unit storage.
 - `capture_fields_whitelist`
   Optional array of custom journald field names to store. When non-empty,
   custom fields not in this list are skipped.

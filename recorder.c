@@ -75,7 +75,6 @@ typedef void sd_journal;
 #define DEFAULT_CAPTURE_UID 0
 #define DEFAULT_CAPTURE_GID 0
 #define DEFAULT_CAPTURE_ALL_FIELDS 0
-#define DEFAULT_ENTRY_FORMAT 0
 #define DEFAULT_SANITIZE_OUTPUT 1
 #define JOURNAL_WAIT_USEC (300 * 1000ULL)
 #define CLOCK_BACKWARD_JUMP_THRESHOLD_USEC (1000LL)
@@ -158,7 +157,6 @@ typedef struct {
 	int capture_uid;
 	int capture_gid;
 	int capture_all_fields;
-	int entry_format;
 	char **capture_fields_whitelist;
 	size_t capture_fields_whitelist_count;
 	char **capture_fields_blacklist;
@@ -366,7 +364,6 @@ static void recorder_config_init(RecorderConfig *cfg)
 	cfg->capture_uid = DEFAULT_CAPTURE_UID;
 	cfg->capture_gid = DEFAULT_CAPTURE_GID;
 	cfg->capture_all_fields = DEFAULT_CAPTURE_ALL_FIELDS;
-	cfg->entry_format = DEFAULT_ENTRY_FORMAT;
 	cfg->sanitize_output = DEFAULT_SANITIZE_OUTPUT;
 	cfg->durable_priority_max = DEFAULT_DURABLE_PRIORITY_MAX;
 	cfg->durability_flush_frames = DEFAULT_DURABILITY_FLUSH_FRAMES;
@@ -620,29 +617,6 @@ static int json_get_bool_default(json_t *root, const char *key, int *dst)
 		return -1;
 	}
 	*dst = json_is_true(node);
-	return 0;
-}
-
-static int json_get_entry_format(json_t *root, int *dst)
-{
-	json_t *node = json_object_get(root, "entry_format");
-	const char *value;
-
-	if (!node) {
-		return 0;
-	}
-	if (!json_is_string(node) || !(value = json_string_value(node))) {
-		fprintf(stderr, "recorder: config key 'entry_format' must be 'default' or 'full'\n");
-		return -1;
-	}
-	if (strcmp(value, "default") == 0) {
-		*dst = 0;
-	} else if (strcmp(value, "full") == 0) {
-		*dst = 1;
-	} else {
-		fprintf(stderr, "recorder: config key 'entry_format' must be 'default' or 'full'\n");
-		return -1;
-	}
 	return 0;
 }
 
@@ -1080,6 +1054,7 @@ static int validate_modifier_list(const ModifierList *list, const RecorderConfig
 						  const char *scope)
 {
 	size_t i;
+	(void)cfg;
 
 	for (i = 0; i < list->count; i++) {
 		const EntryModifier *modifier = &list->items[i];
@@ -1090,11 +1065,37 @@ static int validate_modifier_list(const ModifierList *list, const RecorderConfig
 				i, scope, modifier->rewrite_field);
 			return -1;
 		}
-		if (cfg->entry_format == 0 && strcmp(modifier->rewrite_field, "MESSAGE") != 0 &&
-			strcmp(modifier->rewrite_field, "_SYSTEMD_UNIT") != 0) {
-			fprintf(stderr, "recorder: modifier %zu in %s rewrites '%s', which requires entry_format 'full'\n",
-				i, scope, modifier->rewrite_field);
-			return -1;
+	}
+	return 0;
+}
+
+static int modifier_list_uses_full_entries(const ModifierList *list)
+{
+	size_t i;
+
+	for (i = 0; i < list->count; i++) {
+		const char *field = list->items[i].rewrite_field;
+		if (field && strcmp(field, "MESSAGE") != 0 && strcmp(field, "_SYSTEMD_UNIT") != 0) {
+			return 1;
+		}
+	}
+	return 0;
+}
+
+static int config_uses_full_entries(const RecorderConfig *cfg)
+{
+	size_t i;
+
+	if (cfg->capture_all_fields || cfg->capture_message_id || cfg->capture_hostname ||
+		cfg->capture_comm || cfg->capture_exe || cfg->capture_uid || cfg->capture_gid) {
+		return 1;
+	}
+	if (modifier_list_uses_full_entries(&cfg->modifiers)) {
+		return 1;
+	}
+	for (i = 0; i < cfg->group_count; i++) {
+		if (modifier_list_uses_full_entries(&cfg->groups[i].modifiers)) {
+			return 1;
 		}
 	}
 	return 0;
@@ -1237,7 +1238,6 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		json_get_bool_default(root, "capture_uid", &cfg->capture_uid) != 0 ||
 		json_get_bool_default(root, "capture_gid", &cfg->capture_gid) != 0 ||
 		json_get_bool_default(root, "capture_all_fields", &cfg->capture_all_fields) != 0 ||
-		json_get_entry_format(root, &cfg->entry_format) != 0 ||
 		json_get_string_array(root, "capture_fields_whitelist",
 							&cfg->capture_fields_whitelist,
 							&cfg->capture_fields_whitelist_count) != 0 ||
@@ -1264,16 +1264,6 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 	if (cfg->encryption_public_key && access(cfg->encryption_public_key, R_OK) != 0) {
 		fprintf(stderr, "recorder: encryption public key is not readable: %s\n",
 				cfg->encryption_public_key);
-		goto out;
-	}
-	if (cfg->capture_all_fields && cfg->entry_format != 1) {
-		fprintf(stderr, "recorder: capture_all_fields requires entry_format 'full'\n");
-		goto out;
-	}
-	if (cfg->entry_format == 0 &&
-		(cfg->capture_message_id || cfg->capture_hostname || cfg->capture_comm || cfg->capture_exe ||
-		 cfg->capture_pid || cfg->capture_uid || cfg->capture_gid)) {
-		fprintf(stderr, "recorder: extended fixed-field capture requires entry_format 'full'\n");
 		goto out;
 	}
 	if (validate_modifier_list(&cfg->modifiers, cfg, "top-level config") != 0) {
@@ -2630,7 +2620,7 @@ static int extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 					journal_field_for_capture(j, "_COMM", cfg->capture_all_fields) : (JournalField){0};
 	entry->exe = (cfg->capture_all_fields || cfg->capture_exe) ?
 					journal_field_for_capture(j, "_EXE", cfg->capture_all_fields) : (JournalField){0};
-	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || cfg->entry_format == 0) ?
+	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || !config_uses_full_entries(cfg)) ?
 		journal_get_u32(j, "_PID") : 0;
 	entry->uid = (cfg->capture_all_fields || cfg->capture_uid) ? journal_get_u32(j, "_UID") : 0;
 	entry->gid = (cfg->capture_all_fields || cfg->capture_gid) ? journal_get_u32(j, "_GID") : 0;
@@ -2661,7 +2651,7 @@ static int extract_fallback_entry(LogEntry *entry, FallbackRecord *record,
 	entry->realtime_ts = record->realtime_ts;
 	entry->monotonic_ts = record->monotonic_ts;
 	entry->priority = record->priority <= 7 ? record->priority : 5;
-	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || cfg->entry_format == 0) ?
+	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || !config_uses_full_entries(cfg)) ?
 		record->pid : 0;
 	entry->uid = (cfg->capture_all_fields || cfg->capture_uid) ? record->uid : 0;
 	entry->gid = (cfg->capture_all_fields || cfg->capture_gid) ? record->gid : 0;
@@ -3100,7 +3090,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	current_timezone_string(header.timezone);
 	header.first_realtime_ts = entry->realtime_ts;
 	header.first_monotonic_ts = entry->monotonic_ts;
-	if (r->config.entry_format == 0) {
+	if (!config_uses_full_entries(&r->config)) {
 		header.flags |= SEGMENT_FLAG_COMPACT_ENTRIES;
 	}
 	if (w->encryptor) {
@@ -3200,7 +3190,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	w->compress_enabled = r->config.compress_enabled;
 	w->compress_min_frame_bytes = r->config.compress_min_frame_bytes;
 	w->compress_if_smaller = r->config.compress_if_smaller;
-	w->use_compact_entries = r->config.entry_format == 0;
+	w->use_compact_entries = !config_uses_full_entries(&r->config);
 	w->durable_per_frame = r->config.groups[w->group_index].durable_per_frame;
 	w->durability_flush_frames = r->config.groups[w->group_index].durability_flush_frames;
 	w->durability_flush_interval_sec = r->config.groups[w->group_index].durability_flush_interval_sec;

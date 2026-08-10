@@ -237,7 +237,6 @@ def write_recorder_config(path: Path, budget: int,
         f'  "capture_uid": {capture},\n'
         f'  "capture_gid": {capture},\n'
         f'  "capture_all_fields": {capture},\n'
-        f'  "entry_format": "{"full" if capture_all_fields else "default"}",\n'
         '  "sanitize_output": true\n'
         "}\n",
         encoding="utf-8",

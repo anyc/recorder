@@ -32,7 +32,6 @@ class StorageBenchmarkTests(unittest.TestCase):
         for field in ("hostname", "comm", "exe", "pid", "uid", "gid"):
             self.assertIn(f'"capture_{field}": true', recorder)
         self.assertIn('"capture_all_fields": true', recorder)
-        self.assertIn('"entry_format": "full"', recorder)
 
     def test_replay_disables_service_rate_limiting(self) -> None:
         args = storage.replay_command(

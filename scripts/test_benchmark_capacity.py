@@ -105,7 +105,6 @@ class CapacityBenchmarkTests(unittest.TestCase):
             recorder = path.read_text(encoding="utf-8")
         self.assertIn('"log_max_bytes": 20971520', recorder)
         self.assertIn('"segment_max_bytes": 1048576', recorder)
-        self.assertIn('"entry_format": "default"', recorder)
 
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "recorder-all.json"
@@ -115,7 +114,6 @@ class CapacityBenchmarkTests(unittest.TestCase):
         for field in ("hostname", "comm", "exe", "pid", "uid", "gid"):
             self.assertIn(f'"capture_{field}": true', recorder_all)
         self.assertIn('"capture_all_fields": true', recorder_all)
-        self.assertIn('"entry_format": "full"', recorder_all)
 
     def test_prepare_batches_rejects_truncated_workload(self) -> None:
         args = argparse.Namespace(
