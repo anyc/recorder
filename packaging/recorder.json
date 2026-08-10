@@ -1,38 +1,87 @@
 {
-  "log_max_bytes": 67108864,
-  "segment_max_bytes": 4194304,
-  "segment_max_age_sec": 900,
-  "durable_priority_max": 3,
-  "durability_flush_frames": 32,
-  "durability_flush_interval_sec": 60,
-  "compress_enabled": true,
-  "compress_min_frame_bytes": 256,
-  "compress_if_smaller": true,
-  # Optional PEM public key. When set, frame payloads are encrypted.
+  ### Maximum total storage used by recorder-owned files, in bytes.
+  # "log_max_bytes": 67108864,
+
+  ### Maximum size of one segment before rotation, in bytes.
+  # "segment_max_bytes": 4194304,
+
+  ### Maximum age of one segment before rotation, in seconds.
+  # "segment_max_age_sec": 900,
+
+  ### Priorities 0 through this value use the durable write policy.
+  # "durable_priority_max": 3,
+
+  ### Flush a durable segment after this many frames.
+  # "durability_flush_frames": 32,
+
+  ### Flush a durable segment after this many seconds.
+  # "durability_flush_interval_sec": 60,
+
+  ### Enable zstd compression for eligible frames.
+  # "compress_enabled": true,
+
+  ### Minimum uncompressed frame size for compression, in bytes.
+  # "compress_min_frame_bytes": 256,
+
+  ### Keep compressed data only when it is smaller than the original.
+  # "compress_if_smaller": true,
+
+  ### Optional path to a PEM public key for encrypting new frame payloads.
   # "encryption_public_key": "/etc/recorder/encryption-public.pem",
-  "capture_unit": true,
-  "capture_pid": true,
-  # Enabling any of the following options automatically selects FullEntry.
-  "capture_message_id": false,
-  "capture_hostname": false,
-  "capture_comm": false,
-  "capture_exe": false,
-  "capture_uid": false,
-  "capture_gid": false,
-  "capture_all_fields": false,
-  "capture_fields_whitelist": [],
-  "capture_fields_blacklist": [],
-  "sanitize_output": true,
-  "modifiers": [],
-  "priority_groups": [
-    { "name": "p0", "priorities": [0] },
-    { "name": "p1", "priorities": [1] },
-    { "name": "p2", "priorities": [2] },
-    { "name": "p3", "priorities": [3] },
-    { "name": "p4", "priorities": [4] },
-    { "name": "p5", "priorities": [5] },
-    { "name": "p6", "priorities": [6] },
-    { "name": "p7", "priorities": [7] }
-  ],
-  "static_dict_paths": {}
+
+  ### Store _SYSTEMD_UNIT when present; this remains compact-compatible.
+  # "capture_unit": true,
+
+  ### Store _PID when present; CompactEntry retains PID by default.
+  # "capture_pid": true,
+
+  ### The following options automatically select FullEntry when enabled.
+
+  ### Store MESSAGE_ID when present.
+  # "capture_message_id": false,
+
+  ### Store _HOSTNAME when present.
+  # "capture_hostname": false,
+
+  ### Store _COMM when present.
+  # "capture_comm": false,
+
+  ### Store _EXE when present.
+  # "capture_exe": false,
+
+  ### Store _UID when present.
+  # "capture_uid": false,
+
+  ### Store _GID when present.
+  # "capture_gid": false,
+
+  ### Store all optional fixed fields and arbitrary journald fields.
+  # "capture_all_fields": false,
+
+  ### Restrict captured custom journald fields to this list when non-empty.
+  # "capture_fields_whitelist": [],
+
+  ### Skip these custom journald fields; this takes precedence over the whitelist.
+  # "capture_fields_blacklist": [],
+
+  ### Escape terminal control characters in verbose recorder output.
+  # "sanitize_output": true,
+
+  ### Ordered entry transformations applied before priority-group assignment.
+  # "modifiers": [],
+
+  ### Group priorities into named segment directories.
+  # "priority_groups": [
+  #   { "name": "p0", "priorities": [0] },
+  #   { "name": "p1", "priorities": [1] },
+  #   { "name": "p2", "priorities": [2] },
+  #   { "name": "p3", "priorities": [3] },
+  #   { "name": "p4", "priorities": [4] },
+  #   { "name": "p5", "priorities": [5] },
+  #   { "name": "p6", "priorities": [6] },
+  #   { "name": "p7", "priorities": [7] }
+  # ],
+
+  ### Map priority numbers to optional zstd static dictionary paths.
+  # "static_dict_paths": {}
 }
