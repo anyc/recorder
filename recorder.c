@@ -17,6 +17,7 @@
 #include <sys/file.h>
 #include <sys/random.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/vfs.h>
 #include <time.h>
 #include <unistd.h>
@@ -455,6 +456,32 @@ static void recorder_verbose_log(const Recorder *r, const char *fmt, ...)
 	vfprintf(stderr, fmt, ap);
 	va_end(ap);
 	fputc('\n', stderr);
+}
+
+static void recorder_report_storage_error(const char *operation, const char *path)
+{
+	int saved_errno = errno;
+	struct statvfs stats;
+	const char *target = path ? path : g_log_dir;
+	const char *reason = saved_errno != 0 ? strerror(saved_errno) : "I/O error";
+	int have_stats = statvfs(target, &stats) == 0;
+	unsigned long long available = have_stats ?
+		(unsigned long long)stats.f_bavail * (unsigned long long)stats.f_frsize : 0;
+
+	if (saved_errno == ENOSPC || saved_errno == EDQUOT ||
+		(saved_errno == 0 && have_stats && available == 0)) {
+		if (saved_errno == 0) {
+			reason = "no space left on device";
+		}
+		fprintf(stderr,
+				"recorder: storage error while %s in '%s': %s "
+				"(%llu bytes available)\n",
+				operation, target, reason, available);
+	} else {
+		fprintf(stderr, "recorder: storage error while %s in '%s': %s\n",
+			operation, target, reason);
+	}
+	errno = saved_errno;
 }
 
 static const char *rotate_reason_text(RotateReason reason)
@@ -3867,7 +3894,7 @@ static size_t recorder_step_fallback(Recorder *r)
 		return 0;
 	}
 	if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
-		fprintf(stderr, "recorder: failed to store entry\n");
+		recorder_report_storage_error("storing an entry", g_log_dir);
 		free_log_entry(&entry);
 		return 0;
 	}
@@ -3913,7 +3940,7 @@ static size_t recorder_step(Recorder *r)
 			break;
 		}
 		if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
-			fprintf(stderr, "recorder: failed to store entry\n");
+			recorder_report_storage_error("storing an entry", g_log_dir);
 			free_log_entry(&entry);
 			break;
 		}
@@ -4230,13 +4257,13 @@ int main(int argc, char **argv)
 
 		if (n > 0) {
 			if (recorder_flush_all(&r, 1) != 0) {
-				fprintf(stderr, "recorder: failed to flush stored entries\n");
+				recorder_report_storage_error("flushing stored entries", g_log_dir);
 				break;
 			}
 			continue;
 		}
 		if (recorder_flush_all(&r, 1) != 0) {
-			fprintf(stderr, "recorder: failed to flush stored entries\n");
+			recorder_report_storage_error("flushing stored entries", g_log_dir);
 			break;
 		}
 		if (r.startup_catchup && r.verbose >= 1) {
