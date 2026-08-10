@@ -27,13 +27,18 @@ BENCHMARK_CAPACITY_ARGS ?=
 FLATCC_MODE ?= sysroot
 LIBRECORDER_STATIC ?= 0
 LIBRECORDER_SONAME ?= librecorder.so.1
+LIBRECORDER_VERSIONED ?= librecorder.so.1.0.0
 
 ifeq ($(filter 1 yes true,$(LIBRECORDER_STATIC)),)
-LIBRECORDER_TARGET = librecorder.so
+LIBRECORDER_TARGET = $(LIBRECORDER_VERSIONED)
 LIBRECORDER_INSTALL_MODE = 0755
+LIBRECORDER_LINK_TARGETS = librecorder.so $(LIBRECORDER_SONAME)
+LIBRECORDER_SHARED = 1
 else
 LIBRECORDER_TARGET = librecorder.a
 LIBRECORDER_INSTALL_MODE = 0644
+LIBRECORDER_LINK_TARGETS =
+LIBRECORDER_SHARED = 0
 endif
 
 FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),\
@@ -80,7 +85,7 @@ LDLIBS += -pthread
 
 LIBRECORDER_OBJS = src/librecorder.o src/segment.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 
-all: recorder player $(LIBRECORDER_TARGET)
+all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
 repo:
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
@@ -91,8 +96,14 @@ recorder: src/recorder.o src/fallback_source.o src/helper.o src/segment.o src/in
 player: src/player.o src/librecorder.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-librecorder.so: $(LIBRECORDER_OBJS)
+$(LIBRECORDER_VERSIONED): $(LIBRECORDER_OBJS)
 	$(CC) -shared $(LDFLAGS) -Wl,-soname,$(LIBRECORDER_SONAME) $^ $(LDLIBS) -o $@
+
+librecorder.so: $(LIBRECORDER_VERSIONED)
+	ln -sf $(LIBRECORDER_VERSIONED) $@
+
+$(LIBRECORDER_SONAME): $(LIBRECORDER_VERSIONED)
+	ln -sf $(LIBRECORDER_VERSIONED) $@
 
 librecorder.a: $(LIBRECORDER_OBJS)
 	$(AR) rcs $@ $^
@@ -110,8 +121,9 @@ install: all
 	install -m 0755 recorder $(DESTDIR)$(bindir)/recorder
 	install -m 0755 player $(DESTDIR)$(bindir)/player
 	install -m $(LIBRECORDER_INSTALL_MODE) $(LIBRECORDER_TARGET) $(DESTDIR)$(libdir)/$(LIBRECORDER_TARGET)
-	if [ "$(LIBRECORDER_TARGET)" = "librecorder.so" ]; then \
-		ln -sf librecorder.so $(DESTDIR)$(libdir)/$(LIBRECORDER_SONAME); \
+	if [ "$(LIBRECORDER_SHARED)" = "1" ]; then \
+		ln -sf $(LIBRECORDER_VERSIONED) $(DESTDIR)$(libdir)/$(LIBRECORDER_SONAME); \
+		ln -sf $(LIBRECORDER_SONAME) $(DESTDIR)$(libdir)/librecorder.so; \
 	fi
 	install -m 0644 src/librecorder.h $(DESTDIR)$(includedir)/librecorder.h
 	install -m 0644 packaging/recorder.json $(DESTDIR)$(RECORDER_CONFIG_PATH)
@@ -152,6 +164,6 @@ benchmark-capacity: repo
 	benchmark-compare-storage benchmark-storage benchmark-capacity
 
 clean:
-	rm -f recorder player smoke-test librecorder.a librecorder.so *.o *.d src/*.o src/*.d
+	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* *.o *.d src/*.o src/*.d
 
 -include $(wildcard *.d) $(wildcard src/*.d)
