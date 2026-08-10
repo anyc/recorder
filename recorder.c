@@ -64,6 +64,7 @@ typedef void sd_journal;
 #define DEFAULT_DURABILITY_FLUSH_FRAMES 32
 #define DEFAULT_DURABILITY_FLUSH_INTERVAL_SEC 60
 #define DEFAULT_LOG_MAX_BYTES (64ULL * 1024ULL * 1024ULL)
+#define DEFAULT_MIN_FREE_BYTES 0
 #define DEFAULT_COMPRESS_ENABLED 1
 #define DEFAULT_COMPRESS_MIN_FRAME_BYTES 256
 #define DEFAULT_COMPRESS_IF_SMALLER 1
@@ -144,6 +145,8 @@ typedef struct {
 	int durable_per_frame;
 	unsigned durability_flush_frames;
 	unsigned durability_flush_interval_sec;
+	uint64_t max_bytes;
+	unsigned max_age_sec;
 	const char *static_dict_path;
 	ModifierList modifiers;
 } PriorityGroup;
@@ -167,6 +170,7 @@ typedef struct {
 	unsigned durability_flush_frames;
 	unsigned durability_flush_interval_sec;
 	uint64_t log_max_bytes;
+	uint64_t min_free_bytes;
 	uint64_t segment_max_bytes;
 	unsigned segment_max_age_sec;
 	int compress_enabled;
@@ -305,8 +309,10 @@ typedef struct {
 	char path[512];
 	char dir_name[MAX_GROUP_NAME_LEN + 1];
 	uint8_t min_priority;
+	int group_index;
 	uint64_t segment_seq;
 	uint64_t size;
+	time_t modified_at;
 } RetainedFile;
 
 typedef enum {
@@ -370,6 +376,7 @@ static void recorder_config_init(RecorderConfig *cfg)
 	cfg->durability_flush_frames = DEFAULT_DURABILITY_FLUSH_FRAMES;
 	cfg->durability_flush_interval_sec = DEFAULT_DURABILITY_FLUSH_INTERVAL_SEC;
 	cfg->log_max_bytes = DEFAULT_LOG_MAX_BYTES;
+	cfg->min_free_bytes = DEFAULT_MIN_FREE_BYTES;
 	cfg->segment_max_bytes = DEFAULT_SEGMENT_MAX_BYTES;
 	cfg->segment_max_age_sec = DEFAULT_SEGMENT_MAX_AGE_SEC;
 	cfg->compress_enabled = DEFAULT_COMPRESS_ENABLED;
@@ -458,15 +465,27 @@ static void recorder_verbose_log(const Recorder *r, const char *fmt, ...)
 	fputc('\n', stderr);
 }
 
+static int recorder_available_bytes(const char *path, uint64_t *available)
+{
+	struct statvfs stats;
+
+	if (statvfs(path, &stats) != 0) {
+		return -1;
+	}
+	*available = (uint64_t)stats.f_bavail * (uint64_t)stats.f_frsize;
+#ifdef RECORDER_TEST_FREE_BYTES
+	*available = RECORDER_TEST_FREE_BYTES;
+#endif
+	return 0;
+}
+
 static void recorder_report_storage_error(const char *operation, const char *path)
 {
 	int saved_errno = errno;
-	struct statvfs stats;
 	const char *target = path ? path : g_log_dir;
 	const char *reason = saved_errno != 0 ? strerror(saved_errno) : "I/O error";
-	int have_stats = statvfs(target, &stats) == 0;
-	unsigned long long available = have_stats ?
-		(unsigned long long)stats.f_bavail * (unsigned long long)stats.f_frsize : 0;
+	uint64_t available = 0;
+	int have_stats = recorder_available_bytes(target, &available) == 0;
 
 	if (saved_errno == ENOSPC || saved_errno == EDQUOT ||
 		(saved_errno == 0 && have_stats && available == 0)) {
@@ -475,7 +494,7 @@ static void recorder_report_storage_error(const char *operation, const char *pat
 		}
 		fprintf(stderr,
 				"recorder: storage error while %s in '%s': %s "
-				"(%llu bytes available)\n",
+				"(available=%" PRIu64 " bytes)\n",
 				operation, target, reason, available);
 	} else {
 		fprintf(stderr, "recorder: storage error while %s in '%s': %s\n",
@@ -668,6 +687,8 @@ static int json_get_uint_default(json_t *root, const char *key, unsigned *dst)
 	return 0;
 }
 
+static int parse_size_string(const char *text, uint64_t *value_out);
+
 static int json_get_group_uint_default(json_t *group, const char *group_name,
 										const char *key, unsigned *dst)
 {
@@ -690,6 +711,32 @@ static int json_get_group_uint_default(json_t *group, const char *group_name,
 	}
 	*dst = (unsigned)value;
 	return 0;
+}
+
+static int json_get_group_size_default(json_t *group, const char *group_name,
+								const char *key, uint64_t *dst)
+{
+	json_t *node = json_object_get(group, key);
+	uint64_t value;
+
+	if (!node) return 0;
+	if (json_is_integer(node)) {
+		json_int_t raw = json_integer_value(node);
+		if (raw < 0) {
+			fprintf(stderr, "recorder: priority group '%s' key '%s' must be non-negative\n",
+					group_name, key);
+			return -1;
+		}
+		*dst = (uint64_t)raw;
+		return 0;
+	}
+	if (json_is_string(node) && parse_size_string(json_string_value(node), &value) == 0) {
+		*dst = value;
+		return 0;
+	}
+	fprintf(stderr, "recorder: priority group '%s' key '%s' must be an integer or size string\n",
+			group_name, key);
+	return -1;
 }
 
 static int json_get_int_default(json_t *root, const char *key, int min_value,
@@ -1186,9 +1233,13 @@ static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 		if (json_get_group_uint_default(group, cfg->groups[i].name,
 										"durability_flush_frames",
 										&cfg->groups[i].durability_flush_frames) != 0 ||
-			json_get_group_uint_default(group, cfg->groups[i].name,
+				json_get_group_uint_default(group, cfg->groups[i].name,
 										"durability_flush_interval_sec",
-										&cfg->groups[i].durability_flush_interval_sec) != 0) {
+										&cfg->groups[i].durability_flush_interval_sec) != 0 ||
+				json_get_group_size_default(group, cfg->groups[i].name,
+										"max_bytes", &cfg->groups[i].max_bytes) != 0 ||
+				json_get_group_uint_default(group, cfg->groups[i].name,
+										"max_age_sec", &cfg->groups[i].max_age_sec) != 0) {
 			return -1;
 		}
 		if (json_get_modifier_list(group, cfg->groups[i].name,
@@ -1288,6 +1339,7 @@ static int recorder_config_load(RecorderConfig *cfg, const char *path)
 		json_get_uint_default(root, "durability_flush_frames", &cfg->durability_flush_frames) != 0 ||
 		json_get_uint_default(root, "durability_flush_interval_sec", &cfg->durability_flush_interval_sec) != 0 ||
 		json_get_size_default(root, "log_max_bytes", &cfg->log_max_bytes) != 0 ||
+		json_get_size_default(root, "min_free_bytes", &cfg->min_free_bytes) != 0 ||
 		json_get_size_default(root, "segment_max_bytes", &cfg->segment_max_bytes) != 0 ||
 		json_get_uint_default(root, "segment_max_age_sec", &cfg->segment_max_age_sec) != 0 ||
 		json_get_bool_default(root, "compress_enabled", &cfg->compress_enabled) != 0 ||
@@ -2315,8 +2367,10 @@ static void collect_closed_segments_cb(const char *dir_name, void *ctx)
 				sizeof(collect->files[collect->count].dir_name) - 1);
 		collect->files[collect->count].dir_name[sizeof(collect->files[collect->count].dir_name) - 1] = '\0';
 		collect->files[collect->count].min_priority = 7;
+		collect->files[collect->count].group_index = -1;
 		collect->files[collect->count].segment_seq = seq;
 		collect->files[collect->count].size = (uint64_t)st.st_size;
+		collect->files[collect->count].modified_at = st.st_mtime;
 		{
 			SegmentHeader header;
 			SegmentFooter footer;
@@ -2329,6 +2383,8 @@ static void collect_closed_segments_cb(const char *dir_name, void *ctx)
 						const PriorityGroup *group = &collect->recorder->config.groups[collect->recorder->config.priority_to_group[i]];
 						if (strcmp(group->name, dir_name) == 0) {
 							collect->files[collect->count].min_priority = group->min_priority;
+							collect->files[collect->count].group_index =
+								collect->recorder->config.priority_to_group[i];
 							break;
 						}
 					}
@@ -2370,38 +2426,61 @@ static void retention_sort(RetainedFile *files, size_t count)
 	}
 }
 
+static int retention_remove_file(Recorder *r, RetainedFile *file,
+						 uint64_t *total, uint64_t *group_bytes)
+{
+	char idx_path[512];
+	char dir_path[256];
+
+	if (unlink(file->path) != 0) {
+		return 0;
+	}
+	build_index_path(idx_path, sizeof(idx_path), file->dir_name, file->segment_seq);
+	unlink(idx_path);
+	*total = *total > file->size ? *total - file->size : 0;
+	if (file->group_index >= 0 && group_bytes[file->group_index] >= file->size) {
+		group_bytes[file->group_index] -= file->size;
+	}
+	build_segment_dir(dir_path, sizeof(dir_path), file->dir_name);
+	fsync_dir_path(dir_path);
+	recorder_verbose_log(r,
+						"retention removed segment seq=%" PRIu64 " group=%s size=%" PRIu64 " bytes",
+						file->segment_seq, file->dir_name, file->size);
+	return 1;
+}
+
 static void retention_enforce(Recorder *r)
 {
 	uint64_t total;
+	uint64_t group_bytes[MAX_PRIORITY_GROUPS] = {0};
 	RetainedFile files[4096];
 	size_t count = 0;
 	size_t i;
 	int changed = 0;
+	time_t now = time(NULL);
 
-	if (r->config.log_max_bytes == 0) {
-		return;
-	}
 	total = count_store_bytes();
-	if (total <= r->config.log_max_bytes) {
-		return;
-	}
 	collect_closed_segments(r, files, &count);
+	for (i = 0; i < count; i++) {
+		if (files[i].group_index >= 0) {
+			group_bytes[files[i].group_index] += files[i].size;
+		}
+	}
 	retention_sort(files, count);
-	for (i = 0; i < count && total > r->config.log_max_bytes; i++) {
-		if (unlink(files[i].path) == 0) {
-			char idx_path[512];
-			char dir_path[256];
+	for (i = 0; i < count; i++) {
+		RetainedFile *file = &files[i];
+		const PriorityGroup *group = file->group_index >= 0 ?
+			&r->config.groups[file->group_index] : NULL;
+		int remove = r->config.log_max_bytes != 0 && total > r->config.log_max_bytes;
 
-			build_index_path(idx_path, sizeof(idx_path), files[i].dir_name,
-								files[i].segment_seq);
-			unlink(idx_path);
-			total = total > files[i].size ? total - files[i].size : 0;
-			build_segment_dir(dir_path, sizeof(dir_path), files[i].dir_name);
-			fsync_dir_path(dir_path);
-			recorder_verbose_log(r,
-									"retention removed segment seq=%" PRIu64 " group=%s size=%" PRIu64 " bytes",
-									files[i].segment_seq, files[i].dir_name,
-									(uint64_t)files[i].size);
+		if (group && group->max_bytes != 0 && group_bytes[file->group_index] > group->max_bytes) {
+			remove = 1;
+		}
+		if (group && group->max_age_sec != 0 && now > file->modified_at &&
+			(unsigned long long)(now - file->modified_at) >= group->max_age_sec) {
+			remove = 1;
+		}
+		if (remove && retention_remove_file(r, file, &total, group_bytes)) {
 			changed = 1;
 		}
 	}
@@ -2409,6 +2488,49 @@ static void retention_enforce(Recorder *r)
 		boot_registry_rebuild_from_segments(&r->boots);
 		persist_boot_state(&r->boots);
 	}
+}
+
+static int retention_reclaim_lower_priority(Recorder *r, uint8_t priority,
+								uint64_t required_bytes)
+{
+	RetainedFile files[4096];
+	uint64_t group_bytes[MAX_PRIORITY_GROUPS] = {0};
+	size_t count = 0;
+	size_t i;
+	int changed = 0;
+	uint64_t available;
+
+	if (recorder_available_bytes(g_log_dir, &available) != 0) {
+		return 0;
+	}
+	if (available >= required_bytes) {
+		return 0;
+	}
+	collect_closed_segments(r, files, &count);
+	retention_sort(files, count);
+	for (i = 0; i < count; i++) {
+		if (files[i].group_index >= 0) {
+			group_bytes[files[i].group_index] += files[i].size;
+		}
+	}
+	for (i = 0; i < count; i++) {
+		if (files[i].min_priority <= priority) {
+			continue;
+		}
+		if (retention_remove_file(r, &files[i], &(uint64_t){0}, group_bytes)) {
+			changed = 1;
+		}
+		if (recorder_available_bytes(g_log_dir, &available) == 0) {
+			if (available >= required_bytes) {
+				break;
+			}
+		}
+	}
+	if (changed) {
+		boot_registry_rebuild_from_segments(&r->boots);
+		persist_boot_state(&r->boots);
+	}
+	return changed;
 }
 
 typedef struct {
@@ -3737,6 +3859,30 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 	return 0;
 }
 
+static int recorder_submit_entry_with_recovery(Recorder *r, const LogEntry *entry)
+{
+	int saved_errno;
+	uint64_t required_bytes = recorder_segment_limit(r);
+
+	if (r->config.min_free_bytes > required_bytes) {
+		required_bytes = r->config.min_free_bytes;
+	}
+	if (r->config.min_free_bytes != 0) {
+		retention_reclaim_lower_priority(r, entry->priority, required_bytes);
+	}
+
+	if (recorder_submit_entry(r, entry) == 0) {
+		return 0;
+	}
+	saved_errno = errno;
+	if ((saved_errno == ENOSPC || saved_errno == EDQUOT) &&
+		retention_reclaim_lower_priority(r, entry->priority, required_bytes) > 0) {
+		return recorder_submit_entry(r, entry);
+	}
+	errno = saved_errno;
+	return -1;
+}
+
 static int script_add_field(json_t *json, const char *name, JournalField field,
 						const char **env_names, const char **env_values,
 						size_t *env_count, char **owned_values, size_t *owned_count)
@@ -3893,7 +4039,7 @@ static size_t recorder_step_fallback(Recorder *r)
 		free_log_entry(&entry);
 		return 0;
 	}
-	if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
+	if (modifier_result == 0 && recorder_submit_entry_with_recovery(r, &entry) != 0) {
 		recorder_report_storage_error("storing an entry", g_log_dir);
 		free_log_entry(&entry);
 		return 0;
@@ -3939,8 +4085,9 @@ static size_t recorder_step(Recorder *r)
 			free_log_entry(&entry);
 			break;
 		}
-		if (modifier_result == 0 && recorder_submit_entry(r, &entry) != 0) {
+		if (modifier_result == 0 && recorder_submit_entry_with_recovery(r, &entry) != 0) {
 			recorder_report_storage_error("storing an entry", g_log_dir);
+			r->current_entry_pending = 1;
 			free_log_entry(&entry);
 			break;
 		}

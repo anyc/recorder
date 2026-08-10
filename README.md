@@ -277,6 +277,10 @@ filename order. Later files override earlier values, so drop-ins can customize
 the packaged defaults. The directory is set at build time with the
 `RECORDER_CONFIG_DIR` Make variable.
 
+For deterministic low-space testing, builds may set
+`RECORDER_TEST_FREE_BYTES=N`; this overrides the reported available space used
+by retention and diagnostics without consuming the real filesystem.
+
 The config file is JSON. Before parsing, lines starting with `#` are removed, so this is valid:
 
 ```json
@@ -395,8 +399,18 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
   "capture_fields_whitelist": [],
   "capture_fields_blacklist": [],
   "priority_groups": [
-    { "name": "high", "priorities": [0, 1, 2, 3] },
-    { "name": "low", "priorities": [4, 5, 6, 7] }
+    {
+      "name": "high",
+      "priorities": [0, 1, 2, 3],
+      "max_bytes": "48M",
+      "max_age_sec": 604800
+    },
+    {
+      "name": "low",
+      "priorities": [4, 5, 6, 7],
+      "max_bytes": "16M",
+      "max_age_sec": 86400
+    }
   ]
 }
 ```
@@ -405,6 +419,10 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 
 - `log_max_bytes`
   Maximum total space used by recorder-owned files. Accepts an integer byte count or a size string such as `64M`.
+- `min_free_bytes`
+  Minimum free space to preserve on the log filesystem. When set, recorder
+  removes closed lower-priority segments before writing higher-priority data.
+  Zero disables the reserve.
 - `segment_max_bytes`
   Maximum size of a single segment before rotation.
 - `segment_max_age_sec`
@@ -457,7 +475,7 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 - `sanitize_output`
   Escape terminal control characters in `recorder -vv` output. Enabled by default.
 - `priority_groups`
-  Optional grouping of priorities into named segment directories. Each priority `0..7` must appear exactly once.
+  Optional grouping of priorities into named segment directories. Each priority `0..7` must appear exactly once. A group may also set `max_bytes` (an integer or size string) and `max_age_sec` to retain less data than the global limits.
 - `static_dict_paths`
   Optional map from priority number to a zstd static dictionary path. If priorities are grouped together, all priorities in that group must use the same dictionary path or no dictionary path.
 
@@ -505,6 +523,14 @@ Example:
 ## Retention
 
 Recorder keeps the total on-disk size within `log_max_bytes`.
+
+Priority groups may define independent `max_bytes` and `max_age_sec` limits.
+Closed segments that exceed a group limit are removed according to the same
+priority and age ordering as global retention.
+
+When a write fails because the filesystem is full or over quota, recorder
+removes closed segments from lower-priority groups and retries the write. If no
+lower-priority data can be reclaimed, ingestion pauses until storage recovers.
 
 When space must be reclaimed:
 

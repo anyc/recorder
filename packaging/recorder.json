@@ -2,6 +2,9 @@
   ### Maximum total storage used by recorder-owned files, in bytes.
   # "log_max_bytes": 67108864,
 
+  ### Minimum free space to preserve on the log filesystem; zero disables the reserve.
+  # "min_free_bytes": 0,
+
   ### Maximum size of one segment before rotation, in bytes.
   # "segment_max_bytes": 4194304,
 
@@ -71,6 +74,7 @@
   # "modifiers": [],
 
   ### Group priorities into named segment directories.
+  ### Each group may also set optional max_bytes and max_age_sec retention limits.
   # "priority_groups": [
   #   { "name": "p0", "priorities": [0] },
   #   { "name": "p1", "priorities": [1] },
