@@ -8,10 +8,12 @@ localstatedir ?= /var
 systemd_system_unitdir ?= $(PREFIX)/lib/systemd/system
 PKG_CONFIG ?= pkg-config
 PYTHON ?= python3
-LOG_DIR ?= /var/log/recorder
+LOG_DIR ?= $(localstatedir)/log/recorder
 RECORDER_CONFIG_PATH ?= /etc/recorder.json
+RECORDER_CONFIG_DIR ?= $(sysconfdir)/recorder.d
 REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
+REPO_CONFIG_DIR ?= $(CURDIR)/packaging/recorder.d
 FLATCC_PKG ?= flatccrt
 PCRE2_PKG ?= libpcre2-8
 OPENSSL_PKG ?= libcrypto
@@ -49,6 +51,7 @@ CPPFLAGS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --cflags $(PCRE2_PKG)) -DHA
 CPPFLAGS += $(if $(filter 1 yes true,$(LIBC_REGEX)),-DHAVE_LIBC_REGEX)
 CPPFLAGS += -DLOG_DIR=\"$(LOG_DIR)\"
 CPPFLAGS += -DRECORDER_CONFIG_PATH=\"$(RECORDER_CONFIG_PATH)\"
+CPPFLAGS += -DRECORDER_CONFIG_DIR=\"$(RECORDER_CONFIG_DIR)\"
 
 LDLIBS += $(shell $(PKG_CONFIG) --libs jansson)
 LDLIBS += $(shell $(PKG_CONFIG) --libs libzstd)
@@ -63,7 +66,7 @@ LDLIBS += -pthread
 all: recorder player librecorder.a
 
 repo:
-	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) all
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
 
 recorder: recorder.o fallback_source.o helper.o segment.o index.o recorder_crypto.o script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -83,6 +86,7 @@ install: all
 	install -d $(DESTDIR)$(includedir)
 	install -d $(DESTDIR)$(systemd_system_unitdir)
 	install -d $(DESTDIR)$(dir $(RECORDER_CONFIG_PATH))
+	install -d $(DESTDIR)$(RECORDER_CONFIG_DIR)
 	install -m 0755 recorder $(DESTDIR)$(bindir)/recorder
 	install -m 0755 player $(DESTDIR)$(bindir)/player
 	install -m 0644 librecorder.a $(DESTDIR)$(libdir)/librecorder.a
@@ -102,7 +106,7 @@ test-smoke: smoke-test
 # Build test binaries against the repository's bundled FlatCC checkout and
 # sample configuration, then run every non-privileged test suite.
 test:
-	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-smoke
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) test-smoke
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-python
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-fallback
 

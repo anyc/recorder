@@ -84,7 +84,6 @@ typedef void sd_journal;
 #define MAX_MODIFIER_REROUTES 8
 #define RECORDER_CURSOR_PATH "/run/recorder/journal.cursor"
 #define RECORDER_CURSOR_MAX_BYTES 512
-#define RECORDER_CONFIG_DIR "/etc/recorder.d"
 
 static char g_log_dir[PATH_MAX] = LOG_DIR;
 
