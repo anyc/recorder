@@ -15,7 +15,7 @@ RECORDER_TEST_FREE_BYTES ?=
 REPO_LOG_DIR ?= $(CURDIR)/.recorder-log
 REPO_CONFIG_PATH ?= $(CURDIR)/packaging/recorder.json
 REPO_CONFIG_DIR ?= $(CURDIR)/packaging/recorder.d
-FLATCC_PKG ?= flatccrt
+FLATCC_PKG ?= auto
 PCRE2_PKG ?= libpcre2-8
 OPENSSL_PKG ?= libcrypto
 PCRE2 ?= auto
@@ -42,10 +42,14 @@ LIBRECORDER_SHARED = 0
 endif
 
 FLATCC_RUNTIME_OBJS = $(if $(filter repo,$(FLATCC_MODE)),\
-	flatcc/src/runtime/builder.o \
-	flatcc/src/runtime/refmap.o \
-	flatcc/src/runtime/emitter.o \
-	flatcc/src/runtime/verifier.o,)
+	flatcc/src/runtime/builder.pic.o \
+	flatcc/src/runtime/refmap.pic.o \
+	flatcc/src/runtime/emitter.pic.o \
+	flatcc/src/runtime/verifier.pic.o,)
+ifeq ($(FLATCC_PKG),auto)
+FLATCC_PKG := $(shell if $(PKG_CONFIG) --exists flatccrt; then echo flatccrt; \
+	elif $(PKG_CONFIG) --exists flatcc; then echo flatcc; fi)
+endif
 FLATCC_CPPFLAGS = $(if $(filter repo,$(FLATCC_MODE)),-Iflatcc/include/,$(shell $(PKG_CONFIG) --cflags $(FLATCC_PKG)))
 FLATCC_LIBS = $(if $(filter repo,$(FLATCC_MODE)),,$(shell $(PKG_CONFIG) --libs $(FLATCC_PKG)))
 ifeq ($(PCRE2),auto)
@@ -82,6 +86,9 @@ LDLIBS += $(FLATCC_LIBS)
 
 CFLAGS += -ggdb -Wall -MMD -MP -pthread -fPIC
 LDLIBS += -pthread
+
+flatcc/src/runtime/%.pic.o: flatcc/src/runtime/%.c
+	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
 LIBRECORDER_OBJS = src/librecorder.o src/segment.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 
@@ -164,6 +171,6 @@ benchmark-capacity: repo
 	benchmark-compare-storage benchmark-storage benchmark-capacity
 
 clean:
-	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* *.o *.d src/*.o src/*.d
+	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* *.o *.d src/*.o src/*.d flatcc/src/runtime/*.pic.o flatcc/src/runtime/*.pic.d
 
--include $(wildcard *.d) $(wildcard src/*.d)
+-include $(wildcard *.d) $(wildcard src/*.d) $(wildcard flatcc/src/runtime/*.pic.d)
