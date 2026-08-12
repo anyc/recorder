@@ -95,7 +95,7 @@ LIBRECORDER_OBJS = src/librecorder.o src/segment.o src/recorder_crypto.o src/scr
 all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
 repo:
-	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
+	$(MAKE) -B FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
 
 recorder: src/recorder.o src/fallback_source.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
