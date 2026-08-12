@@ -1035,7 +1035,15 @@ int main(int argc, char **argv)
 	}
 
 	if (stat(opts.path, &st) != 0) {
-		perror("stat");
+		int saved_errno = errno;
+
+		fprintf(stderr, "player: cannot access log path '%s': %s\n",
+				opts.path, strerror(saved_errno));
+		if (saved_errno == ENOENT) {
+			fprintf(stderr,
+					"player: no recorder data found there; use -D DIR or -i FILE, "
+					"or run 'make repo' and start recorder first\n");
+		}
 		return 1;
 	}
 	if (opts.list_boots) {
