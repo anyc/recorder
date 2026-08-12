@@ -74,8 +74,27 @@ typedef struct {
 	int follow;
 	uint64_t follow_start_ts;
 	int list_boots;
+	int disk_usage;
 	int sanitize_output;
 } PlayerOptions;
+
+typedef struct {
+	uint64_t total_bytes;
+	uint64_t group_bytes;
+} DiskUsage;
+
+typedef struct {
+	char name[256];
+	uint64_t bytes;
+} DiskUsageGroup;
+
+static int compare_disk_usage_groups(const void *left, const void *right)
+{
+	const DiskUsageGroup *a = left;
+	const DiskUsageGroup *b = right;
+
+	return strcmp(a->name, b->name);
+}
 
 typedef struct {
 	uint32_t boot_seq;
@@ -102,6 +121,141 @@ static int valid_group_name(const char *name)
 		}
 	}
 	return 1;
+}
+
+static int disk_usage_path(const char *path, uint64_t *bytes_out)
+{
+	struct stat st;
+	DIR *dir;
+	struct dirent *de;
+	uint64_t total = 0;
+
+	if (lstat(path, &st) != 0) {
+		return -1;
+	}
+	if (S_ISREG(st.st_mode)) {
+		*bytes_out = (uint64_t)st.st_blocks * 512u;
+		return 0;
+	}
+	if (!S_ISDIR(st.st_mode)) {
+		*bytes_out = 0;
+		return 0;
+	}
+	dir = opendir(path);
+	if (!dir) {
+		return -1;
+	}
+	while ((de = readdir(dir)) != NULL) {
+		char child[512];
+		uint64_t child_bytes;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
+			continue;
+		}
+		if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >=
+				(int)sizeof(child) || disk_usage_path(child, &child_bytes) != 0) {
+			fprintf(stderr, "player: cannot measure disk usage for '%s/%s': %s\n",
+					path, de->d_name, strerror(errno));
+			closedir(dir);
+			return -1;
+		}
+		total += child_bytes;
+	}
+	closedir(dir);
+	*bytes_out = total;
+	return 0;
+}
+
+static int print_disk_usage(const char *root_path)
+{
+	DIR *dir;
+	struct dirent *de;
+	uint64_t total;
+	DiskUsageGroup *groups = NULL;
+	size_t group_count = 0;
+	size_t group_capacity = 0;
+	size_t i;
+	size_t label_width = strlen("Total");
+	int value_width;
+	char value_text[32];
+
+	if (disk_usage_path(root_path, &total) != 0) {
+		fprintf(stderr, "player: failed to measure disk usage for '%s': %s\n",
+				root_path, strerror(errno));
+		return 1;
+	}
+	dir = opendir(root_path);
+	if (!dir) {
+		fprintf(stderr, "player: cannot read log directory '%s': %s\n",
+				root_path, strerror(errno));
+		free(groups);
+		return 1;
+	}
+	while ((de = readdir(dir)) != NULL) {
+		char path[512];
+		struct stat st;
+		uint64_t group_bytes;
+		DiskUsageGroup *new_groups;
+
+		if (!valid_group_name(de->d_name)) {
+			continue;
+		}
+		if (snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
+				(int)sizeof(path) || stat(path, &st) != 0 || !S_ISDIR(st.st_mode)) {
+			continue;
+		}
+		if (disk_usage_path(path, &group_bytes) != 0) {
+			fprintf(stderr, "player: failed to measure priority group '%s': %s\n",
+					de->d_name, strerror(errno));
+			closedir(dir);
+			free(groups);
+			return 1;
+		}
+		if (group_count == group_capacity) {
+			size_t new_capacity = group_capacity ? group_capacity * 2 : 8;
+
+			new_groups = realloc(groups, new_capacity * sizeof(*groups));
+			if (!new_groups) {
+				fprintf(stderr, "player: out of memory while collecting disk usage\n");
+				closedir(dir);
+				free(groups);
+				return 1;
+			}
+			groups = new_groups;
+			group_capacity = new_capacity;
+		}
+		strncpy(groups[group_count].name, de->d_name,
+				sizeof(groups[group_count].name) - 1);
+		groups[group_count].name[sizeof(groups[group_count].name) - 1] = '\0';
+		groups[group_count].bytes = group_bytes;
+		group_count++;
+	}
+	closedir(dir);
+
+	qsort(groups, group_count, sizeof(*groups), compare_disk_usage_groups);
+	value_width = snprintf(value_text, sizeof(value_text), "%" PRIu64, total);
+	for (i = 0; i < group_count; i++) {
+		int group_width = snprintf(value_text, sizeof(value_text), "%" PRIu64,
+				groups[i].bytes);
+
+		if (strlen(groups[i].name) > label_width) {
+			label_width = strlen(groups[i].name);
+		}
+		if (group_width > value_width) {
+			value_width = group_width;
+		}
+	}
+	for (i = 0; i < group_count; i++) {
+		printf("%-*s: %*" PRIu64 " bytes\n", (int)label_width,
+				groups[i].name, value_width, groups[i].bytes);
+	}
+	if (group_count > 0) {
+		putchar('\n');
+	}
+	printf("%-*s: %*" PRIu64 " bytes\n", (int)label_width, "Total",
+			value_width, total);
+	free(groups);
+	return 0;
 }
 
 static int segment_seq_from_name(const char *name, uint64_t *seq_out)
@@ -919,7 +1073,7 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
@@ -968,6 +1122,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->boot_filter = arg + 2;
 		} else if (strcmp(arg, "--list-boots") == 0) {
 			opts->list_boots = 1;
+		} else if (strcmp(arg, "--disk-usage") == 0) {
+			opts->disk_usage = 1;
 		} else if (strcmp(arg, "--sanitize-output") == 0) {
 			opts->sanitize_output = 1;
 		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
@@ -1057,7 +1213,14 @@ int main(int argc, char **argv)
 			(uint64_t)now.tv_nsec / 1000ull;
 	}
 	if (S_ISDIR(st.st_mode)) {
+		if (opts.disk_usage) {
+			return print_disk_usage(opts.path);
+		}
 		return scan_log_root(&opts);
+	}
+	if (opts.disk_usage) {
+		fprintf(stderr, "player: --disk-usage requires a log directory\n");
+		return 1;
 	}
 	if (opts.dir_path) {
 		fprintf(stderr, "player: -D path is not a directory: %s\n", opts.path);

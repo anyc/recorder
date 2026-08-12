@@ -92,6 +92,13 @@ updates an existing file or device in place. A missing path is created.
 To read a systemd journal namespace instead of the default namespace, use
 `--namespace NAME` (or `-n NAME`).
 
+To report total allocated disk usage and usage for each priority-group
+directory, use:
+
+```sh
+./player --disk-usage -D /var/log/recorder
+```
+
 ### Non-systemd fallback input
 
 On systems without a running journald instance, recorder can collect local
