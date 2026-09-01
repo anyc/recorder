@@ -25,7 +25,9 @@ COMPARE_STORAGE_ARGS ?=
 BENCHMARK_STORAGE_ARGS ?=
 BENCHMARK_CAPACITY_ARGS ?=
 FLATCC_MODE ?= sysroot
+REPO_BUILD ?= 0
 LIBRECORDER_STATIC ?= 0
+comma := ,
 LIBRECORDER_SONAME ?= librecorder.so.1
 LIBRECORDER_VERSIONED ?= librecorder.so.1.0.0
 
@@ -87,21 +89,23 @@ LDLIBS += $(FLATCC_LIBS)
 CFLAGS += -ggdb -Wall -MMD -MP -pthread -fPIC
 LDLIBS += -pthread
 
+LIBRECORDER_RPATH = $(if $(and $(filter 1 yes true,$(REPO_BUILD)),$(filter 1,$(LIBRECORDER_SHARED))),-Wl$(comma)-rpath$(comma)'$$ORIGIN',)
+
 flatcc/src/runtime/%.pic.o: flatcc/src/runtime/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-LIBRECORDER_OBJS = src/librecorder.o src/segment.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
+LIBRECORDER_OBJS = src/librecorder.o src/helper.o src/segment.o src/recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 
 all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
 repo:
-	$(MAKE) -B FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
+	$(MAKE) -B FLATCC_MODE=repo REPO_BUILD=1 LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
 
 recorder: src/recorder.o src/fallback_source.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
 
-player: src/player.o src/librecorder.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
-	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+player: src/player.o $(LIBRECORDER_TARGET)
+	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
 $(LIBRECORDER_VERSIONED): $(LIBRECORDER_OBJS)
 	$(CC) -shared $(LDFLAGS) -Wl,-soname,$(LIBRECORDER_SONAME) $^ $(LDLIBS) -o $@
@@ -115,8 +119,8 @@ $(LIBRECORDER_SONAME): $(LIBRECORDER_VERSIONED)
 librecorder.a: $(LIBRECORDER_OBJS)
 	$(AR) rcs $@ $^
 
-smoke-test: src/smoke_test.o src/librecorder.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
-	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
+smoke-test: src/smoke_test.o $(LIBRECORDER_TARGET)
+	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
 install: all
 	install -d $(DESTDIR)$(bindir)
