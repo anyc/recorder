@@ -53,6 +53,10 @@ typedef struct PlayerEntry {
 typedef struct {
 	char path[512];
 	uint64_t committed_end;
+	ino_t inode;
+	off_t size;
+	time_t mtime;
+	long mtime_nsec;
 } SeenSegment;
 
 typedef struct {
@@ -749,7 +753,7 @@ static int collect_segments_in_dir(const char *dir_path, SegmentPath **items,
 }
 
 static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
-										const char *path)
+										 const char *path)
 {
 	size_t i;
 
@@ -761,15 +765,32 @@ static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
 	return NULL;
 }
 
+static int segment_has_changed(const SeenSegment *seen_item, const char *path,
+								   struct stat *st_out)
+{
+	struct stat st;
+
+	if (stat(path, &st) != 0) return 1;
+	if (st_out) *st_out = st;
+	return !seen_item || seen_item->inode != st.st_ino ||
+		seen_item->size != st.st_size || seen_item->mtime != st.st_mtime ||
+		seen_item->mtime_nsec != st.st_mtim.tv_nsec;
+}
+
 static int remember_seen_segment(SeenSegment **seen, size_t *seen_count,
-									size_t *seen_cap, const char *path,
-									uint64_t committed_end)
+										 size_t *seen_cap, const char *path,
+										 uint64_t committed_end,
+										 const struct stat *st)
 {
 	SeenSegment *item = find_seen_segment(*seen, *seen_count, path);
 	SeenSegment *tmp;
 
 	if (item) {
 		item->committed_end = committed_end;
+		item->inode = st->st_ino;
+		item->size = st->st_size;
+		item->mtime = st->st_mtime;
+		item->mtime_nsec = st->st_mtim.tv_nsec;
 		return 0;
 	}
 	if (*seen_count == *seen_cap) {
@@ -785,6 +806,10 @@ static int remember_seen_segment(SeenSegment **seen, size_t *seen_count,
 	strncpy((*seen)[*seen_count].path, path, sizeof((*seen)[*seen_count].path) - 1);
 	(*seen)[*seen_count].path[sizeof((*seen)[*seen_count].path) - 1] = '\0';
 	(*seen)[*seen_count].committed_end = committed_end;
+	(*seen)[*seen_count].inode = st->st_ino;
+	(*seen)[*seen_count].size = st->st_size;
+	(*seen)[*seen_count].mtime = st->st_mtime;
+	(*seen)[*seen_count].mtime_nsec = st->st_mtim.tv_nsec;
 	(*seen_count)++;
 	return 0;
 }
@@ -984,8 +1009,12 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 		int skip_history = initial_follow_scan && output.entry_count >= FOLLOW_INITIAL_ENTRY_COUNT;
 		const char *path = items[item_index].path;
 		size_t committed_end_size;
+		struct stat st;
 
 		seen_item = find_seen_segment(*seen, *seen_count, path);
+		if (seen_item && !segment_has_changed(seen_item, path, &st)) {
+			continue;
+		}
 		min_offset = seen_item ? seen_item->committed_end : 0;
 		committed_end = min_offset;
 
@@ -1003,7 +1032,8 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 			rc = 1;
 			break;
 		}
-		if (remember_seen_segment(seen, seen_count, seen_cap, path, committed_end) != 0) {
+		if (stat(path, &st) != 0 ||
+			remember_seen_segment(seen, seen_count, seen_cap, path, committed_end, &st) != 0) {
 			rc = 1;
 			break;
 		}
