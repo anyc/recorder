@@ -1002,16 +1002,17 @@ static int resolve_boot_filter(PlayerOptions *opts)
 	if (!opts->boot_filter) {
 		return 0;
 	}
-	if (parse_i32(opts->boot_filter, &offset) == 0 && offset < 0) {
+	if (parse_i32(opts->boot_filter, &offset) == 0 && offset <= 0) {
 		if (collect_boots_for_path(opts->path, &boots, &boot_count) != 0) {
 			return -1;
 		}
-		if ((size_t)(-offset) >= boot_count) {
+		if (boot_count == 0 || (offset < 0 &&
+				(uint64_t)(-(int64_t)offset) >= boot_count)) {
 			fprintf(stderr, "player: boot offset %d is out of range\n", offset);
 			free(boots);
 			return -1;
 		}
-		idx = boot_count - 1u + offset;
+		idx = (size_t)((int64_t)boot_count - 1 + offset);
 		opts->boot_seq_filter = boots[idx].boot_seq;
 		opts->have_boot_seq_filter = 1;
 		opts->boot_id_filter = NULL;
