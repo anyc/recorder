@@ -976,6 +976,7 @@ static int print_boots(const PlayerOptions *opts)
 	if (collect_boots_for_path(opts->path, &boots, &boot_count) != 0) {
 		return 1;
 	}
+	printf("%6s %-32s %-19s - %s\n", "offset", "boot-id", "first entry", "last entry");
 	for (i = 0; i < boot_count; i++) {
 		char first[32];
 		char last[32];
@@ -983,8 +984,7 @@ static int print_boots(const PlayerOptions *opts)
 
 		format_realtime_full(boots[i].first_realtime_ts, first, sizeof(first));
 		format_realtime_full(boots[i].last_realtime_ts, last, sizeof(last));
-		printf("%3d %10u %s %s - %s\n", idx, boots[i].boot_seq,
-				boots[i].boot_id, first, last);
+		printf("%6d %-32s %s - %s\n", idx, boots[i].boot_id, first, last);
 	}
 	free(boots);
 	return 0;
