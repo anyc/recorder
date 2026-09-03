@@ -977,14 +977,33 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 	}
 	sort_segment_files(items, count);
 	for (i = 0; i < count; i++) {
-		SeenSegment *seen_item = find_seen_segment(*seen, *seen_count, items[i].path);
-		uint64_t min_offset = seen_item ? seen_item->committed_end : 0;
-		uint64_t committed_end = min_offset;
+		size_t item_index = initial_follow_scan ? count - 1 - i : i;
+		SeenSegment *seen_item;
+		uint64_t min_offset;
+		uint64_t committed_end;
+		int skip_history = initial_follow_scan && output.entry_count >= FOLLOW_INITIAL_ENTRY_COUNT;
+		const char *path = items[item_index].path;
+		size_t committed_end_size;
 
-		/* Each scan uses the same buffer so output can be globally ordered. */
-		if (scan_segment_file_with_context(reader, items[i].path, opts, min_offset,
-										&output, &committed_end) != 0 ||
-			remember_seen_segment(seen, seen_count, seen_cap, items[i].path, committed_end) != 0) {
+		seen_item = find_seen_segment(*seen, *seen_count, path);
+		min_offset = seen_item ? seen_item->committed_end : 0;
+		committed_end = min_offset;
+
+		/* Scan newest segments first for follow mode; older history only needs
+		 * its committed end recorded so it is not replayed on the next event. */
+		if (skip_history) {
+			if (segment_scan_path(path, NULL, NULL, NULL, NULL, NULL,
+							&committed_end_size) != 0) {
+				rc = 1;
+				break;
+			}
+			committed_end = committed_end_size;
+		} else if (scan_segment_file_with_context(reader, path, opts, min_offset,
+										&output, &committed_end) != 0) {
+			rc = 1;
+			break;
+		}
+		if (remember_seen_segment(seen, seen_count, seen_cap, path, committed_end) != 0) {
 			rc = 1;
 			break;
 		}

@@ -443,7 +443,8 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 	ctx.callback = callback;
 	ctx.userdata = userdata;
 	ctx.min_frame_offset = min_frame_offset;
-	if (segment_scan_path(path, reader->decryptor, scan_frame, &ctx, &header,
+	if (segment_scan_path_from_offset(path, reader->decryptor, scan_frame, &ctx,
+							min_frame_offset, &header,
 						  &footer, &committed_end) != 0) return -1;
 	if (committed_end_out) *committed_end_out = committed_end;
 	return 0;

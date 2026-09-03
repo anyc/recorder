@@ -495,9 +495,10 @@ int segment_read_header(const void *buf, size_t size,
 }
 
 static int segment_scan_impl(const void *buf, size_t size,
-								SegmentDecryptor *decryptor, segment_frame_cb cb,
-								void *ctx, SegmentHeader *header_out,
-								SegmentFooter *footer_out, size_t *committed_end_out)
+								 SegmentDecryptor *decryptor, segment_frame_cb cb,
+								 void *ctx, SegmentHeader *header_out,
+								 SegmentFooter *footer_out, size_t *committed_end_out,
+								 size_t min_frame_offset)
 {
 	SegmentHeader header;
 	SegmentEncryptionInfo encryption;
@@ -601,7 +602,7 @@ static int segment_scan_impl(const void *buf, size_t size,
 				break;
 			}
 		}
-		if (cb) {
+		if (cb && frame.file_offset >= min_frame_offset) {
 			const void *payload = p + SEGMENT_FRAME_HEADER_SIZE;
 			void *decrypted_payload = NULL;
 			void *chunk_buf = NULL;
@@ -695,7 +696,7 @@ int segment_scan_buffer(const void *buf, size_t size,
 						SegmentFooter *footer_out, size_t *committed_end_out)
 {
 	return segment_scan_impl(buf, size, decryptor, cb, ctx, header_out,
-								footer_out, committed_end_out);
+								footer_out, committed_end_out, 0);
 }
 
 int segment_scan_path(const char *path, SegmentDecryptor *decryptor,
@@ -725,7 +726,7 @@ int segment_scan_path(const char *path, SegmentDecryptor *decryptor,
 	}
 
 	rv = segment_scan_impl(map, (size_t)st.st_size, decryptor, cb, ctx, header_out,
-							footer_out, committed_end_out);
+							footer_out, committed_end_out, 0);
 
 out:
 	if (map != MAP_FAILED) {
@@ -734,5 +735,32 @@ out:
 	if (fd >= 0) {
 		close(fd);
 	}
+	return rv;
+}
+
+int segment_scan_path_from_offset(const char *path, SegmentDecryptor *decryptor,
+						segment_frame_cb cb, void *ctx, size_t min_frame_offset,
+						SegmentHeader *header_out, SegmentFooter *footer_out,
+						size_t *committed_end_out)
+{
+	int fd = -1;
+	struct stat st;
+	void *map = MAP_FAILED;
+	int rv = -1;
+
+	fd = open(path, O_RDONLY);
+	if (fd < 0) goto out;
+	if (fstat(fd, &st) != 0) goto out;
+	if (st.st_size == 0) {
+		errno = EINVAL;
+		goto out;
+	}
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (map == MAP_FAILED) goto out;
+	rv = segment_scan_impl(map, (size_t)st.st_size, decryptor, cb, ctx, header_out,
+							footer_out, committed_end_out, min_frame_offset);
+out:
+	if (map != MAP_FAILED) munmap(map, st.st_size);
+	if (fd >= 0) close(fd);
 	return rv;
 }

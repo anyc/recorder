@@ -123,9 +123,13 @@ int segment_read_header(const void *buf, size_t size,
                         SegmentHeader *header, size_t *offset_out);
 /* A decryptor is optional for metadata-only scans (cb == NULL). */
 int segment_scan_path(const char *path, SegmentDecryptor *decryptor,
-                      segment_frame_cb cb, void *ctx,
-                      SegmentHeader *header_out, SegmentFooter *footer_out,
-                      size_t *committed_end_out);
+						segment_frame_cb cb, void *ctx,
+						SegmentHeader *header_out, SegmentFooter *footer_out,
+						size_t *committed_end_out);
+int segment_scan_path_from_offset(const char *path, SegmentDecryptor *decryptor,
+						segment_frame_cb cb, void *ctx, size_t min_frame_offset,
+						SegmentHeader *header_out, SegmentFooter *footer_out,
+						size_t *committed_end_out);
 int segment_scan_buffer(const void *buf, size_t size,
                         SegmentDecryptor *decryptor, segment_frame_cb cb,
                         void *ctx, SegmentHeader *header_out,
