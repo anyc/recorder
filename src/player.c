@@ -827,30 +827,6 @@ static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
 	return NULL;
 }
 
-static int segment_group_key(const char *root_path, const char *path,
-							char *key, size_t key_size)
-{
-	const char *last_slash = strrchr(path, '/');
-	const char *parent_end = last_slash;
-	(void)root_path;
-
-	if (!last_slash || last_slash <= path) return -1;
-	if ((size_t)(parent_end - path) >= key_size) return -1;
-	memcpy(key, path, (size_t)(parent_end - path));
-	key[parent_end - path] = '\0';
-	return 0;
-}
-
-static int seen_group(char groups[][512], size_t group_count, const char *key)
-{
-	size_t i;
-
-	for (i = 0; i < group_count; i++) {
-		if (strcmp(groups[i], key) == 0) return 1;
-	}
-	return 0;
-}
-
 static int remember_seen_segment(SeenSegment **seen, size_t *seen_count,
 										 size_t *seen_cap, const char *path,
 										 uint64_t committed_end)
@@ -1059,8 +1035,6 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 	int rc = 0;
 	PrintContext output;
 	int initial_follow_scan = opts->follow && *seen_count == 0;
-	char scanned_groups[32][512];
-	size_t scanned_group_count = 0;
 
 	memset(&output, 0, sizeof(output));
 
@@ -1070,30 +1044,12 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 	}
 	sort_segment_files(items, count);
 	for (i = 0; i < count; i++) {
-		size_t item_index = initial_follow_scan ? count - 1 - i : i;
 		SeenSegment *seen_item;
 		uint64_t min_offset;
 		uint64_t committed_end;
-		const char *path = items[item_index].path;
-		char group_key[512];
-		int group_was_scanned;
+		const char *path = items[i].path;
 
-		if (segment_group_key(opts->path, path, group_key, sizeof(group_key)) != 0) {
-			rc = 1;
-			break;
-		}
-		group_was_scanned = seen_group(scanned_groups, scanned_group_count, group_key);
-		if (opts->follow && group_was_scanned) {
-			continue;
-		}
-		if (!group_was_scanned &&
-				scanned_group_count >= sizeof(scanned_groups) / sizeof(scanned_groups[0])) {
-			rc = 1;
-			break;
-		}
-		strcpy(scanned_groups[scanned_group_count++], group_key);
-
-		seen_item = find_seen_segment(*seen, *seen_count, path);
+		seen_item = opts->follow ? find_seen_segment(*seen, *seen_count, path) : NULL;
 		min_offset = seen_item ? seen_item->committed_end : 0;
 		committed_end = min_offset;
 
@@ -1105,7 +1061,7 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 			rc = 1;
 			break;
 		}
-		if (!opts->follow || !group_was_scanned) {
+		if (opts->follow) {
 			if (remember_seen_segment(seen, seen_count, seen_cap, path, committed_end) != 0) {
 				rc = 1;
 				break;
