@@ -752,6 +752,72 @@ static int collect_segments_in_dir(const char *dir_path, SegmentPath **items,
 	return 0;
 }
 
+static int collect_latest_segment_in_dir(const char *dir_path,
+								 SegmentPath **items, size_t *count, size_t *cap)
+{
+	DIR *dir = opendir(dir_path);
+	struct dirent *de;
+	char latest_path[512] = { 0 };
+	uint64_t latest_seq = 0;
+	int have_latest = 0;
+
+	if (!dir) return -1;
+	while ((de = readdir(dir)) != NULL) {
+		char path[512];
+		uint64_t seq;
+		struct stat st;
+
+		if (segment_seq_from_name(de->d_name, &seq) != 0 ||
+			snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name) >=
+				(int)sizeof(path) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
+			continue;
+		}
+		if (!have_latest || seq > latest_seq) {
+			strcpy(latest_path, path);
+			latest_seq = seq;
+			have_latest = 1;
+		}
+	}
+	closedir(dir);
+	return have_latest ? add_segment_file(items, count, cap, latest_path, latest_seq) : 0;
+}
+
+static int collect_latest_log_segments(const char *root_path, SegmentPath **items,
+								size_t *count, size_t *cap)
+{
+	DIR *dir = opendir(root_path);
+	struct dirent *de;
+	char latest_path[512] = { 0 };
+	uint64_t latest_seq = 0;
+	int have_root_latest = 0;
+
+	if (!dir) return -1;
+	while ((de = readdir(dir)) != NULL) {
+		char path[512];
+		struct stat st;
+		uint64_t seq;
+
+		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
+			snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
+				(int)sizeof(path) || stat(path, &st) != 0) {
+			continue;
+		}
+		if (S_ISREG(st.st_mode) && segment_seq_from_name(de->d_name, &seq) == 0) {
+			if (!have_root_latest || seq > latest_seq) {
+				strcpy(latest_path, path);
+				latest_seq = seq;
+				have_root_latest = 1;
+			}
+		} else if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
+				collect_latest_segment_in_dir(path, items, count, cap) != 0) {
+			closedir(dir);
+			return -1;
+		}
+	}
+	closedir(dir);
+	return have_root_latest ? add_segment_file(items, count, cap, latest_path, latest_seq) : 0;
+}
+
 static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
 										 const char *path)
 {
@@ -763,6 +829,30 @@ static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
 		}
 	}
 	return NULL;
+}
+
+static int segment_group_key(const char *root_path, const char *path,
+							char *key, size_t key_size)
+{
+	const char *last_slash = strrchr(path, '/');
+	const char *parent_end = last_slash;
+	(void)root_path;
+
+	if (!last_slash || last_slash <= path) return -1;
+	if ((size_t)(parent_end - path) >= key_size) return -1;
+	memcpy(key, path, (size_t)(parent_end - path));
+	key[parent_end - path] = '\0';
+	return 0;
+}
+
+static int seen_group(char groups[][512], size_t group_count, const char *key)
+{
+	size_t i;
+
+	for (i = 0; i < group_count; i++) {
+		if (strcmp(groups[i], key) == 0) return 1;
+	}
+	return 0;
 }
 
 static int segment_has_changed(const SeenSegment *seen_item, const char *path,
@@ -994,10 +1084,13 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 	int rc = 0;
 	PrintContext output;
 	int initial_follow_scan = opts->follow && *seen_count == 0;
+	char scanned_groups[32][512];
+	size_t scanned_group_count = 0;
 
 	memset(&output, 0, sizeof(output));
 
-	if (collect_log_segments(opts->path, &items, &count, &cap) != 0) {
+	if ((opts->follow ? collect_latest_log_segments(opts->path, &items, &count, &cap) :
+			collect_log_segments(opts->path, &items, &count, &cap)) != 0) {
 		return 1;
 	}
 	sort_segment_files(items, count);
@@ -1006,10 +1099,25 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 		SeenSegment *seen_item;
 		uint64_t min_offset;
 		uint64_t committed_end;
-		int skip_history = initial_follow_scan && output.entry_count >= FOLLOW_INITIAL_ENTRY_COUNT;
 		const char *path = items[item_index].path;
-		size_t committed_end_size;
 		struct stat st;
+		char group_key[512];
+		int group_was_scanned;
+
+		if (segment_group_key(opts->path, path, group_key, sizeof(group_key)) != 0) {
+			rc = 1;
+			break;
+		}
+		group_was_scanned = seen_group(scanned_groups, scanned_group_count, group_key);
+		if (opts->follow && group_was_scanned) {
+			continue;
+		}
+		if (!group_was_scanned &&
+				scanned_group_count >= sizeof(scanned_groups) / sizeof(scanned_groups[0])) {
+			rc = 1;
+			break;
+		}
+		strcpy(scanned_groups[scanned_group_count++], group_key);
 
 		seen_item = find_seen_segment(*seen, *seen_count, path);
 		if (seen_item && !segment_has_changed(seen_item, path, &st)) {
@@ -1018,25 +1126,42 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 		min_offset = seen_item ? seen_item->committed_end : 0;
 		committed_end = min_offset;
 
-		/* Scan newest segments first for follow mode; older history only needs
-		 * its committed end recorded so it is not replayed on the next event. */
-		if (skip_history) {
-			if (segment_scan_path(path, NULL, NULL, NULL, NULL, NULL,
-							&committed_end_size) != 0) {
-				rc = 1;
-				break;
-			}
-			committed_end = committed_end_size;
-		} else if (scan_segment_file_with_context(reader, path, opts, min_offset,
+		/* Scan newest segments first for follow mode. Older segments are read
+		 * only when needed to collect the initial last entries; they are not
+		 * retained as monitored state. */
+		if (scan_segment_file_with_context(reader, path, opts, min_offset,
 										&output, &committed_end) != 0) {
 			rc = 1;
 			break;
 		}
-		if (stat(path, &st) != 0 ||
-			remember_seen_segment(seen, seen_count, seen_cap, path, committed_end, &st) != 0) {
-			rc = 1;
-			break;
+		if (!opts->follow || !group_was_scanned) {
+			if (stat(path, &st) != 0 ||
+				remember_seen_segment(seen, seen_count, seen_cap, path, committed_end, &st) != 0) {
+				rc = 1;
+				break;
+			}
 		}
+	}
+	if (rc == 0 && initial_follow_scan && output.entry_count < FOLLOW_INITIAL_ENTRY_COUNT) {
+		SegmentPath *history = NULL;
+		size_t history_count = 0;
+		size_t history_cap = 0;
+
+		if (collect_log_segments(opts->path, &history, &history_count, &history_cap) != 0) {
+			rc = 1;
+		} else {
+			sort_segment_files(history, history_count);
+			for (i = history_count; i > 0 && output.entry_count < FOLLOW_INITIAL_ENTRY_COUNT; i--) {
+				const char *path = history[i - 1].path;
+				if (find_seen_segment(*seen, *seen_count, path)) continue;
+				if (scan_segment_file_with_context(reader, path, opts, 0,
+										&output, NULL) != 0) {
+					rc = 1;
+					break;
+				}
+			}
+		}
+		free(history);
 	}
 	if (rc == 0) {
 		size_t old_count = 0;
@@ -1078,7 +1203,9 @@ static void wait_for_reader_change(RecorderPlayer *reader)
 	};
 
 	if (rec_player_get_timeout(reader, &deadline) == 0 &&
-		deadline != UINT64_MAX && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
+		deadline == UINT64_MAX) {
+		timeout_ms = -1;
+	} else if (deadline != UINT64_MAX && clock_gettime(CLOCK_MONOTONIC, &now) == 0) {
 		uint64_t current = (uint64_t)now.tv_sec * 1000000 + now.tv_nsec / 1000;
 		uint64_t wait_usec = deadline > current ? deadline - current : 0;
 		timeout_ms = (int)((wait_usec + 999) / 1000);
