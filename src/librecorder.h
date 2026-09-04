@@ -54,13 +54,17 @@ int rec_player_set_private_key(RecorderPlayer *reader, const char *path);
 /** Close a reader and release all associated resources. */
 void rec_player_close(RecorderPlayer *reader);
 
-/*
- * sd-journal-style iterator API.  next()/previous() return 1 when positioned
- * on an entry, 0 at the end, and a negative value on failure.  get_data()
- * returns a FIELD=value byte sequence whose lifetime ends at the next reader
- * call. Cursors use the opaque rec1: format and include the 64-bit store ID;
- * they require a store with state/store-id. get_cursor() allocates its result;
- * release it with free().
+/**
+ * Journald-style iterator API.
+ *
+ * next()/previous() return 1 when positioned on an entry, 0 at the end, and
+ * a negative value on failure. After seek_tail(), process() returning
+ * RECORDER_PROCESS_APPEND causes a later next() call to scan only newly
+ * appended data. get_data() returns a FIELD=value byte sequence whose
+ * lifetime ends at the next reader call. Cursors use the opaque rec1: format
+ * and include the 64-bit store ID; they require a store with state/store-id.
+ * get_cursor() allocates its result; release it with free(). Cursors use the
+	 * rec1 format and include the priority group.
  */
 int rec_player_seek_head(RecorderPlayer *reader);
 int rec_player_seek_tail(RecorderPlayer *reader);

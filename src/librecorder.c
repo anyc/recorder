@@ -33,6 +33,7 @@ struct RecorderPlayer {
 	size_t follow_count;
 	size_t follow_capacity;
 	int follow_initialized;
+	int follow_pending;
 };
 
 typedef struct StoredEntry {
@@ -63,6 +64,10 @@ typedef struct FollowSegment {
 	char path[512];
 	uint64_t committed_end;
 } FollowSegment;
+
+static FollowSegment *find_follow_segment(RecorderPlayer *reader, const char *path);
+static int remember_follow_segment(RecorderPlayer *reader, const char *path,
+							   uint64_t committed_end);
 
 static int valid_group_name(const char *name)
 {
@@ -230,6 +235,8 @@ static void clear_entries(RecorderPlayer *reader)
 	reader->entry_capacity = 0;
 	reader->current = SIZE_MAX;
 	reader->entries_loaded = 0;
+	rec_player_follow_reset(reader);
+	reader->follow_pending = 0;
 }
 
 static int copy_string(char **out, const char *value)
@@ -480,12 +487,17 @@ static int load_entries(RecorderPlayer *reader)
 	}
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
 	for (i = 0; i < path_count; i++) {
-		if (rec_player_scan_file(reader, paths[i].path, append_stored_entry, reader, 0, NULL) != 0) {
+		uint64_t committed_end;
+
+		if (rec_player_scan_file(reader, paths[i].path, append_stored_entry, reader, 0,
+								&committed_end) != 0 ||
+			remember_follow_segment(reader, paths[i].path, committed_end) != 0) {
 			clear_entries(reader);
 			goto out;
 		}
 	}
 	reader->entries_loaded = 1;
+	reader->follow_initialized = 1;
 	rc = 0;
 out:
 	free(paths);
@@ -781,7 +793,6 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 			entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
 			entry->frame_entry_index == frame_entry_index) {
 			reader->current = i == 0 ? SIZE_MAX : i - 1;
-			reader->iterator_follow = 1;
 			return 0;
 		}
 	}
@@ -810,7 +821,20 @@ int rec_player_next(RecorderPlayer *reader)
 {
 	if (!reader || load_entries(reader) != 0) return -1;
 	if (reader->current == SIZE_MAX) reader->current = 0;
-	else if (reader->current < reader->entry_count) reader->current++;
+	else if (reader->current < reader->entry_count) {
+		if (reader->current + 1 < reader->entry_count) {
+			reader->current++;
+		} else if (reader->follow_pending) {
+			if (rec_player_scan_follow(reader, append_stored_entry, reader, 0) != 0) return -1;
+			reader->follow_pending = 0;
+			if (reader->current < reader->entry_count) reader->current++;
+		} else {
+			reader->current++;
+		}
+	} else if (reader->follow_pending) {
+		if (rec_player_scan_follow(reader, append_stored_entry, reader, 0) != 0) return -1;
+		reader->follow_pending = 0;
+	}
 	return reader->current < reader->entry_count;
 }
 
@@ -978,7 +1002,11 @@ int rec_player_process(RecorderPlayer *reader)
 			}
 		}
 	}
-	if (result != RECORDER_PROCESS_NOP) clear_entries(reader);
+	if (result == RECORDER_PROCESS_APPEND) {
+		reader->follow_pending = 1;
+	} else if (result == RECORDER_PROCESS_INVALIDATE) {
+		clear_entries(reader);
+	}
 	if (result == RECORDER_PROCESS_INVALIDATE) add_directory_watches(reader);
 	return result;
 }
