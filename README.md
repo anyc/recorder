@@ -57,6 +57,10 @@ By default, it also builds the versioned shared library
 make LIBRECORDER_STATIC=1
 ```
 
+`make install` installs the library's pkg-config file as `librecorder.pc` in
+`$(libdir)/pkgconfig`. Consumers can use `pkg-config --cflags --libs
+librecorder`.
+
 To build binaries that run directly from the repository checkout, use:
 
 ```sh

@@ -3,6 +3,7 @@ PREFIX ?= /usr
 bindir ?= $(PREFIX)/bin
 libdir ?= $(PREFIX)/lib
 includedir ?= $(PREFIX)/include
+pkgconfigdir ?= $(libdir)/pkgconfig
 sysconfdir ?= /etc
 localstatedir ?= /var
 systemd_system_unitdir ?= $(PREFIX)/lib/systemd/system
@@ -28,8 +29,9 @@ FLATCC_MODE ?= sysroot
 REPO_BUILD ?= 0
 LIBRECORDER_STATIC ?= 0
 comma := ,
+LIBRECORDER_VERSION ?= 1.0.0
 LIBRECORDER_SONAME ?= librecorder.so.1
-LIBRECORDER_VERSIONED ?= librecorder.so.1.0.0
+LIBRECORDER_VERSIONED ?= librecorder.so.$(LIBRECORDER_VERSION)
 
 ifeq ($(filter 1 yes true,$(LIBRECORDER_STATIC)),)
 LIBRECORDER_TARGET = $(LIBRECORDER_VERSIONED)
@@ -54,6 +56,7 @@ FLATCC_PKG := $(shell if $(PKG_CONFIG) --exists flatccrt; then echo flatccrt; \
 endif
 FLATCC_CPPFLAGS = $(if $(filter repo,$(FLATCC_MODE)),-Iflatcc/include/,$(shell $(PKG_CONFIG) --cflags $(FLATCC_PKG)))
 FLATCC_LIBS = $(if $(filter repo,$(FLATCC_MODE)),,$(shell $(PKG_CONFIG) --libs $(FLATCC_PKG)))
+LIBRECORDER_PC_REQUIRES_PRIVATE = $(strip libzstd $(OPENSSL_PKG) $(if $(filter repo,$(FLATCC_MODE)),,$(FLATCC_PKG)))
 ifeq ($(PCRE2),auto)
 HAVE_PCRE2 := $(shell $(PKG_CONFIG) --exists $(PCRE2_PKG) && echo 1)
 else ifeq ($(PCRE2),1)
@@ -98,8 +101,16 @@ LIBRECORDER_OBJS = src/librecorder.o src/helper.o src/segment.o src/recorder_cry
 
 all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
+librecorder.pc: packaging/librecorder.pc.in Makefile FORCE
+	sed -e 's|@PREFIX@|$(PREFIX)|g' \
+		-e 's|@LIBDIR@|$(libdir)|g' \
+		-e 's|@INCLUDEDIR@|$(includedir)|g' \
+		-e 's|@VERSION@|$(LIBRECORDER_VERSION)|g' \
+		-e 's|@REQUIRES_PRIVATE@|$(LIBRECORDER_PC_REQUIRES_PRIVATE)|g' \
+		$< > $@
+
 repo:
-	$(MAKE) -B FLATCC_MODE=repo REPO_BUILD=1 LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all
+	$(MAKE) -B FLATCC_MODE=repo REPO_BUILD=1 PREFIX=$(CURDIR) libdir=$(CURDIR) includedir=$(CURDIR)/src LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) all librecorder.pc
 
 recorder: src/recorder.o src/fallback_source.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o src/script_worker.o $(FLATCC_RUNTIME_OBJS)
 	$(CC) $(LDFLAGS) $^ $(LDLIBS) -o $@
@@ -122,10 +133,11 @@ librecorder.a: $(LIBRECORDER_OBJS)
 smoke-test: src/smoke_test.o $(LIBRECORDER_TARGET)
 	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
-install: all
+install: all librecorder.pc
 	install -d $(DESTDIR)$(bindir)
 	install -d $(DESTDIR)$(libdir)
 	install -d $(DESTDIR)$(includedir)
+	install -d $(DESTDIR)$(pkgconfigdir)
 	install -d $(DESTDIR)$(systemd_system_unitdir)
 	install -d $(DESTDIR)$(dir $(RECORDER_CONFIG_PATH))
 	install -d $(DESTDIR)$(RECORDER_CONFIG_DIR)
@@ -137,6 +149,7 @@ install: all
 		ln -sf $(LIBRECORDER_SONAME) $(DESTDIR)$(libdir)/librecorder.so; \
 	fi
 	install -m 0644 src/librecorder.h $(DESTDIR)$(includedir)/librecorder.h
+	install -m 0644 librecorder.pc $(DESTDIR)$(pkgconfigdir)/librecorder.pc
 	install -m 0644 packaging/recorder.json $(DESTDIR)$(RECORDER_CONFIG_PATH)
 	install -m 0644 packaging/recorder.service $(DESTDIR)$(systemd_system_unitdir)/recorder.service
 
@@ -171,10 +184,12 @@ benchmark-storage: repo
 benchmark-capacity: repo
 	$(PYTHON) scripts/benchmark_capacity.py --recorder ./recorder --player ./player $(BENCHMARK_CAPACITY_ARGS)
 
-.PHONY: all repo clean install test-fallback test-storage-policy test-python test-smoke test \
+.PHONY: all repo clean install test-fallback test-storage-policy test-python test-smoke test FORCE \
 	benchmark-compare-storage benchmark-storage benchmark-capacity
 
+FORCE:
+
 clean:
-	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* *.o *.d src/*.o src/*.d flatcc/src/runtime/*.pic.o flatcc/src/runtime/*.pic.d
+	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* librecorder.pc *.o *.d src/*.o src/*.d flatcc/src/runtime/*.pic.o flatcc/src/runtime/*.pic.d
 
 -include $(wildcard *.d) $(wildcard src/*.d) $(wildcard flatcc/src/runtime/*.pic.d)

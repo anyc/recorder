@@ -1,0 +1,12 @@
+prefix=@PREFIX@
+exec_prefix=${prefix}
+libdir=@LIBDIR@
+includedir=@INCLUDEDIR@
+
+Name: librecorder
+Description: Reader library for recorder log segments
+Version: @VERSION@
+Requires.private: @REQUIRES_PRIVATE@
+Libs: -L${libdir} -lrecorder
+Libs.private: -pthread
+Cflags: -I${includedir}

@@ -5,3 +5,5 @@ flatcc
 player
 recorder
 .recorder-log
+*.a
+*.pc
