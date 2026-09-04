@@ -73,12 +73,6 @@ typedef struct {
 	int sanitize_output;
 } PlayerOptions;
 
-/* Kept temporarily for the legacy segment helpers below. */
-typedef struct {
-	char path[512];
-	uint64_t committed_end;
-} SeenSegment;
-
 typedef struct {
 	uint64_t total_bytes;
 	uint64_t group_bytes;
@@ -746,113 +740,6 @@ static int collect_segments_in_dir(const char *dir_path, SegmentPath **items,
 		}
 	}
 	closedir(dir);
-	return 0;
-}
-
-static int collect_latest_segment_in_dir(const char *dir_path,
-								 SegmentPath **items, size_t *count, size_t *cap)
-{
-	DIR *dir = opendir(dir_path);
-	struct dirent *de;
-	char latest_path[512] = { 0 };
-	uint64_t latest_seq = 0;
-	int have_latest = 0;
-
-	if (!dir) return -1;
-	while ((de = readdir(dir)) != NULL) {
-		char path[512];
-		uint64_t seq;
-		struct stat st;
-
-		if (segment_seq_from_name(de->d_name, &seq) != 0 ||
-			snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name) >=
-				(int)sizeof(path) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
-			continue;
-		}
-		if (!have_latest || seq > latest_seq) {
-			strcpy(latest_path, path);
-			latest_seq = seq;
-			have_latest = 1;
-		}
-	}
-	closedir(dir);
-	return have_latest ? add_segment_file(items, count, cap, latest_path, latest_seq) : 0;
-}
-
-static int collect_latest_log_segments(const char *root_path, SegmentPath **items,
-								size_t *count, size_t *cap)
-{
-	DIR *dir = opendir(root_path);
-	struct dirent *de;
-	char latest_path[512] = { 0 };
-	uint64_t latest_seq = 0;
-	int have_root_latest = 0;
-
-	if (!dir) return -1;
-	while ((de = readdir(dir)) != NULL) {
-		char path[512];
-		struct stat st;
-		uint64_t seq;
-
-		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
-			snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
-				(int)sizeof(path) || stat(path, &st) != 0) {
-			continue;
-		}
-		if (S_ISREG(st.st_mode) && segment_seq_from_name(de->d_name, &seq) == 0) {
-			if (!have_root_latest || seq > latest_seq) {
-				strcpy(latest_path, path);
-				latest_seq = seq;
-				have_root_latest = 1;
-			}
-		} else if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
-				collect_latest_segment_in_dir(path, items, count, cap) != 0) {
-			closedir(dir);
-			return -1;
-		}
-	}
-	closedir(dir);
-	return have_root_latest ? add_segment_file(items, count, cap, latest_path, latest_seq) : 0;
-}
-
-static SeenSegment *find_seen_segment(SeenSegment *seen, size_t seen_count,
-										 const char *path)
-{
-	size_t i;
-
-	for (i = 0; i < seen_count; i++) {
-		if (strcmp(seen[i].path, path) == 0) {
-			return &seen[i];
-		}
-	}
-	return NULL;
-}
-
-static int remember_seen_segment(SeenSegment **seen, size_t *seen_count,
-										 size_t *seen_cap, const char *path,
-										 uint64_t committed_end)
-{
-	SeenSegment *item = find_seen_segment(*seen, *seen_count, path);
-	SeenSegment *tmp;
-
-	if (item) {
-		item->committed_end = committed_end;
-		return 0;
-	}
-	if (*seen_count == *seen_cap) {
-		size_t new_cap = *seen_cap ? (*seen_cap * 2) : 32;
-
-		tmp = realloc(*seen, new_cap * sizeof(**seen));
-		if (!tmp) {
-			return -1;
-		}
-		*seen = tmp;
-		*seen_cap = new_cap;
-	}
-	strncpy((*seen)[*seen_count].path, path, sizeof((*seen)[*seen_count].path) - 1);
-	(*seen)[*seen_count].path[sizeof((*seen)[*seen_count].path) - 1] = '\0';
-	(*seen)[*seen_count].committed_end = committed_end;
-	(*seen_count)++;
 	return 0;
 }
 
