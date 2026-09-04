@@ -72,6 +72,20 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 						  uint64_t min_frame_offset,
 						  uint64_t *committed_end_out);
 
+/* Scan all currently retained segments in sequence order. */
+int rec_player_scan_all(RecorderPlayer *reader, rec_player_entry_cb callback,
+						void *userdata);
+
+/*
+ * Scan only the newest segment in each group and retain per-segment offsets
+ * internally. On the first call, older segments are scanned as needed to
+ * provide initial_entries entries. Subsequent calls scan only appended data
+ * and newly created newest segments.
+ */
+int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
+						   void *userdata, size_t initial_entries);
+void rec_player_follow_reset(RecorderPlayer *reader);
+
 /* Poll integration, equivalent in shape to sd_journal_get_fd/events/timeout/process. */
 int rec_player_get_fd(RecorderPlayer *reader);
 int rec_player_get_events(RecorderPlayer *reader);

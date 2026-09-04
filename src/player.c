@@ -51,11 +51,6 @@ typedef struct PlayerEntry {
 } PlayerEntry;
 
 typedef struct {
-	char path[512];
-	uint64_t committed_end;
-} SeenSegment;
-
-typedef struct {
 	const char *path;
 	const char *dir_path;
 	const char *file_path;
@@ -77,6 +72,12 @@ typedef struct {
 	int disk_usage;
 	int sanitize_output;
 } PlayerOptions;
+
+/* Kept temporarily for the legacy segment helpers below. */
+typedef struct {
+	char path[512];
+	uint64_t committed_end;
+} SeenSegment;
 
 typedef struct {
 	uint64_t total_bytes;
@@ -1026,81 +1027,48 @@ static int resolve_boot_filter(PlayerOptions *opts)
 	return 0;
 }
 
-static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, SeenSegment **seen,
-							size_t *seen_count, size_t *seen_cap)
+static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
+						 int *follow_initialized)
 {
-	SegmentPath *items = NULL;
-	size_t count = 0;
-	size_t cap = 0;
-	size_t i;
-	int rc = 0;
 	PrintContext output;
-	int initial_follow_scan = opts->follow && *seen_count == 0;
+	int initial_follow_scan = opts->follow && !*follow_initialized;
+	int rc;
+	size_t i;
 
 	memset(&output, 0, sizeof(output));
+	output.unit_filter = opts->unit_filter;
+	output.boot_id_filter = opts->boot_id_filter;
+	output.boot_seq_filter = opts->boot_seq_filter;
+	output.have_boot_seq_filter = opts->have_boot_seq_filter;
+	output.since_ts = opts->since_ts;
+	output.until_ts = opts->until_ts;
+	output.have_since = opts->have_since;
+	output.have_until = opts->have_until;
+	output.follow_start_ts = opts->follow_start_ts;
+	output.initial_follow_scan = initial_follow_scan;
 
-	if ((opts->follow ? collect_latest_log_segments(opts->path, &items, &count, &cap) :
-			collect_log_segments(opts->path, &items, &count, &cap)) != 0) {
+	if (opts->follow) {
+		rc = rec_player_scan_follow(reader, print_record, &output,
+								FOLLOW_INITIAL_ENTRY_COUNT);
+		*follow_initialized = 1;
+	} else {
+		rc = rec_player_scan_all(reader, print_record, &output);
+	}
+	if (rc != 0) {
+		fprintf(stderr, "player: failed to scan log\n");
+		free_player_entries(output.entries, output.entry_count);
 		return 1;
 	}
-	sort_segment_files(items, count);
-	for (i = 0; i < count; i++) {
-		SeenSegment *seen_item;
-		uint64_t min_offset;
-		uint64_t committed_end;
-		const char *path = items[i].path;
 
-		seen_item = opts->follow ? find_seen_segment(*seen, *seen_count, path) : NULL;
-		min_offset = seen_item ? seen_item->committed_end : 0;
-		committed_end = min_offset;
-
-		/* Scan newest segments first for follow mode. Older segments are read
-		 * only when needed to collect the initial last entries; they are not
-		 * retained as monitored state. */
-		if (scan_segment_file_with_context(reader, path, opts, min_offset,
-										&output, &committed_end) != 0) {
-			rc = 1;
-			break;
-		}
-		if (opts->follow) {
-			if (remember_seen_segment(seen, seen_count, seen_cap, path, committed_end) != 0) {
-				rc = 1;
-				break;
-			}
-		}
-	}
-	if (rc == 0 && initial_follow_scan && output.entry_count < FOLLOW_INITIAL_ENTRY_COUNT) {
-		SegmentPath *history = NULL;
-		size_t history_count = 0;
-		size_t history_cap = 0;
-
-		if (collect_log_segments(opts->path, &history, &history_count, &history_cap) != 0) {
-			rc = 1;
-		} else {
-			sort_segment_files(history, history_count);
-			for (i = history_count; i > 0 && output.entry_count < FOLLOW_INITIAL_ENTRY_COUNT; i--) {
-				const char *path = history[i - 1].path;
-				if (find_seen_segment(*seen, *seen_count, path)) continue;
-				if (scan_segment_file_with_context(reader, path, opts, 0,
-										&output, NULL) != 0) {
-					rc = 1;
-					break;
-				}
-			}
-		}
-		free(history);
-	}
-	if (rc == 0) {
+	qsort(output.entries, output.entry_count, sizeof(*output.entries),
+			compare_player_entries);
+	{
 		size_t old_count = 0;
 		size_t old_seen = 0;
 
-		qsort(output.entries, output.entry_count, sizeof(*output.entries),
-				compare_player_entries);
 		if (initial_follow_scan) {
 			for (i = 0; i < output.entry_count; i++) {
-				if (!output.entries[i].follow_new) {
-					old_count++;
-				}
+				if (!output.entries[i].follow_new) old_count++;
 			}
 		}
 		for (i = 0; i < output.entry_count; i++) {
@@ -1108,14 +1076,11 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts, Seen
 				(old_count - old_seen <= FOLLOW_INITIAL_ENTRY_COUNT)) {
 				print_entry(&output.entries[i], opts->sanitize_output);
 			}
-			if (initial_follow_scan && !output.entries[i].follow_new) {
-				old_seen++;
-			}
+			if (initial_follow_scan && !output.entries[i].follow_new) old_seen++;
 		}
 	}
 	free_player_entries(output.entries, output.entry_count);
-	free(items);
-	return rc;
+	return 0;
 }
 
 static void wait_for_reader_change(RecorderPlayer *reader)
@@ -1144,9 +1109,7 @@ static void wait_for_reader_change(RecorderPlayer *reader)
 static int scan_log_root(const PlayerOptions *opts)
 {
 	RecorderPlayer *reader = NULL;
-	SeenSegment *seen = NULL;
-	size_t seen_count = 0;
-	size_t seen_cap = 0;
+	int follow_initialized = 0;
 	int rc;
 
 	if (rec_player_open(&reader, opts->path) != 0) {
@@ -1161,14 +1124,13 @@ static int scan_log_root(const PlayerOptions *opts)
 		return 1;
 	}
 	do {
-		rc = scan_log_once(reader, opts, &seen, &seen_count, &seen_cap);
+		rc = scan_log_once(reader, opts, &follow_initialized);
 		if (rc != 0 || !opts->follow) {
 			break;
 		}
 		fflush(stdout);
 		wait_for_reader_change(reader);
 	} while (1);
-	free(seen);
 	rec_player_close(reader);
 	return rc;
 }
