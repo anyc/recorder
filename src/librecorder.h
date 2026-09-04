@@ -4,16 +4,21 @@
 #include <stddef.h>
 #include <stdint.h>
 
+/** Opaque reader for recorder segments and log directories. */
 typedef struct RecorderPlayer RecorderPlayer;
 
 typedef struct {
-	/* Identity of the boot that produced this entry. */
+	/** Identity of the boot that produced this entry. */
 	uint32_t boot_seq;
+	/** Borrowed boot ID string. */
 	const char *boot_id;
+	/** Stored entry location, suitable for cursor construction. */
 	uint64_t segment_seq;
 	uint64_t frame_offset;
 	uint32_t frame_entry_index;
+	/** Realtime timestamp in microseconds. */
 	uint64_t realtime_ts;
+	/** Monotonic timestamp in microseconds. */
 	uint64_t monotonic_ts;
 	uint32_t pid;
 	uint32_t uid;
@@ -28,6 +33,7 @@ typedef struct {
 	const char *message_id;
 } RecorderEntry;
 
+/** Return zero to continue scanning, or nonzero to stop with an error. */
 typedef int (*rec_player_entry_cb)(const RecorderEntry *entry, void *userdata);
 
 enum {
@@ -36,12 +42,14 @@ enum {
 	RECORDER_PROCESS_INVALIDATE = 2,
 };
 
+/** Open a log directory or a single segment file. */
 int rec_player_open(RecorderPlayer **reader, const char *path);
 /*
  * Configure the PEM private key used for encrypted segments. This invalidates
  * any entries already loaded by the iterator. Pass NULL to clear the key.
  */
 int rec_player_set_private_key(RecorderPlayer *reader, const char *path);
+/** Close a reader and release all associated resources. */
 void rec_player_close(RecorderPlayer *reader);
 
 /*
@@ -66,13 +74,13 @@ int rec_player_get_monotonic_usec(RecorderPlayer *reader, uint64_t *usec_out,
 							const char **boot_id_out);
 int rec_player_get_cursor(RecorderPlayer *reader, char **cursor_out);
 
-/* Scan one segment. Entry pointers are valid only for the duration of callback. */
+/** Scan one segment; callback entry pointers are valid only during the callback. */
 int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 						  rec_player_entry_cb callback, void *userdata,
 						  uint64_t min_frame_offset,
 						  uint64_t *committed_end_out);
 
-/* Scan all currently retained segments in sequence order. */
+/** Scan all currently retained segments in sequence order. */
 int rec_player_scan_all(RecorderPlayer *reader, rec_player_entry_cb callback,
 						void *userdata);
 
@@ -86,7 +94,7 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 						   void *userdata, size_t initial_entries);
 void rec_player_follow_reset(RecorderPlayer *reader);
 
-/* Poll integration, equivalent in shape to sd_journal_get_fd/events/timeout/process. */
+/** Poll integration, equivalent in shape to sd_journal get-fd/events/timeout/process. */
 int rec_player_get_fd(RecorderPlayer *reader);
 int rec_player_get_events(RecorderPlayer *reader);
 int rec_player_get_timeout(RecorderPlayer *reader, uint64_t *timeout_usec);
