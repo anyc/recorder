@@ -12,6 +12,8 @@ typedef struct {
 	uint32_t boot_seq;
 	/** Borrowed boot ID string. */
 	const char *boot_id;
+	/** Borrowed priority-group name, or NULL for a root-level segment. */
+	const char *group;
 	/** Stored entry location, suitable for cursor construction. */
 	uint64_t segment_seq;
 	uint64_t frame_offset;

@@ -37,6 +37,7 @@ struct RecorderPlayer {
 
 typedef struct StoredEntry {
 	RecorderEntry entry;
+	char *group;
 	char *boot_id;
 	char *hostname;
 	char *comm;
@@ -50,6 +51,7 @@ typedef struct {
 	rec_player_entry_cb callback;
 	void *userdata;
 	uint64_t min_frame_offset;
+	char group[64];
 } ScanContext;
 
 typedef struct {
@@ -161,6 +163,7 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 	memset(&entry, 0, sizeof(entry));
 	entry.boot_seq = header->boot_seq;
 	entry.boot_id = header->boot_id;
+	entry.group = ctx->group;
 	entry.segment_seq = header->segment_seq;
 	entry.frame_offset = frame->file_offset;
 	if ((header->flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0) {
@@ -206,6 +209,7 @@ static void free_stored_entry(StoredEntry *stored)
 {
 	if (!stored) return;
 	free(stored->boot_id);
+	free(stored->group);
 	free(stored->hostname);
 	free(stored->comm);
 	free(stored->unit);
@@ -234,6 +238,42 @@ static int copy_string(char **out, const char *value)
 	return !value || *out ? 0 : -1;
 }
 
+static int group_from_path(const char *path, const char *root_path,
+						  char *group, size_t group_size)
+{
+	const char *end;
+	const char *start;
+	const char *relative;
+	size_t len;
+
+	if (!path || !group || group_size == 0) return -1;
+	strcpy(group, "-");
+	if (root_path) {
+		size_t root_len = strlen(root_path);
+		if (strncmp(path, root_path, root_len) == 0 && path[root_len] == '/') {
+			relative = path + root_len + 1;
+			end = strchr(relative, '/');
+			if (!end) return 0;
+			len = (size_t)(end - relative);
+			if (len == 0 || len >= group_size) return 0;
+			memcpy(group, relative, len);
+			group[len] = '\0';
+			if (!valid_group_name(group)) strcpy(group, "-");
+			return 0;
+		}
+	}
+	end = strrchr(path, '/');
+	if (!end || end == path) return 0;
+	start = end - 1;
+	while (start > path && start[-1] != '/') start--;
+	len = (size_t)(end - start);
+	if (len == 0 || len >= group_size) return 0;
+	memcpy(group, start, len);
+	group[len] = '\0';
+	if (!valid_group_name(group)) strcpy(group, "-");
+	return 0;
+}
+
 static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 {
 	RecorderPlayer *reader = userdata;
@@ -250,7 +290,8 @@ static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 	stored = &reader->entries[reader->entry_count];
 	memset(stored, 0, sizeof(*stored));
 	stored->entry = *entry;
-	if (copy_string(&stored->boot_id, entry->boot_id) != 0 ||
+	if (copy_string(&stored->group, entry->group) != 0 ||
+		copy_string(&stored->boot_id, entry->boot_id) != 0 ||
 		copy_string(&stored->hostname, entry->hostname) != 0 ||
 		copy_string(&stored->comm, entry->comm) != 0 ||
 		copy_string(&stored->unit, entry->unit) != 0 ||
@@ -260,6 +301,7 @@ static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 		free_stored_entry(stored);
 		return -1;
 	}
+	stored->entry.group = stored->group;
 	stored->entry.boot_id = stored->boot_id;
 	stored->entry.hostname = stored->hostname;
 	stored->entry.comm = stored->comm;
@@ -553,6 +595,8 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 	ctx.callback = callback;
 	ctx.userdata = userdata;
 	ctx.min_frame_offset = min_frame_offset;
+	if (group_from_path(path, reader->path_is_directory ? reader->path : NULL,
+			ctx.group, sizeof(ctx.group)) != 0) return -1;
 	if (segment_scan_path_from_offset(path, reader->decryptor, scan_frame, &ctx,
 							min_frame_offset, &header,
 						  &footer, &committed_end) != 0) return -1;
@@ -682,7 +726,8 @@ static const RecorderEntry *current_entry(RecorderPlayer *reader)
 	return &reader->entries[reader->current].entry;
 }
 
-static int parse_cursor(const char *cursor, uint64_t *store_id, uint64_t *segment_seq, uint64_t *frame_offset,
+static int parse_cursor(const char *cursor, uint64_t *store_id, char *group,
+						size_t group_size, uint64_t *segment_seq, uint64_t *frame_offset,
 						uint32_t *frame_entry_index)
 {
 	unsigned long long store;
@@ -691,7 +736,10 @@ static int parse_cursor(const char *cursor, uint64_t *store_id, uint64_t *segmen
 	unsigned int entry;
 	char tail;
 
-	if (!cursor || sscanf(cursor, "rec1:%llx:%llx:%llx:%x%c", &store, &segment, &frame, &entry, &tail) != 4) return -1;
+	if (!cursor || !group || group_size < 64 ||
+		sscanf(cursor, "rec1:%llx:%63[^:]:%llx:%llx:%x%c", &store, group,
+			&segment, &frame, &entry, &tail) != 5 ||
+		!valid_group_name(group)) return -1;
 	*store_id = store;
 	*segment_seq = segment;
 	*frame_offset = frame;
@@ -719,17 +767,21 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 	uint64_t frame_offset;
 	uint64_t store_id;
 	uint32_t frame_entry_index;
+	char group[64];
 	size_t i;
 
 	if (!reader || !reader->have_store_id ||
-		parse_cursor(cursor, &store_id, &segment_seq, &frame_offset, &frame_entry_index) != 0 ||
+		parse_cursor(cursor, &store_id, group, sizeof(group), &segment_seq, &frame_offset,
+			&frame_entry_index) != 0 ||
 		store_id != reader->store_id ||
 		load_entries(reader) != 0) return -1;
 	for (i = 0; i < reader->entry_count; i++) {
 		const RecorderEntry *entry = &reader->entries[i].entry;
-		if (entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
+		if (entry->group && strcmp(entry->group, group) == 0 &&
+			entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
 			entry->frame_entry_index == frame_entry_index) {
 			reader->current = i == 0 ? SIZE_MAX : i - 1;
+			reader->iterator_follow = 1;
 			return 0;
 		}
 	}
@@ -743,11 +795,14 @@ int rec_player_test_cursor(RecorderPlayer *reader, const char *cursor)
 	uint64_t frame_offset;
 	uint64_t store_id;
 	uint32_t frame_entry_index;
+	char group[64];
 
 	if (!entry || !reader->have_store_id ||
-		parse_cursor(cursor, &store_id, &segment_seq, &frame_offset, &frame_entry_index) != 0 ||
+		parse_cursor(cursor, &store_id, group, sizeof(group), &segment_seq, &frame_offset,
+			&frame_entry_index) != 0 ||
 		store_id != reader->store_id) return -1;
-	return entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
+	return entry->group && strcmp(entry->group, group) == 0 &&
+		entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
 		entry->frame_entry_index == frame_entry_index;
 }
 
@@ -859,11 +914,13 @@ int rec_player_get_monotonic_usec(RecorderPlayer *reader, uint64_t *usec_out,
 int rec_player_get_cursor(RecorderPlayer *reader, char **cursor_out)
 {
 	const RecorderEntry *entry = current_entry(reader);
-	char cursor[96];
+	char cursor[192];
 
 	if (!entry || !cursor_out || !reader->have_store_id) return -1;
-	snprintf(cursor, sizeof(cursor), "rec1:%016llx:%llx:%llx:%x",
+	if (!entry->group || !valid_group_name(entry->group)) return -1;
+	snprintf(cursor, sizeof(cursor), "rec1:%016llx:%s:%llx:%llx:%x",
 			(unsigned long long)reader->store_id,
+			entry->group,
 			(unsigned long long)entry->segment_seq,
 			(unsigned long long)entry->frame_offset, entry->frame_entry_index);
 	*cursor_out = strdup(cursor);
