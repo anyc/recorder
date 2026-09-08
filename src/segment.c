@@ -764,3 +764,28 @@ out:
 	if (fd >= 0) close(fd);
 	return rv;
 }
+
+typedef struct {
+	segment_frame_cb callback;
+	void *userdata;
+} SingleFrameContext;
+
+static int scan_single_frame(const SegmentHeader *header, const SegmentFrameInfo *frame,
+					 const void *chunk_buf, size_t chunk_size, void *userdata)
+{
+	SingleFrameContext *ctx = userdata;
+	int rc = ctx->callback(header, frame, chunk_buf, chunk_size, ctx->userdata);
+	return rc != 0 ? rc : 1; /* Stop after the requested frame. */
+}
+
+int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
+					segment_frame_cb cb, void *ctx, size_t file_offset)
+{
+	SingleFrameContext single = { .callback = cb, .userdata = ctx };
+	int rc;
+
+	if (!cb) return -1;
+	rc = segment_scan_path_from_offset(path, decryptor, scan_single_frame, &single,
+							   file_offset, NULL, NULL, NULL);
+	return rc == 1 ? 0 : rc;
+}

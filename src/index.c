@@ -14,6 +14,7 @@
 #define RECORDER_INDEX_FOOTER_SIZE 28u
 #define RECORDER_SERVICE_HASH_SLOTS 4u
 #define RECORDER_SERVICE_HASH_BYTES (RECORDER_SERVICE_HASH_SLOTS * sizeof(uint64_t))
+#define RECORDER_INDEX_RECORD_SIZE (8u + 4u + 8u + 8u + 8u + 8u + 1u + 4u + 1u + RECORDER_SERVICE_HASH_BYTES + 1u)
 
 typedef struct {
 	FILE *fp;
@@ -271,4 +272,66 @@ int index_rebuild_for_segment(const char *segment_path, const char *index_path)
 		return -1;
 	}
 	return 0;
+}
+
+int index_read_frames(const char *path, IndexFrame **frames_out, size_t *count_out)
+{
+	unsigned char header[RECORDER_INDEX_HEADER_SIZE];
+	unsigned char record[RECORDER_INDEX_RECORD_SIZE];
+	FILE *fp = NULL;
+	long size;
+	uint64_t count;
+	IndexFrame *frames = NULL;
+	size_t i;
+
+	if (!path || !frames_out || !count_out) return -1;
+	*frames_out = NULL;
+	*count_out = 0;
+	fp = fopen(path, "rb");
+	if (!fp || fread(header, 1, sizeof(header), fp) != sizeof(header) ||
+		memcmp(header, RECORDER_INDEX_MAGIC, 8) != 0 ||
+		read_u32_le(header + 8) != RECORDER_INDEX_VERSION ||
+		fseek(fp, 0, SEEK_END) != 0 || (size = ftell(fp)) < RECORDER_INDEX_HEADER_SIZE) {
+		if (fp) fclose(fp);
+		return -1;
+	}
+	/* A live index has no footer yet.  Ignore a partial final record. */
+	count = ((uint64_t)size - RECORDER_INDEX_HEADER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+	if (size >= RECORDER_INDEX_HEADER_SIZE + RECORDER_INDEX_FOOTER_SIZE) {
+		unsigned char footer[RECORDER_INDEX_FOOTER_SIZE];
+		if (fseek(fp, size - RECORDER_INDEX_FOOTER_SIZE, SEEK_SET) == 0 &&
+			fread(footer, 1, sizeof(footer), fp) == sizeof(footer) &&
+			memcmp(footer, RECORDER_INDEX_FOOTER_MAGIC, 8) == 0) {
+			uint64_t footer_count = read_u64_le(footer + 8);
+			uint64_t available = ((uint64_t)size - RECORDER_INDEX_HEADER_SIZE -
+				RECORDER_INDEX_FOOTER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+			if (footer_count > available) { fclose(fp); return -1; }
+			count = footer_count;
+		}
+	}
+	if (count > SIZE_MAX / sizeof(*frames)) { fclose(fp); return -1; }
+	if (count != 0 && !(frames = calloc((size_t)count, sizeof(*frames)))) {
+		fclose(fp);
+		return -1;
+	}
+	if (fseek(fp, RECORDER_INDEX_HEADER_SIZE, SEEK_SET) != 0) goto fail;
+	for (i = 0; i < (size_t)count; i++) {
+		if (fread(record, 1, sizeof(record), fp) != sizeof(record)) goto fail;
+		frames[i].file_offset = read_u64_le(record);
+		frames[i].frame_len = read_u32_le(record + 8);
+		frames[i].min_realtime_ts = read_u64_le(record + 12);
+		frames[i].max_realtime_ts = read_u64_le(record + 20);
+		frames[i].min_monotonic_ts = read_u64_le(record + 28);
+		frames[i].max_monotonic_ts = read_u64_le(record + 36);
+		frames[i].priority = record[44];
+		frames[i].entry_count = read_u32_le(record + 45);
+	}
+	fclose(fp);
+	*frames_out = frames;
+	*count_out = (size_t)count;
+	return 0;
+fail:
+	free(frames);
+	fclose(fp);
+	return -1;
 }

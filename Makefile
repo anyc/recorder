@@ -97,7 +97,7 @@ LIBRECORDER_RPATH = $(if $(and $(filter 1 yes true,$(REPO_BUILD)),$(filter 1,$(L
 flatcc/src/runtime/%.pic.o: flatcc/src/runtime/%.c
 	$(CC) $(CPPFLAGS) $(CFLAGS) -c -o $@ $<
 
-LIBRECORDER_OBJS = src/librecorder.o src/helper.o src/segment.o src/recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
+LIBRECORDER_OBJS = src/librecorder.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 
 all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
