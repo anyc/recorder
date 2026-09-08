@@ -15,6 +15,7 @@
 #include "recorder_builder.h"
 #include "helper.h"
 #include "librecorder.h"
+#include "index.h"
 #include "segment.h"
 
 typedef struct {
@@ -425,6 +426,8 @@ int main(void)
 	char store_dir[] = "/tmp/recorder-store-smoke-XXXXXX";
 	char segment_path[512];
 	char second_segment_path[512];
+	char index_path[512];
+	char second_index_path[512];
 	char state_path[512];
 	char group_path[512];
 	char store_id_path[512];
@@ -551,10 +554,17 @@ int main(void)
 		snprintf(segment_path, sizeof(segment_path), "%s/7.seg", group_path) >= (int)sizeof(segment_path) ||
 		snprintf(second_segment_path, sizeof(second_segment_path), "%s/8.seg", group_path) >=
 			(int)sizeof(second_segment_path) ||
+		snprintf(index_path, sizeof(index_path), "%s/7.idx", group_path) >= (int)sizeof(index_path) ||
+		snprintf(second_index_path, sizeof(second_index_path), "%s/8.idx", group_path) >=
+			(int)sizeof(second_index_path) ||
 		snprintf(store_id_path, sizeof(store_id_path), "%s/store-id", state_path) >= (int)sizeof(store_id_path) ||
 		mkdir(state_path, 0755) != 0 || mkdir(group_path, 0755) != 0 || rename(path, segment_path) != 0) {
 		fprintf(stderr, "smoke: create reader store failed\n");
 		unlink(path);
+		return 1;
+	}
+	if (index_rebuild_for_segment(segment_path, index_path) != 0) {
+		fprintf(stderr, "smoke: build reader index failed\n");
 		return 1;
 	}
 	fp = fopen(store_id_path, "wb");
@@ -605,6 +615,27 @@ int main(void)
 			unlink(segment_path);
 			return 1;
 		}
+		if (rec_player_seek_realtime_usec(reader, 1234) != 0 ||
+			rec_player_next(reader) != 1 ||
+			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
+			data_size != strlen("MESSAGE=hello smoke") ||
+			memcmp(data, "MESSAGE=hello smoke", data_size) != 0) {
+			fprintf(stderr, "smoke: librecorder realtime seek failed\n");
+			free(cursor);
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		if (rec_player_seek_tail(reader) != 0 || rec_player_previous(reader) != 1 ||
+			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
+			data_size != strlen("MESSAGE=hello smoke") ||
+			memcmp(data, "MESSAGE=hello smoke", data_size) != 0) {
+			fprintf(stderr, "smoke: librecorder lazy reverse iteration failed\n");
+			free(cursor);
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
 		free(cursor);
 		{
 			unsigned char *segment_copy = NULL;
@@ -618,6 +649,7 @@ int main(void)
 			if (rec_player_seek_tail(reader) != 0 || rec_player_next(reader) != 0 ||
 				read_file(segment_path, &segment_copy, &segment_copy_size) != 0 ||
 				write_file(second_segment_path, segment_copy, segment_copy_size) != 0 ||
+				index_rebuild_for_segment(second_segment_path, second_index_path) != 0 ||
 				poll(&pfd, 1, 1000) <= 0 ||
 				rec_player_process(reader) == RECORDER_PROCESS_NOP ||
 				rec_player_next(reader) != 1 ||
@@ -628,6 +660,7 @@ int main(void)
 				free(segment_copy);
 				rec_player_close(reader);
 				unlink(second_segment_path);
+				unlink(second_index_path);
 				unlink(segment_path);
 				return 1;
 			}
@@ -639,6 +672,7 @@ int main(void)
 				fprintf(stderr, "smoke: librecorder retention replayed entries\n");
 				rec_player_close(reader);
 				unlink(second_segment_path);
+				unlink(second_index_path);
 				unlink(segment_path);
 				return 1;
 			}
@@ -647,6 +681,8 @@ int main(void)
 	}
 	unlink(segment_path);
 	unlink(second_segment_path);
+	unlink(index_path);
+	unlink(second_index_path);
 	unlink(store_id_path);
 	rmdir(group_path);
 	rmdir(state_path);

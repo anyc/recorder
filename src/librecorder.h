@@ -60,7 +60,8 @@ void rec_player_close(RecorderPlayer *reader);
  * Journald-style iterator API.
  *
  * next()/previous() return 1 when positioned on an entry, 0 at the end, and
- * a negative value on failure. After seek_tail(), process() returning
+ * a negative value on failure. seek_tail() records only the ends of current
+ * segments; it does not load historical entries. After seek_tail(), process() returning
  * RECORDER_PROCESS_APPEND or RECORDER_PROCESS_INVALIDATE causes a later
  * next() call to scan only entries after the retained per-group high-water
  * marks. Rotation and retention do not reset the iterator or replay entries.
@@ -68,10 +69,14 @@ void rec_player_close(RecorderPlayer *reader);
  * lifetime ends at the next reader call. Cursors use the opaque rec1: format
  * and include the 64-bit store ID; they require a store with state/store-id.
  * get_cursor() allocates its result; release it with free(). Cursors include
- * the priority group.
+ * the priority group. Iterator seeks require the recorder-generated .idx
+ * sidecar for every traversed segment; this unreleased format does not fall
+ * back to decoding complete segments when an index is absent.
  */
 int rec_player_seek_head(RecorderPlayer *reader);
 int rec_player_seek_tail(RecorderPlayer *reader);
+/** Position before the first entry with realtime timestamp at or after usec. */
+int rec_player_seek_realtime_usec(RecorderPlayer *reader, uint64_t usec);
 int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_test_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_next(RecorderPlayer *reader);
