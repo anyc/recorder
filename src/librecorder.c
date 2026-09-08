@@ -320,6 +320,97 @@ static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 	return 0;
 }
 
+static int compare_stored_entries(const void *left, const void *right)
+{
+	const StoredEntry *a = left;
+	const StoredEntry *b = right;
+	int result;
+
+	if (a->entry.realtime_ts < b->entry.realtime_ts) return -1;
+	if (a->entry.realtime_ts > b->entry.realtime_ts) return 1;
+	if (a->entry.boot_seq < b->entry.boot_seq) return -1;
+	if (a->entry.boot_seq > b->entry.boot_seq) return 1;
+	result = strcmp(a->entry.group ? a->entry.group : "-",
+				b->entry.group ? b->entry.group : "-");
+	if (result != 0) return result;
+	if (a->entry.segment_seq < b->entry.segment_seq) return -1;
+	if (a->entry.segment_seq > b->entry.segment_seq) return 1;
+	if (a->entry.frame_offset < b->entry.frame_offset) return -1;
+	if (a->entry.frame_offset > b->entry.frame_offset) return 1;
+	if (a->entry.frame_entry_index < b->entry.frame_entry_index) return -1;
+	if (a->entry.frame_entry_index > b->entry.frame_entry_index) return 1;
+	return 0;
+}
+
+static void rebind_stored_entry_strings(RecorderPlayer *reader)
+{
+	size_t i;
+
+	for (i = 0; i < reader->entry_count; i++) {
+		StoredEntry *stored = &reader->entries[i];
+
+		stored->entry.group = stored->group;
+		stored->entry.boot_id = stored->boot_id;
+		stored->entry.hostname = stored->hostname;
+		stored->entry.comm = stored->comm;
+		stored->entry.unit = stored->unit;
+		stored->entry.exe = stored->exe;
+		stored->entry.message = stored->message;
+		stored->entry.message_id = stored->message_id;
+	}
+}
+
+static int append_pending_entries(RecorderPlayer *reader)
+{
+	RecorderPlayer pending;
+	StoredEntry *tmp;
+	size_t required;
+	size_t capacity;
+	size_t i;
+
+	memset(&pending, 0, sizeof(pending));
+	if (rec_player_scan_follow(reader, append_stored_entry, &pending, 0) != 0) {
+		for (i = 0; i < pending.entry_count; i++) free_stored_entry(&pending.entries[i]);
+		free(pending.entries);
+		return -1;
+	}
+	if (pending.entry_count == 0) {
+		free(pending.entries);
+		return 0;
+	}
+	qsort(pending.entries, pending.entry_count, sizeof(*pending.entries),
+			compare_stored_entries);
+	rebind_stored_entry_strings(&pending);
+	if (pending.entry_count > SIZE_MAX - reader->entry_count) goto fail;
+	required = reader->entry_count + pending.entry_count;
+	if (required > SIZE_MAX / sizeof(*reader->entries)) goto fail;
+	capacity = reader->entry_capacity;
+	if (capacity < required) {
+		if (capacity == 0) capacity = 256;
+		while (capacity < required) {
+			if (capacity > SIZE_MAX / 2) {
+				capacity = required;
+				break;
+			}
+			capacity *= 2;
+		}
+		tmp = realloc(reader->entries, capacity * sizeof(*tmp));
+		if (!tmp) goto fail;
+		reader->entries = tmp;
+		reader->entry_capacity = capacity;
+	}
+	memcpy(reader->entries + reader->entry_count, pending.entries,
+			pending.entry_count * sizeof(*pending.entries));
+	reader->entry_count = required;
+	free(pending.entries);
+	return 0;
+
+fail:
+	for (i = 0; i < pending.entry_count; i++) free_stored_entry(&pending.entries[i]);
+	free(pending.entries);
+	return -1;
+}
+
 static int segment_seq_from_name(const char *name, uint64_t *seq_out)
 {
 	char *end = NULL;
@@ -825,14 +916,14 @@ int rec_player_next(RecorderPlayer *reader)
 		if (reader->current + 1 < reader->entry_count) {
 			reader->current++;
 		} else if (reader->follow_pending) {
-			if (rec_player_scan_follow(reader, append_stored_entry, reader, 0) != 0) return -1;
+			if (append_pending_entries(reader) != 0) return -1;
 			reader->follow_pending = 0;
 			if (reader->current < reader->entry_count) reader->current++;
 		} else {
 			reader->current++;
 		}
 	} else if (reader->follow_pending) {
-		if (rec_player_scan_follow(reader, append_stored_entry, reader, 0) != 0) return -1;
+		if (append_pending_entries(reader) != 0) return -1;
 		reader->follow_pending = 0;
 	}
 	return reader->current < reader->entry_count;
