@@ -3,6 +3,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <poll.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -113,6 +114,18 @@ out:
 	if (fp) {
 		fclose(fp);
 	}
+	return rv;
+}
+
+static int write_file(const char *path, const void *buf, size_t size)
+{
+	FILE *fp = fopen(path, "wb");
+	int rv = 0;
+
+	if (!fp) return -1;
+	if (fwrite(buf, 1, size, fp) != size) rv = -1;
+	if (fclose(fp) != 0) rv = -1;
+	if (rv != 0) unlink(path);
 	return rv;
 }
 
@@ -411,6 +424,7 @@ int main(void)
 	char path[] = "/tmp/recorder-segment-smoke-XXXXXX";
 	char store_dir[] = "/tmp/recorder-store-smoke-XXXXXX";
 	char segment_path[512];
+	char second_segment_path[512];
 	char state_path[512];
 	char group_path[512];
 	char store_id_path[512];
@@ -535,6 +549,8 @@ int main(void)
 		snprintf(state_path, sizeof(state_path), "%s/state", store_dir) >= (int)sizeof(state_path) ||
 		snprintf(group_path, sizeof(group_path), "%s/p4", store_dir) >= (int)sizeof(group_path) ||
 		snprintf(segment_path, sizeof(segment_path), "%s/7.seg", group_path) >= (int)sizeof(segment_path) ||
+		snprintf(second_segment_path, sizeof(second_segment_path), "%s/8.seg", group_path) >=
+			(int)sizeof(second_segment_path) ||
 		snprintf(store_id_path, sizeof(store_id_path), "%s/store-id", state_path) >= (int)sizeof(store_id_path) ||
 		mkdir(state_path, 0755) != 0 || mkdir(group_path, 0755) != 0 || rename(path, segment_path) != 0) {
 		fprintf(stderr, "smoke: create reader store failed\n");
@@ -590,9 +606,47 @@ int main(void)
 			return 1;
 		}
 		free(cursor);
+		{
+			unsigned char *segment_copy = NULL;
+			size_t segment_copy_size = 0;
+			struct pollfd pfd = {
+				.fd = rec_player_get_fd(reader),
+				.events = (short)rec_player_get_events(reader),
+			};
+			const RecorderEntry *entry;
+
+			if (rec_player_seek_tail(reader) != 0 || rec_player_next(reader) != 0 ||
+				read_file(segment_path, &segment_copy, &segment_copy_size) != 0 ||
+				write_file(second_segment_path, segment_copy, segment_copy_size) != 0 ||
+				poll(&pfd, 1, 1000) <= 0 ||
+				rec_player_process(reader) == RECORDER_PROCESS_NOP ||
+				rec_player_next(reader) != 1 ||
+				rec_player_get_entry(reader, &entry) != 0 ||
+				strcmp(entry->message, "hello smoke") != 0 ||
+				rec_player_next(reader) != 0) {
+				fprintf(stderr, "smoke: librecorder follow rotation failed\n");
+				free(segment_copy);
+				rec_player_close(reader);
+				unlink(second_segment_path);
+				unlink(segment_path);
+				return 1;
+			}
+			free(segment_copy);
+			pfd.revents = 0;
+			if (unlink(segment_path) != 0 || poll(&pfd, 1, 1000) <= 0 ||
+				rec_player_process(reader) == RECORDER_PROCESS_NOP ||
+				rec_player_next(reader) != 0) {
+				fprintf(stderr, "smoke: librecorder retention replayed entries\n");
+				rec_player_close(reader);
+				unlink(second_segment_path);
+				unlink(segment_path);
+				return 1;
+			}
+		}
 		rec_player_close(reader);
 	}
 	unlink(segment_path);
+	unlink(second_segment_path);
 	unlink(store_id_path);
 	rmdir(group_path);
 	rmdir(state_path);

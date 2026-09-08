@@ -31,6 +31,8 @@ typedef struct {
 	const char *exe;
 	const char *message;
 	const char *message_id;
+	/** Borrowed priority-group name, or NULL for a root-level segment. */
+	const char *group;
 } RecorderEntry;
 
 /** Return zero to continue scanning, or nonzero to stop with an error. */
@@ -38,7 +40,9 @@ typedef int (*rec_player_entry_cb)(const RecorderEntry *entry, void *userdata);
 
 enum {
 	RECORDER_PROCESS_NOP = 0,
+	/** Segment contents changed; next() can make newly committed entries available. */
 	RECORDER_PROCESS_APPEND = 1,
+	/** Segment topology changed; iterator position is preserved while rescanning. */
 	RECORDER_PROCESS_INVALIDATE = 2,
 };
 
@@ -57,12 +61,14 @@ void rec_player_close(RecorderPlayer *reader);
  *
  * next()/previous() return 1 when positioned on an entry, 0 at the end, and
  * a negative value on failure. After seek_tail(), process() returning
- * RECORDER_PROCESS_APPEND causes a later next() call to scan only newly
- * appended data. get_data() returns a FIELD=value byte sequence whose
+ * RECORDER_PROCESS_APPEND or RECORDER_PROCESS_INVALIDATE causes a later
+ * next() call to scan only entries after the retained per-group high-water
+ * marks. Rotation and retention do not reset the iterator or replay entries.
+ * get_data() returns a FIELD=value byte sequence whose
  * lifetime ends at the next reader call. Cursors use the opaque rec1: format
  * and include the 64-bit store ID; they require a store with state/store-id.
- * get_cursor() allocates its result; release it with free(). Cursors use the
-	 * rec1 format and include the priority group.
+ * get_cursor() allocates its result; release it with free(). Cursors include
+ * the priority group.
  */
 int rec_player_seek_head(RecorderPlayer *reader);
 int rec_player_seek_tail(RecorderPlayer *reader);

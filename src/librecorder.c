@@ -34,6 +34,7 @@ struct RecorderPlayer {
 	size_t follow_capacity;
 	int follow_initialized;
 	int follow_pending;
+	int follow_topology_pending;
 };
 
 typedef struct StoredEntry {
@@ -61,13 +62,15 @@ typedef struct {
 } SegmentPath;
 
 typedef struct FollowSegment {
+	char group[64];
 	char path[512];
+	uint64_t segment_seq;
 	uint64_t committed_end;
 } FollowSegment;
 
 static FollowSegment *find_follow_segment(RecorderPlayer *reader, const char *path);
 static int remember_follow_segment(RecorderPlayer *reader, const char *path,
-							   uint64_t committed_end);
+								   uint64_t segment_seq, uint64_t committed_end);
 
 static int valid_group_name(const char *name)
 {
@@ -127,23 +130,24 @@ static void load_store_id(RecorderPlayer *reader)
 	}
 }
 
-static void add_watch(RecorderPlayer *reader, const char *path)
+static int add_watch(RecorderPlayer *reader, const char *path)
 {
-	if (reader->inotify_fd >= 0) {
-		(void)inotify_add_watch(reader->inotify_fd, path,
+	if (reader->inotify_fd < 0) return -1;
+	if (inotify_add_watch(reader->inotify_fd, path,
 				IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM |
-				IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF);
-	}
+				IN_MODIFY | IN_CLOSE_WRITE | IN_DELETE_SELF | IN_MOVE_SELF) < 0) return -1;
+	return 0;
 }
 
-static void add_directory_watches(RecorderPlayer *reader)
+static int add_directory_watches(RecorderPlayer *reader)
 {
 	DIR *dir;
 	struct dirent *de;
+	int rv = 0;
 
-	add_watch(reader, reader->path);
+	if (add_watch(reader, reader->path) != 0) rv = -1;
 	dir = opendir(reader->path);
-	if (!dir) return;
+	if (!dir) return -1;
 	while ((de = readdir(dir)) != NULL) {
 		char child[512];
 		struct stat st;
@@ -151,9 +155,10 @@ static void add_directory_watches(RecorderPlayer *reader)
 		if (!valid_group_name(de->d_name) ||
 			snprintf(child, sizeof(child), "%s/%s", reader->path, de->d_name) >=
 				(int)sizeof(child) || stat(child, &st) != 0 || !S_ISDIR(st.st_mode)) continue;
-		add_watch(reader, child);
+		if (add_watch(reader, child) != 0) rv = -1;
 	}
 	closedir(dir);
+	return rv;
 }
 
 static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame,
@@ -237,6 +242,7 @@ static void clear_entries(RecorderPlayer *reader)
 	reader->entries_loaded = 0;
 	rec_player_follow_reset(reader);
 	reader->follow_pending = 0;
+	reader->follow_topology_pending = 0;
 }
 
 static int copy_string(char **out, const char *value)
@@ -501,15 +507,15 @@ static int collect_latest_segment_in_dir(const char *dir_path,
 
 	if (!dir) return -1;
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
 		uint64_t seq;
-		struct stat st;
 
-		if (segment_seq_from_name(de->d_name, &seq) != 0 ||
-			snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name) >=
-				(int)sizeof(path) || stat(path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+		if (segment_seq_from_name(de->d_name, &seq) != 0) continue;
 		if (!have_latest || seq > latest_seq) {
-			strcpy(latest_path, path);
+			if (snprintf(latest_path, sizeof(latest_path), "%s/%s", dir_path,
+					de->d_name) >= (int)sizeof(latest_path)) {
+				closedir(dir);
+				return -1;
+			}
 			latest_seq = seq;
 			have_latest = 1;
 		}
@@ -535,14 +541,15 @@ static int collect_latest_segment_paths(const char *root_path, SegmentPath **pat
 
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
 			snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
-				(int)sizeof(path) || stat(path, &st) != 0) continue;
-		if (S_ISREG(st.st_mode) && segment_seq_from_name(de->d_name, &seq) == 0) {
+				(int)sizeof(path)) continue;
+		if (segment_seq_from_name(de->d_name, &seq) == 0) {
 			if (!have_root_latest || seq > latest_seq) {
 				strcpy(latest_path, path);
 				latest_seq = seq;
 				have_root_latest = 1;
 			}
-		} else if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
+		} else if (valid_group_name(de->d_name) && stat(path, &st) == 0 &&
+			S_ISDIR(st.st_mode) &&
 				collect_latest_segment_in_dir(path, paths, count, capacity) != 0) {
 			closedir(dir);
 			return -1;
@@ -582,11 +589,15 @@ static int load_entries(RecorderPlayer *reader)
 
 		if (rec_player_scan_file(reader, paths[i].path, append_stored_entry, reader, 0,
 								&committed_end) != 0 ||
-			remember_follow_segment(reader, paths[i].path, committed_end) != 0) {
+			remember_follow_segment(reader, paths[i].path, paths[i].segment_seq,
+								committed_end) != 0) {
 			clear_entries(reader);
 			goto out;
 		}
 	}
+	qsort(reader->entries, reader->entry_count, sizeof(*reader->entries),
+			compare_stored_entries);
+	rebind_stored_entry_strings(reader);
 	reader->entries_loaded = 1;
 	reader->follow_initialized = 1;
 	rc = 0;
@@ -614,8 +625,9 @@ int rec_player_open(RecorderPlayer **reader_out, const char *path)
 	reader->current = SIZE_MAX;
 	load_store_id(reader);
 	if (reader->inotify_fd >= 0) {
-		if (S_ISDIR(st.st_mode)) add_directory_watches(reader);
-		else add_watch(reader, path);
+		if ((S_ISDIR(st.st_mode) && add_directory_watches(reader) != 0) ||
+			(!S_ISDIR(st.st_mode) && add_watch(reader, path) != 0))
+			reader->reliable_fd = 0;
 	}
 	*reader_out = reader;
 	return 0;
@@ -635,10 +647,13 @@ void rec_player_close(RecorderPlayer *reader)
 
 static FollowSegment *find_follow_segment(RecorderPlayer *reader, const char *path)
 {
+	char group[64];
 	size_t i;
 
+	if (group_from_path(path, reader->path_is_directory ? reader->path : NULL,
+			group, sizeof(group)) != 0) return NULL;
 	for (i = 0; i < reader->follow_count; i++) {
-		if (strcmp(reader->follow_segments[i].path, path) == 0) {
+		if (strcmp(reader->follow_segments[i].group, group) == 0) {
 			return &reader->follow_segments[i];
 		}
 	}
@@ -646,12 +661,26 @@ static FollowSegment *find_follow_segment(RecorderPlayer *reader, const char *pa
 }
 
 static int remember_follow_segment(RecorderPlayer *reader, const char *path,
-							   uint64_t committed_end)
+								   uint64_t segment_seq, uint64_t committed_end)
 {
-	FollowSegment *item = find_follow_segment(reader, path);
+	char group[64];
+	FollowSegment *item = NULL;
 	FollowSegment *tmp;
+	size_t i;
 
+	if (group_from_path(path, reader->path_is_directory ? reader->path : NULL,
+			group, sizeof(group)) != 0) return -1;
+	for (i = 0; i < reader->follow_count; i++) {
+		if (strcmp(reader->follow_segments[i].group, group) == 0) {
+			item = &reader->follow_segments[i];
+			break;
+		}
+	}
+	if (item && segment_seq < item->segment_seq) return 0;
 	if (item) {
+		if (snprintf(item->path, sizeof(item->path), "%s", path) >=
+				(int)sizeof(item->path)) return -1;
+		item->segment_seq = segment_seq;
 		item->committed_end = committed_end;
 		return 0;
 	}
@@ -662,9 +691,13 @@ static int remember_follow_segment(RecorderPlayer *reader, const char *path,
 		reader->follow_segments = tmp;
 		reader->follow_capacity = new_capacity;
 	}
-	if (snprintf(reader->follow_segments[reader->follow_count].path,
+	if (snprintf(reader->follow_segments[reader->follow_count].group,
+				 sizeof(reader->follow_segments[reader->follow_count].group), "%s", group) >=
+			(int)sizeof(reader->follow_segments[reader->follow_count].group) ||
+		snprintf(reader->follow_segments[reader->follow_count].path,
 				 sizeof(reader->follow_segments[reader->follow_count].path), "%s", path) >=
 			(int)sizeof(reader->follow_segments[reader->follow_count].path)) return -1;
+	reader->follow_segments[reader->follow_count].segment_seq = segment_seq;
 	reader->follow_segments[reader->follow_count].committed_end = committed_end;
 	reader->follow_count++;
 	return 0;
@@ -773,18 +806,27 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 
 	if (!reader || !callback) return -1;
 	if (reader->path_is_directory) {
-		if (collect_latest_segment_paths(reader->path, &paths, &path_count, &path_capacity) != 0) goto out;
+		if (reader->follow_initialized && reader->follow_topology_pending) {
+			if (collect_segment_paths(reader->path, &paths, &path_count,
+									  &path_capacity) != 0) goto out;
+		} else if (collect_latest_segment_paths(reader->path, &paths, &path_count,
+										 &path_capacity) != 0) goto out;
 	} else if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0) {
 		goto out;
 	}
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
 	for (i = 0; i < path_count; i++) {
 		FollowSegment *seen = find_follow_segment(reader, paths[i].path);
-		uint64_t committed_end = seen ? seen->committed_end : 0;
+		uint64_t committed_end;
+
+		if (seen && paths[i].segment_seq < seen->segment_seq) continue;
+		committed_end = seen && paths[i].segment_seq == seen->segment_seq ?
+			seen->committed_end : 0;
 
 		if (scan_path_with_context(reader, paths[i].path, committed_end, callback, userdata,
 							&scanned_entries, &committed_end) != 0) goto out;
-		if (remember_follow_segment(reader, paths[i].path, committed_end) != 0) goto out;
+		if (remember_follow_segment(reader, paths[i].path, paths[i].segment_seq,
+								committed_end) != 0) goto out;
 	}
 	if (!reader->follow_initialized && scanned_entries < initial_entries && reader->path_is_directory) {
 		SegmentPath *history = NULL;
@@ -797,7 +839,9 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 		}
 		qsort(history, history_count, sizeof(*history), compare_segment_path);
 		for (i = history_count; i > 0 && scanned_entries < initial_entries; i--) {
-			if (find_follow_segment(reader, history[i - 1].path)) continue;
+			FollowSegment *seen = find_follow_segment(reader, history[i - 1].path);
+
+			if (seen && history[i - 1].segment_seq >= seen->segment_seq) continue;
 			if (scan_path_with_context(reader, history[i - 1].path, 0, callback, userdata,
 								&scanned_entries, NULL) != 0) {
 				free(history);
@@ -807,6 +851,7 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 		free(history);
 	}
 	reader->follow_initialized = 1;
+	reader->follow_topology_pending = 0;
 	rc = 0;
 out:
 	free(paths);
@@ -1071,13 +1116,27 @@ int rec_player_reliable_fd(RecorderPlayer *reader)
 	return reader ? reader->reliable_fd : -1;
 }
 
+static int is_segment_event_name(const struct inotify_event *event)
+{
+	size_t len;
+
+	if (!event->len || !event->name[0]) return 0;
+	len = strlen(event->name);
+	return len > 4 && strcmp(event->name + len - 4, ".seg") == 0;
+}
+
 int rec_player_process(RecorderPlayer *reader)
 {
 	char buffer[4096];
 	ssize_t n;
 	int result = RECORDER_PROCESS_NOP;
 
-	if (!reader || reader->inotify_fd < 0) return RECORDER_PROCESS_INVALIDATE;
+	if (!reader) return -1;
+	if (reader->inotify_fd < 0) {
+		reader->follow_pending = 1;
+		reader->follow_topology_pending = 1;
+		return RECORDER_PROCESS_INVALIDATE;
+	}
 	for (;;) {
 		n = read(reader->inotify_fd, buffer, sizeof(buffer));
 		if (n < 0 && errno == EAGAIN) break;
@@ -1086,18 +1145,29 @@ int rec_player_process(RecorderPlayer *reader)
 			size_t offset = 0;
 			while (offset < (size_t)n) {
 				struct inotify_event *event = (struct inotify_event *)(buffer + offset);
-				if (event->mask & (IN_Q_OVERFLOW | IN_DELETE | IN_MOVED_FROM |
-									IN_DELETE_SELF | IN_MOVE_SELF | IN_ISDIR)) result = RECORDER_PROCESS_INVALIDATE;
-				else if (result != RECORDER_PROCESS_INVALIDATE) result = RECORDER_PROCESS_APPEND;
+				if (event->mask & (IN_Q_OVERFLOW | IN_DELETE_SELF | IN_MOVE_SELF |
+									IN_IGNORED)) {
+					result = RECORDER_PROCESS_INVALIDATE;
+				} else if (reader->path_is_directory && (event->mask & IN_ISDIR)) {
+					if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM))
+						result = RECORDER_PROCESS_INVALIDATE;
+				} else if (!reader->path_is_directory || is_segment_event_name(event)) {
+					if (event->mask & (IN_CREATE | IN_DELETE | IN_MOVED_TO | IN_MOVED_FROM))
+						result = RECORDER_PROCESS_INVALIDATE;
+					else if (result != RECORDER_PROCESS_INVALIDATE &&
+						(event->mask & (IN_MODIFY | IN_CLOSE_WRITE)))
+						result = RECORDER_PROCESS_APPEND;
+				}
 				offset += sizeof(*event) + event->len;
 			}
 		}
 	}
-	if (result == RECORDER_PROCESS_APPEND) {
+	if (result != RECORDER_PROCESS_NOP) {
 		reader->follow_pending = 1;
-	} else if (result == RECORDER_PROCESS_INVALIDATE) {
-		clear_entries(reader);
 	}
-	if (result == RECORDER_PROCESS_INVALIDATE) add_directory_watches(reader);
+	if (result == RECORDER_PROCESS_INVALIDATE) {
+		reader->follow_topology_pending = 1;
+		if (add_directory_watches(reader) != 0) reader->reliable_fd = 0;
+	}
 	return result;
 }
