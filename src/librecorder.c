@@ -84,6 +84,8 @@ struct IteratorSource {
 	size_t frame_count;
 	size_t frame_index;
 	int segment_scan_fallback;
+	SegmentFrameReader *frame_reader;
+	char frame_reader_path[512];
 	StoredEntry *entries;
 	size_t entry_count;
 	size_t entry_capacity;
@@ -970,6 +972,7 @@ static void iterator_reset(RecorderPlayer *reader)
 	size_t i;
 	for (i = 0; i < reader->source_count; i++) {
 		source_clear_frame(&reader->sources[i]);
+		segment_frame_reader_close(reader->sources[i].frame_reader);
 		free(reader->sources[i].segments);
 	}
 	free(reader->sources);
@@ -1050,7 +1053,15 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	segment = &source->segments[source->segment_index];
 	if (segment_index_path(segment->path, index_path, sizeof(index_path)) != 0 ||
 		index_read_frame(index_path, frame_index, &frame) != 0) return -1;
-	if (segment_scan_path_frame(segment->path, reader->decryptor, scan_source_frame,
+	if (!source->frame_reader || strcmp(source->frame_reader_path, segment->path) != 0) {
+		segment_frame_reader_close(source->frame_reader);
+		source->frame_reader = NULL;
+		if (segment_frame_reader_open(segment->path, reader->decryptor,
+				&source->frame_reader) != 0 ||
+			snprintf(source->frame_reader_path, sizeof(source->frame_reader_path), "%s",
+				segment->path) >= (int)sizeof(source->frame_reader_path)) return -1;
+	}
+	if (segment_frame_reader_scan(source->frame_reader, scan_source_frame,
 							&context, frame.file_offset, frame_index) != 0)
 		return -1;
 	source->frame_index = frame_index;

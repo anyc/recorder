@@ -95,6 +95,7 @@ typedef int (*segment_frame_cb)(const SegmentHeader *header,
 
 typedef struct SegmentEncryptor SegmentEncryptor;
 typedef struct SegmentDecryptor SegmentDecryptor;
+typedef struct SegmentFrameReader SegmentFrameReader;
 
 /*
  * An encryptor owns the public key and the current segment's generated DEK.
@@ -135,6 +136,11 @@ int segment_scan_path_from_offset(const char *path, SegmentDecryptor *decryptor,
 int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
 					segment_frame_cb cb, void *ctx, size_t file_offset,
 					uint64_t frame_index);
+int segment_frame_reader_open(const char *path, SegmentDecryptor *decryptor,
+					  SegmentFrameReader **reader_out);
+void segment_frame_reader_close(SegmentFrameReader *reader);
+int segment_frame_reader_scan(SegmentFrameReader *reader, segment_frame_cb cb,
+					  void *ctx, size_t file_offset, uint64_t frame_index);
 int segment_scan_buffer(const void *buf, size_t size,
                         SegmentDecryptor *decryptor, segment_frame_cb cb,
                         void *ctx, SegmentHeader *header_out,

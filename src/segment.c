@@ -61,6 +61,17 @@ typedef struct {
 	unsigned char nonce_prefix[SEGMENT_NONCE_PREFIX_SIZE];
 } SegmentEncryptionInfo;
 
+struct SegmentFrameReader {
+	int fd;
+	size_t size;
+	size_t data_offset;
+	SegmentHeader header;
+	SegmentEncryptionInfo encryption;
+	unsigned char *metadata;
+	unsigned char dek[SEGMENT_DEK_SIZE];
+	int encrypted;
+};
+
 static void secure_clear(void *ptr, size_t len)
 {
 	volatile unsigned char *p = ptr;
@@ -768,6 +779,98 @@ out:
 static int pread_exact(int fd, void *buf, size_t size, off_t offset)
 {
 	return pread(fd, buf, size, offset) == (ssize_t)size ? 0 : -1;
+}
+
+int segment_frame_reader_open(const char *path, SegmentDecryptor *decryptor,
+					  SegmentFrameReader **reader_out)
+{
+	SegmentFrameReader *reader;
+	struct stat st;
+	unsigned char fixed[SEGMENT_HEADER_FIXED_SIZE];
+	uint32_t header_size;
+
+	if (!path || !reader_out || !(reader = calloc(1, sizeof(*reader)))) return -1;
+	reader->fd = -1;
+	if ((reader->fd = open(path, O_RDONLY)) < 0 || fstat(reader->fd, &st) != 0 ||
+		st.st_size < SEGMENT_HEADER_FIXED_SIZE || (uintmax_t)st.st_size > SIZE_MAX ||
+		pread_exact(reader->fd, fixed, sizeof(fixed), 0) != 0) goto fail;
+	header_size = read_u32_le(fixed + 12);
+	if (header_size < SEGMENT_HEADER_FIXED_SIZE || header_size > (uint64_t)st.st_size ||
+		read_u32_le(fixed + 144) > (uint64_t)st.st_size - header_size) goto fail;
+	reader->size = (size_t)st.st_size;
+	reader->metadata = malloc(header_size + read_u32_le(fixed + 144));
+	if (!reader->metadata || pread_exact(reader->fd, reader->metadata,
+		header_size + read_u32_le(fixed + 144), 0) != 0 ||
+		segment_parse_header(reader->metadata, header_size + read_u32_le(fixed + 144),
+			&reader->header, &reader->data_offset, &reader->encryption) != 0) goto fail;
+	reader->encrypted = (reader->header.flags & SEGMENT_FLAG_ENCRYPTED) != 0;
+	if (reader->encrypted && (!decryptor || recorder_crypto_unwrap_dek(decryptor->private_key,
+		reader->encryption.wrapped_dek, reader->encryption.wrapped_dek_len, reader->dek) != 0)) {
+		errno = EACCES;
+		goto fail;
+	}
+	*reader_out = reader;
+	return 0;
+fail:
+	segment_frame_reader_close(reader);
+	return -1;
+}
+
+void segment_frame_reader_close(SegmentFrameReader *reader)
+{
+	if (!reader) return;
+	if (reader->fd >= 0) close(reader->fd);
+	free(reader->metadata);
+	recorder_crypto_cleanse(reader->dek, sizeof(reader->dek));
+	free(reader);
+}
+
+int segment_frame_reader_scan(SegmentFrameReader *reader, segment_frame_cb cb,
+					  void *ctx, size_t file_offset, uint64_t frame_index)
+{
+	SegmentFrameInfo frame;
+	unsigned char frame_header[SEGMENT_FRAME_HEADER_SIZE];
+	unsigned char *frame_bytes = NULL;
+	const unsigned char *p, *dict_bytes = NULL;
+	const void *payload;
+	void *decrypted = NULL, *chunk = NULL;
+	size_t expected, chunk_size;
+	uint32_t tag_len, total, stored_crc, calc_crc;
+	int verify, rc = -1;
+
+	if (!reader || !cb || file_offset < reader->data_offset ||
+		file_offset > reader->size - SEGMENT_FRAME_HEADER_SIZE - 4 ||
+		pread_exact(reader->fd, frame_header, sizeof(frame_header), file_offset) != 0) goto out;
+	tag_len = reader->encrypted ? SEGMENT_GCM_TAG_SIZE : 0;
+	frame.flags = read_u32_le(frame_header); frame.stored_len = read_u32_le(frame_header + 4);
+	frame.uncompressed_len = read_u32_le(frame_header + 8); total = read_u32_le(frame_header + 12);
+	frame.file_offset = file_offset; frame.frame_len = total;
+	expected = SEGMENT_FRAME_HEADER_SIZE + (size_t)frame.stored_len + tag_len + 4;
+	if (expected > UINT32_MAX || total != expected || total > reader->size - file_offset) { errno = EIO; goto out; }
+	if (!(frame_bytes = malloc(total)) || pread_exact(reader->fd, frame_bytes, total, file_offset) != 0) goto out;
+	p = frame_bytes;
+	stored_crc = read_u32_le(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len + tag_len);
+	calc_crc = recorder_crc32(p, SEGMENT_FRAME_HEADER_SIZE) ^ recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE, frame.stored_len);
+	if (reader->encrypted) calc_crc ^= recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len, SEGMENT_GCM_TAG_SIZE);
+	if (stored_crc != calc_crc) { errno = EIO; goto out; }
+	if (reader->header.dict_len) dict_bytes = reader->metadata + reader->data_offset - reader->header.dict_len;
+	payload = p + SEGMENT_FRAME_HEADER_SIZE;
+	if (reader->encrypted) {
+		unsigned char nonce[SEGMENT_GCM_NONCE_SIZE]; unsigned int i;
+		if (!(decrypted = malloc(frame.stored_len ? frame.stored_len : 1))) goto out;
+		memcpy(nonce, reader->encryption.nonce_prefix, SEGMENT_NONCE_PREFIX_SIZE);
+		for (i = 0; i < 8; i++) nonce[SEGMENT_NONCE_PREFIX_SIZE + i] = (unsigned char)(frame_index >> (56 - i * 8));
+		if (recorder_crypto_aes_gcm_decrypt(reader->dek, nonce, p, SEGMENT_FRAME_HEADER_SIZE, payload,
+			frame.stored_len, p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len, decrypted) != 0) { errno = EIO; goto out; }
+		payload = decrypted;
+	}
+	if (decompress_payload(&reader->header, dict_bytes, &frame, payload, &chunk, &chunk_size) < 0) goto out;
+	verify = (reader->header.flags & SEGMENT_FLAG_COMPACT_ENTRIES) ? journal_DefaultChunk_verify_as_root(chunk, chunk_size) : journal_Chunk_verify_as_root(chunk, chunk_size);
+	if (verify != flatcc_verify_ok) goto out;
+	rc = cb(&reader->header, &frame, chunk, chunk_size, ctx);
+out:
+	free(chunk); free(decrypted); free(frame_bytes);
+	return rc;
 }
 
 int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
