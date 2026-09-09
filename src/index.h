@@ -20,6 +20,8 @@ typedef struct {
 	uint32_t entry_count;
 } IndexFrame;
 
+typedef int (*index_frame_cb)(const IndexFrame *frame, void *userdata);
+
 int index_writer_open(const char *path, uint64_t segment_seq, uint32_t flags,
                       IndexWriter **writer_out);
 int index_writer_append(IndexWriter *writer, const SegmentHeader *header,
@@ -31,6 +33,7 @@ void index_writer_abort(IndexWriter *writer, int unlink_path);
 int index_rebuild_for_segment(const char *segment_path, const char *index_path);
 int index_get_frame_count(const char *path, size_t *count_out);
 int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out);
+int index_scan_frames(const char *path, index_frame_cb callback, void *userdata);
 /* Locate the first frame whose realtime range can contain usec. */
 int index_find_realtime_frame(const char *path, uint64_t usec,
 					  IndexFrame *frame_out, size_t *frame_index_out);

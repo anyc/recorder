@@ -349,6 +349,24 @@ int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out
 	return rc;
 }
 
+int index_scan_frames(const char *path, index_frame_cb callback, void *userdata)
+{
+	int fd;
+	size_t count, i;
+	IndexFrame frame;
+	int rc = -1;
+
+	if (!callback || index_open_read(path, &fd, &count) != 0) return -1;
+	for (i = 0; i < count; i++) {
+		if (index_pread_frame(fd, i, &frame) != 0) goto out;
+		if (callback(&frame, userdata) != 0) goto out;
+	}
+	rc = 0;
+out:
+	close(fd);
+	return rc;
+}
+
 int index_find_realtime_frame(const char *path, uint64_t usec,
 					  IndexFrame *frame_out, size_t *frame_index_out)
 {
