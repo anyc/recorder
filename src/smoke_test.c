@@ -601,6 +601,17 @@ int main(void)
 			unlink(segment_path);
 			return 1;
 		}
+		if (unlink(index_path) != 0 || rec_player_seek_head(reader) != 0 ||
+			rec_player_next(reader) != 1 || rec_player_get_data(reader, "MESSAGE", &data,
+				&data_size) != 0 || data_size != strlen("MESSAGE=hello smoke") ||
+			memcmp(data, "MESSAGE=hello smoke", data_size) != 0 ||
+			rec_player_seek_realtime_usec(reader, 1234) != 0 || rec_player_next(reader) != 1 ||
+			index_rebuild_for_segment(segment_path, index_path) != 0) {
+			fprintf(stderr, "smoke: librecorder index fallback failed\n");
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
 		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
 			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
 			data_size != strlen("MESSAGE=hello smoke") ||

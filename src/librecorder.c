@@ -83,6 +83,7 @@ struct IteratorSource {
 	size_t segment_index;
 	size_t frame_count;
 	size_t frame_index;
+	int segment_scan_fallback;
 	StoredEntry *entries;
 	size_t entry_count;
 	size_t entry_capacity;
@@ -1006,6 +1007,7 @@ static int source_load_index(IteratorSource *source)
 {
 	char path[512];
 	source->frame_count = 0;
+	source->segment_scan_fallback = 0;
 	if (source->segment_index >= source->segment_count ||
 		segment_index_path(source->segments[source->segment_index].path, path, sizeof(path)) != 0)
 		return -1;
@@ -1056,15 +1058,39 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	return 0;
 }
 
+static int source_load_segment_fallback(RecorderPlayer *reader, IteratorSource *source,
+									int direction)
+{
+	source_clear_frame(source);
+	if (rec_player_scan_file(reader, source->segments[source->segment_index].path,
+			append_source_entry, source, 0, NULL) != 0) return -1;
+	qsort(source->entries, source->entry_count, sizeof(*source->entries),
+			compare_stored_entries);
+	source->segment_scan_fallback = 1;
+	source->frame_count = 0;
+	source->entry_index = direction > 0 ? 0 : (ssize_t)source->entry_count - 1;
+	return source->entry_count != 0;
+}
+
+static int source_load_segment_edge(RecorderPlayer *reader, IteratorSource *source,
+								 int direction)
+{
+	if (source_load_index(source) == 0) {
+		if (source->frame_count == 0) return 0;
+		if (source_load_frame(reader, source, direction > 0 ? 0 : source->frame_count - 1,
+				direction) == 0 && source->entry_count != 0) return 1;
+	}
+	return source_load_segment_fallback(reader, source, direction);
+}
+
 static int source_position_edge(RecorderPlayer *reader, IteratorSource *source, int direction)
 {
 	if (source->segment_count == 0) return 0;
 	source->segment_index = direction > 0 ? 0 : source->segment_count - 1;
 	for (;;) {
-		if (source_load_index(source) != 0) return -1;
-		if (source->frame_count != 0 &&
-			source_load_frame(reader, source, direction > 0 ? 0 : source->frame_count - 1,
-						  direction) == 0 && source->entry_count != 0) return 1;
+		int rc = source_load_segment_edge(reader, source, direction);
+		if (rc < 0) return -1;
+		if (rc > 0) return 1;
 		if ((direction > 0 && ++source->segment_index >= source->segment_count) ||
 			(direction < 0 && source->segment_index-- == 0)) break;
 	}
@@ -1077,19 +1103,22 @@ static int source_advance(RecorderPlayer *reader, IteratorSource *source, int di
 	source->entry_index += direction;
 	if (source->entry_index >= 0 && source->entry_index < (ssize_t)source->entry_count) return 1;
 	for (;;) {
-		if ((direction > 0 && ++source->frame_index < source->frame_count) ||
-			(direction < 0 && source->frame_index-- > 0)) {
-			if (source_load_frame(reader, source, source->frame_index, direction) != 0) return -1;
+		if (!source->segment_scan_fallback &&
+			((direction > 0 && ++source->frame_index < source->frame_count) ||
+			(direction < 0 && source->frame_index-- > 0))) {
+			if (source_load_frame(reader, source, source->frame_index, direction) == 0 &&
+				source->entry_count != 0) return 1;
+			if (source_load_segment_fallback(reader, source, direction) < 0) return -1;
 			if (source->entry_count != 0) return 1;
 			continue;
 		}
 		if ((direction > 0 && ++source->segment_index >= source->segment_count) ||
 			(direction < 0 && source->segment_index-- == 0)) break;
-		if (source_load_index(source) != 0) return -1;
-		if (source->frame_count == 0) continue;
-		if (source_load_frame(reader, source, direction > 0 ? 0 : source->frame_count - 1,
-						 direction) != 0) return -1;
-		if (source->entry_count != 0) return 1;
+		{
+			int rc = source_load_segment_edge(reader, source, direction);
+			if (rc < 0) return -1;
+			if (rc > 0) return 1;
+		}
 	}
 	source_clear_frame(source);
 	return 0;
@@ -1107,10 +1136,18 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 		IndexFrame frame;
 		size_t frame_index;
 		size_t j;
-		if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0)
-			return -1;
-		if (index_find_realtime_frame(index_path, usec, &frame, &frame_index) != 0)
+		if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
+			index_find_realtime_frame(index_path, usec, &frame, &frame_index) != 0) {
+			source->segment_index = i;
+			if (source_load_segment_fallback(reader, source, 1) < 0) return -1;
+			for (j = 0; j < source->entry_count; j++) {
+				if (source->entries[j].entry.realtime_ts >= usec) {
+					source->entry_index = (ssize_t)j;
+					return 0;
+				}
+			}
 			continue;
+		}
 		source->segment_index = i;
 		if (source_load_index(source) != 0 ||
 			source_load_frame(reader, source, frame_index, 1) != 0) return -1;
