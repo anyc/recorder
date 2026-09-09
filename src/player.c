@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include "librecorder.h"
+#include "index.h"
 #include "segment.h"
 
 #define FOLLOW_INITIAL_ENTRY_COUNT 10
@@ -58,6 +59,8 @@ typedef struct {
 	const char *boot_filter;
 	const char *since_arg;
 	const char *until_arg;
+	const char *since_cursor;
+	const char *until_cursor;
 	const char *encryption_private_key;
 	const char *boot_id_filter;
 	uint32_t boot_seq_filter;
@@ -70,6 +73,7 @@ typedef struct {
 	uint64_t follow_start_ts;
 	int list_boots;
 	int disk_usage;
+	int stats;
 	int sanitize_output;
 } PlayerOptions;
 
@@ -82,6 +86,20 @@ typedef struct {
 	char name[256];
 	uint64_t bytes;
 } DiskUsageGroup;
+
+typedef struct {
+	char name[64];
+	uint64_t count;
+	uint64_t first_realtime_ts;
+	uint64_t last_realtime_ts;
+} StatsGroup;
+
+typedef struct {
+	StatsGroup *groups;
+	size_t group_count;
+	size_t group_capacity;
+	uint64_t total_count;
+} StatsContext;
 
 static int compare_disk_usage_groups(const void *left, const void *right)
 {
@@ -351,6 +369,156 @@ static void format_realtime_full(uint64_t realtime_ts, char *buf, size_t bufsz)
 	}
 }
 
+static int compare_stats_groups(const void *left, const void *right)
+{
+	const StatsGroup *a = left;
+	const StatsGroup *b = right;
+	return strcmp(a->name, b->name);
+}
+
+typedef struct {
+    StatsContext *stats;
+    const char *group_name;
+} StatsIndexContext;
+
+static int collect_stats_frame(const IndexFrame *frame, void *userdata)
+{
+    StatsIndexContext *context = userdata;
+    StatsGroup *group = NULL;
+    size_t i;
+
+    if (frame->entry_count == 0) return 0;
+    for (i = 0; i < context->stats->group_count; i++) {
+        if (strcmp(context->stats->groups[i].name, context->group_name) == 0) {
+            group = &context->stats->groups[i];
+            break;
+        }
+    }
+    if (!group) {
+        if (context->stats->group_count == context->stats->group_capacity) {
+            size_t capacity = context->stats->group_capacity ?
+                context->stats->group_capacity * 2 : 8;
+            StatsGroup *groups = realloc(context->stats->groups, capacity * sizeof(*groups));
+            if (!groups) return -1;
+            context->stats->groups = groups;
+            context->stats->group_capacity = capacity;
+        }
+        group = &context->stats->groups[context->stats->group_count++];
+        memset(group, 0, sizeof(*group));
+        if (snprintf(group->name, sizeof(group->name), "%s", context->group_name) >=
+            (int)sizeof(group->name)) return -1;
+    }
+    if (group->count == 0 || frame->min_realtime_ts < group->first_realtime_ts)
+        group->first_realtime_ts = frame->min_realtime_ts;
+    if (group->count == 0 || frame->max_realtime_ts > group->last_realtime_ts)
+        group->last_realtime_ts = frame->max_realtime_ts;
+    group->count += frame->entry_count;
+    context->stats->total_count += frame->entry_count;
+    return 0;
+}
+
+static int stats_scan_index(const char *path, const char *group, StatsContext *stats)
+{
+    StatsIndexContext context = { .stats = stats, .group_name = group };
+    return index_scan_frames(path, collect_stats_frame, &context);
+}
+
+static int stats_scan_directory(const char *path, const char *group, StatsContext *stats)
+{
+    DIR *dir = opendir(path);
+    struct dirent *de;
+    int rc = -1;
+
+    if (!dir) return -1;
+    while ((de = readdir(dir)) != NULL) {
+        char child[512];
+        size_t len = strlen(de->d_name);
+        struct stat st;
+        if (len < 5 || strcmp(de->d_name + len - 4, ".idx") != 0 ||
+            snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
+            stat(child, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+        if (stats_scan_index(child, group, stats) != 0) goto out;
+    }
+    rc = 0;
+out:
+    closedir(dir);
+    return rc;
+}
+
+static int scan_stats_path(const char *path, int is_directory, StatsContext *stats)
+{
+    if (!is_directory) {
+        char index_path[512];
+        size_t len = strlen(path);
+        if (len < 5 || strcmp(path + len - 4, ".seg") != 0 ||
+            snprintf(index_path, sizeof(index_path), "%.*s.idx", (int)(len - 4), path) >=
+                (int)sizeof(index_path)) return -1;
+        return stats_scan_index(index_path, "-", stats);
+    }
+    {
+        DIR *dir = opendir(path);
+        struct dirent *de;
+        int rc = -1;
+        if (!dir) return -1;
+        while ((de = readdir(dir)) != NULL) {
+            char child[512];
+            struct stat st;
+            size_t len = strlen(de->d_name);
+            if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
+                stat(child, &st) != 0) continue;
+            if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name)) {
+                if (stats_scan_directory(child, de->d_name, stats) != 0) goto out;
+            } else if (S_ISREG(st.st_mode) && len >= 5 &&
+                strcmp(de->d_name + len - 4, ".idx") == 0 &&
+                stats_scan_index(child, "-", stats) != 0) goto out;
+        }
+        rc = 0;
+out:
+        closedir(dir);
+        return rc;
+    }
+}
+
+static int print_stats(const PlayerOptions *opts)
+{
+	RecorderPlayer *reader = NULL;
+	StatsContext stats = { 0 };
+	size_t i, label_width = strlen("Group"), count_width = strlen("Lines");
+	char count[32];
+	int rc = 1;
+
+	if (rec_player_open(&reader, opts->path) != 0) goto out;
+	if (opts->encryption_private_key &&
+		rec_player_set_private_key(reader, opts->encryption_private_key) != 0) goto out;
+	if (scan_stats_path(opts->path, opts->dir_path != NULL || opts->file_path == NULL,
+			&stats) != 0) {
+		fprintf(stderr, "player: failed to scan log statistics\n");
+		goto out;
+	}
+	qsort(stats.groups, stats.group_count, sizeof(*stats.groups), compare_stats_groups);
+	for (i = 0; i < stats.group_count; i++) {
+		size_t width = (size_t)snprintf(count, sizeof(count), "%" PRIu64, stats.groups[i].count);
+		if (strlen(stats.groups[i].name) > label_width) label_width = strlen(stats.groups[i].name);
+		if (width > count_width) count_width = width;
+	}
+	printf("%-*s %*s  %-19s  %-19s\n", (int)label_width, "Group", (int)count_width,
+		"Lines", "First entry", "Last entry");
+	for (i = 0; i < stats.group_count; i++) {
+		char first[32], last[32];
+		format_realtime_full(stats.groups[i].first_realtime_ts, first, sizeof(first));
+		format_realtime_full(stats.groups[i].last_realtime_ts, last, sizeof(last));
+		printf("%-*s %*" PRIu64 "  %-19s  %-19s\n", (int)label_width,
+			stats.groups[i].name, (int)count_width, stats.groups[i].count, first, last);
+	}
+	printf("\n%-*s %*" PRIu64 "\n", (int)label_width, "Total", (int)count_width,
+		stats.total_count);
+	rc = 0;
+out:
+	free(stats.groups);
+	rec_player_close(reader);
+	return rc;
+}
+
 static int parse_datetime_fields(const char *text, struct tm *tm)
 {
 	int year;
@@ -418,6 +586,11 @@ static int parse_time_arg(const char *text, uint64_t *value_out)
 	}
 	*value_out = (uint64_t)sec * 1000000ull;
 	return 0;
+}
+
+static int is_cursor_arg(const char *text)
+{
+	return text && strncmp(text, "rec1:", 5) == 0;
 }
 
 static void free_player_entries(PlayerEntry *entries, size_t count)
@@ -938,6 +1111,27 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		rc = rec_player_scan_follow(reader, print_record, &output,
 								FOLLOW_INITIAL_ENTRY_COUNT);
 		*follow_initialized = 1;
+	} else if (opts->since_cursor || opts->until_cursor) {
+		int reached_until = 0;
+		const RecorderEntry *entry;
+
+		rc = opts->since_cursor ? rec_player_seek_cursor(reader, opts->since_cursor) :
+			rec_player_seek_head(reader);
+		if (rc == 0) {
+			while ((rc = rec_player_next(reader)) > 0) {
+				if (rec_player_get_entry(reader, &entry) != 0 ||
+					print_record(entry, &output) != 0) {
+					rc = -1;
+					break;
+				}
+				if (opts->until_cursor && rec_player_test_cursor(reader, opts->until_cursor) == 1) {
+					reached_until = 1;
+					rc = 0;
+					break;
+				}
+			}
+		}
+		if (rc == 0 && opts->until_cursor && !reached_until) rc = -1;
 	} else {
 		rc = rec_player_scan_all(reader, print_record, &output);
 	}
@@ -1025,12 +1219,12 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
 			prog);
-	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, or YYYY-MM-DD HH:MM[:SS]\n");
+	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, YYYY-MM-DD HH:MM[:SS], or a rec1: cursor\n");
 }
 
 static int parse_options(int argc, char **argv, PlayerOptions *opts)
@@ -1076,6 +1270,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->list_boots = 1;
 		} else if (strcmp(arg, "--disk-usage") == 0) {
 			opts->disk_usage = 1;
+		} else if (strcmp(arg, "--stats") == 0) {
+			opts->stats = 1;
 		} else if (strcmp(arg, "--sanitize-output") == 0) {
 			opts->sanitize_output = 1;
 		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
@@ -1108,21 +1304,32 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	if (opts->dir_path && opts->file_path) {
 		return -1;
 	}
+	if ((opts->disk_usage + opts->stats + opts->list_boots > 1) ||
+		(opts->stats && opts->follow) ||
+		(opts->follow && (is_cursor_arg(opts->since_arg) || is_cursor_arg(opts->until_arg)))) {
+		return -1;
+	}
 	opts->path = opts->file_path ? opts->file_path :
 					(opts->dir_path ? opts->dir_path : LOG_DIR);
 	if (opts->since_arg) {
-		if (parse_time_arg(opts->since_arg, &opts->since_ts) != 0) {
+		if (is_cursor_arg(opts->since_arg)) {
+			opts->since_cursor = opts->since_arg;
+		} else if (parse_time_arg(opts->since_arg, &opts->since_ts) != 0) {
 			fprintf(stderr, "player: invalid --since value: %s\n", opts->since_arg);
 			return -1;
+		} else {
+			opts->have_since = 1;
 		}
-		opts->have_since = 1;
 	}
 	if (opts->until_arg) {
-		if (parse_time_arg(opts->until_arg, &opts->until_ts) != 0) {
+		if (is_cursor_arg(opts->until_arg)) {
+			opts->until_cursor = opts->until_arg;
+		} else if (parse_time_arg(opts->until_arg, &opts->until_ts) != 0) {
 			fprintf(stderr, "player: invalid --until value: %s\n", opts->until_arg);
 			return -1;
+		} else {
+			opts->have_until = 1;
 		}
-		opts->have_until = 1;
 	}
 	if (opts->have_since && opts->have_until && opts->since_ts > opts->until_ts) {
 		fprintf(stderr, "player: --since is after --until\n");
@@ -1156,6 +1363,9 @@ int main(int argc, char **argv)
 	}
 	if (opts.list_boots) {
 		return print_boots(&opts);
+	}
+	if (opts.stats) {
+		return print_stats(&opts);
 	}
 	if (resolve_boot_filter(&opts) != 0) {
 		return 1;
