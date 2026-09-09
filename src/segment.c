@@ -765,27 +765,78 @@ out:
 	return rv;
 }
 
-typedef struct {
-	segment_frame_cb callback;
-	void *userdata;
-} SingleFrameContext;
-
-static int scan_single_frame(const SegmentHeader *header, const SegmentFrameInfo *frame,
-					 const void *chunk_buf, size_t chunk_size, void *userdata)
-{
-	SingleFrameContext *ctx = userdata;
-	int rc = ctx->callback(header, frame, chunk_buf, chunk_size, ctx->userdata);
-	return rc != 0 ? rc : 1; /* Stop after the requested frame. */
-}
-
 int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
-					segment_frame_cb cb, void *ctx, size_t file_offset)
+					segment_frame_cb cb, void *ctx, size_t file_offset,
+					uint64_t frame_index)
 {
-	SingleFrameContext single = { .callback = cb, .userdata = ctx };
-	int rc;
+	int fd = -1;
+	struct stat st;
+	void *map = MAP_FAILED;
+	SegmentHeader header;
+	SegmentEncryptionInfo encryption;
+	SegmentFrameInfo frame;
+	unsigned char dek[SEGMENT_DEK_SIZE] = { 0 };
+	const unsigned char *p;
+	const unsigned char *dict_bytes = NULL;
+	const void *payload;
+	void *decrypted_payload = NULL;
+	void *chunk_buf = NULL;
+	size_t data_offset, expected_len, chunk_size;
+	uint32_t tag_len, total_len, stored_crc, calc_crc;
+	int encrypted, verify_rv, rc = -1;
 
-	if (!cb) return -1;
-	rc = segment_scan_path_from_offset(path, decryptor, scan_single_frame, &single,
-							   file_offset, NULL, NULL, NULL);
-	return rc == 1 ? 0 : rc;
+	if (!path || !cb || (fd = open(path, O_RDONLY)) < 0 || fstat(fd, &st) != 0 ||
+		st.st_size == 0 || (uintmax_t)st.st_size > SIZE_MAX) goto out;
+	map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
+	if (map == MAP_FAILED || segment_parse_header(map, (size_t)st.st_size, &header,
+			&data_offset, &encryption) != 0 || file_offset < data_offset ||
+		file_offset > (size_t)st.st_size - SEGMENT_FRAME_HEADER_SIZE - 4) goto out;
+	encrypted = (header.flags & SEGMENT_FLAG_ENCRYPTED) != 0;
+	tag_len = encrypted ? SEGMENT_GCM_TAG_SIZE : 0;
+	p = (const unsigned char *)map + file_offset;
+	frame.flags = read_u32_le(p);
+	frame.stored_len = read_u32_le(p + 4);
+	frame.uncompressed_len = read_u32_le(p + 8);
+	total_len = read_u32_le(p + 12);
+	frame.file_offset = file_offset;
+	frame.frame_len = total_len;
+	expected_len = SEGMENT_FRAME_HEADER_SIZE + (size_t)frame.stored_len + tag_len + 4;
+	if (expected_len > UINT32_MAX || total_len != expected_len || total_len >
+		(size_t)st.st_size - file_offset) { errno = EIO; goto out; }
+	stored_crc = read_u32_le(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len + tag_len);
+	calc_crc = recorder_crc32(p, SEGMENT_FRAME_HEADER_SIZE) ^
+		recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE, frame.stored_len);
+	if (encrypted) calc_crc ^= recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len,
+		SEGMENT_GCM_TAG_SIZE);
+	if (stored_crc != calc_crc) { errno = EIO; goto out; }
+	if (header.dict_len != 0) dict_bytes = (const unsigned char *)map + data_offset - header.dict_len;
+	payload = p + SEGMENT_FRAME_HEADER_SIZE;
+	if (encrypted) {
+		unsigned char nonce[SEGMENT_GCM_NONCE_SIZE];
+		unsigned int i;
+		if (!decryptor || recorder_crypto_unwrap_dek(decryptor->private_key,
+			encryption.wrapped_dek, encryption.wrapped_dek_len, dek) != 0) { errno = EACCES; goto out; }
+		decrypted_payload = malloc(frame.stored_len ? frame.stored_len : 1);
+		if (!decrypted_payload) goto out;
+		memcpy(nonce, encryption.nonce_prefix, SEGMENT_NONCE_PREFIX_SIZE);
+		for (i = 0; i < 8; i++) nonce[SEGMENT_NONCE_PREFIX_SIZE + i] =
+			(unsigned char)(frame_index >> (56 - i * 8));
+		if (recorder_crypto_aes_gcm_decrypt(dek, nonce, p, SEGMENT_FRAME_HEADER_SIZE,
+			payload, frame.stored_len, p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len,
+			decrypted_payload) != 0) { errno = EIO; goto out; }
+		payload = decrypted_payload;
+	}
+	if (decompress_payload(&header, dict_bytes, &frame, payload, &chunk_buf, &chunk_size) < 0) goto out;
+	verify_rv = (header.flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0 ?
+		journal_DefaultChunk_verify_as_root(chunk_buf, chunk_size) :
+		journal_Chunk_verify_as_root(chunk_buf, chunk_size);
+	if (verify_rv != flatcc_verify_ok) goto out;
+	rc = cb(&header, &frame, chunk_buf, chunk_size, ctx);
+out:
+	free(chunk_buf);
+	free(decrypted_payload);
+	recorder_crypto_cleanse(dek, sizeof(dek));
+	if (map != MAP_FAILED) munmap(map, st.st_size);
+	if (fd >= 0) close(fd);
+	return rc;
 }

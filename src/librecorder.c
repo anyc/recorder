@@ -1049,7 +1049,7 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	if (segment_index_path(segment->path, index_path, sizeof(index_path)) != 0 ||
 		index_read_frame(index_path, frame_index, &frame) != 0) return -1;
 	if (segment_scan_path_frame(segment->path, reader->decryptor, scan_source_frame,
-							&context, frame.file_offset) != 0)
+							&context, frame.file_offset, frame_index) != 0)
 		return -1;
 	source->frame_index = frame_index;
 	source->entry_index = direction > 0 ? 0 : (ssize_t)source->entry_count - 1;
