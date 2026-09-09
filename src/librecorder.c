@@ -84,6 +84,8 @@ struct IteratorSource {
 	size_t frame_count;
 	size_t frame_index;
 	int segment_scan_fallback;
+	IndexReader *index_reader;
+	char index_reader_path[512];
 	SegmentFrameReader *frame_reader;
 	char frame_reader_path[512];
 	StoredEntry *entries;
@@ -972,6 +974,7 @@ static void iterator_reset(RecorderPlayer *reader)
 	size_t i;
 	for (i = 0; i < reader->source_count; i++) {
 		source_clear_frame(&reader->sources[i]);
+		index_reader_close(reader->sources[i].index_reader);
 		segment_frame_reader_close(reader->sources[i].frame_reader);
 		free(reader->sources[i].segments);
 	}
@@ -1014,7 +1017,15 @@ static int source_load_index(IteratorSource *source)
 	if (source->segment_index >= source->segment_count ||
 		segment_index_path(source->segments[source->segment_index].path, path, sizeof(path)) != 0)
 		return -1;
-	return index_get_frame_count(path, &source->frame_count);
+	if (!source->index_reader || strcmp(source->index_reader_path, path) != 0) {
+		index_reader_close(source->index_reader);
+		source->index_reader = NULL;
+		if (index_reader_open(path, &source->index_reader) != 0 ||
+			snprintf(source->index_reader_path, sizeof(source->index_reader_path), "%s", path) >=
+				(int)sizeof(source->index_reader_path)) return -1;
+	}
+	source->frame_count = index_reader_frame_count(source->index_reader);
+	return 0;
 }
 
 typedef struct { IteratorSource *source; } SourceFrameContext;
@@ -1046,13 +1057,12 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	SourceFrameContext context = { .source = source };
 	const SegmentPath *segment;
 	IndexFrame frame;
-	char index_path[512];
 
 	if (frame_index >= source->frame_count) return -1;
 	source_clear_frame(source);
 	segment = &source->segments[source->segment_index];
-	if (segment_index_path(segment->path, index_path, sizeof(index_path)) != 0 ||
-		index_read_frame(index_path, frame_index, &frame) != 0) return -1;
+	if (!source->index_reader || index_reader_read_frame(source->index_reader, frame_index,
+			&frame) != 0) return -1;
 	if (!source->frame_reader || strcmp(source->frame_reader_path, segment->path) != 0) {
 		segment_frame_reader_close(source->frame_reader);
 		source->frame_reader = NULL;

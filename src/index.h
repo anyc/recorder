@@ -6,6 +6,7 @@
 #include "segment.h"
 
 typedef struct IndexWriter IndexWriter;
+typedef struct IndexReader IndexReader;
 
 /* One record per committed segment frame.  The reader owns the returned
  * array from index_read_frames(). */
@@ -33,6 +34,10 @@ void index_writer_abort(IndexWriter *writer, int unlink_path);
 int index_rebuild_for_segment(const char *segment_path, const char *index_path);
 int index_get_frame_count(const char *path, size_t *count_out);
 int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out);
+int index_reader_open(const char *path, IndexReader **reader_out);
+void index_reader_close(IndexReader *reader);
+size_t index_reader_frame_count(const IndexReader *reader);
+int index_reader_read_frame(IndexReader *reader, size_t frame_index, IndexFrame *frame_out);
 int index_scan_frames(const char *path, index_frame_cb callback, void *userdata);
 /* Locate the first frame whose realtime range can contain usec. */
 int index_find_realtime_frame(const char *path, uint64_t usec,

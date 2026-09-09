@@ -32,6 +32,11 @@ struct IndexWriter {
 	uint64_t record_count;
 };
 
+struct IndexReader {
+	int fd;
+	size_t frame_count;
+};
+
 static int append_index_frame_cb(const SegmentHeader *header,
 							 const SegmentFrameInfo *frame,
 							 const void *chunk_buf, size_t chunk_size, void *ctx)
@@ -328,6 +333,38 @@ static int index_pread_frame(int fd, size_t index, IndexFrame *frame)
 	if (pread(fd, record, sizeof(record), offset) != (ssize_t)sizeof(record)) return -1;
 	decode_index_frame(record, frame);
 	return 0;
+}
+
+int index_reader_open(const char *path, IndexReader **reader_out)
+{
+	IndexReader *reader;
+
+	if (!reader_out || !(reader = calloc(1, sizeof(*reader)))) return -1;
+	reader->fd = -1;
+	if (index_open_read(path, &reader->fd, &reader->frame_count) != 0) {
+		free(reader);
+		return -1;
+	}
+	*reader_out = reader;
+	return 0;
+}
+
+void index_reader_close(IndexReader *reader)
+{
+	if (!reader) return;
+	if (reader->fd >= 0) close(reader->fd);
+	free(reader);
+}
+
+size_t index_reader_frame_count(const IndexReader *reader)
+{
+	return reader ? reader->frame_count : 0;
+}
+
+int index_reader_read_frame(IndexReader *reader, size_t frame_index, IndexFrame *frame_out)
+{
+	if (!reader || !frame_out || frame_index >= reader->frame_count) return -1;
+	return index_pread_frame(reader->fd, frame_index, frame_out);
 }
 
 int index_get_frame_count(const char *path, size_t *count_out)
