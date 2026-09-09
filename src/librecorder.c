@@ -81,7 +81,6 @@ struct IteratorSource {
 	size_t segment_count;
 	size_t segment_capacity;
 	size_t segment_index;
-	IndexFrame *frames;
 	size_t frame_count;
 	size_t frame_index;
 	StoredEntry *entries;
@@ -970,7 +969,6 @@ static void iterator_reset(RecorderPlayer *reader)
 	size_t i;
 	for (i = 0; i < reader->source_count; i++) {
 		source_clear_frame(&reader->sources[i]);
-		free(reader->sources[i].frames);
 		free(reader->sources[i].segments);
 	}
 	free(reader->sources);
@@ -1007,13 +1005,11 @@ static int segment_index_path(const char *segment_path, char *index_path, size_t
 static int source_load_index(IteratorSource *source)
 {
 	char path[512];
-	free(source->frames);
-	source->frames = NULL;
 	source->frame_count = 0;
 	if (source->segment_index >= source->segment_count ||
 		segment_index_path(source->segments[source->segment_index].path, path, sizeof(path)) != 0)
 		return -1;
-	return index_read_frames(path, &source->frames, &source->frame_count);
+	return index_get_frame_count(path, &source->frame_count);
 }
 
 typedef struct { IteratorSource *source; } SourceFrameContext;
@@ -1044,12 +1040,16 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 {
 	SourceFrameContext context = { .source = source };
 	const SegmentPath *segment;
+	IndexFrame frame;
+	char index_path[512];
 
 	if (frame_index >= source->frame_count) return -1;
 	source_clear_frame(source);
 	segment = &source->segments[source->segment_index];
+	if (segment_index_path(segment->path, index_path, sizeof(index_path)) != 0 ||
+		index_read_frame(index_path, frame_index, &frame) != 0) return -1;
 	if (segment_scan_path_frame(segment->path, reader->decryptor, scan_source_frame,
-							&context, source->frames[frame_index].file_offset) != 0)
+							&context, frame.file_offset) != 0)
 		return -1;
 	source->frame_index = frame_index;
 	source->entry_index = direction > 0 ? 0 : (ssize_t)source->entry_count - 1;
@@ -1101,8 +1101,6 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 	size_t i;
 
 	source_clear_frame(source);
-	free(source->frames);
-	source->frames = NULL;
 	source->frame_count = 0;
 	for (i = 0; i < source->segment_count; i++) {
 		char index_path[512];

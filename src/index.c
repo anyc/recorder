@@ -330,59 +330,23 @@ static int index_pread_frame(int fd, size_t index, IndexFrame *frame)
 	return 0;
 }
 
-int index_read_frames(const char *path, IndexFrame **frames_out, size_t *count_out)
+int index_get_frame_count(const char *path, size_t *count_out)
 {
-	unsigned char header[RECORDER_INDEX_HEADER_SIZE];
-	unsigned char record[RECORDER_INDEX_RECORD_SIZE];
-	FILE *fp = NULL;
-	long size;
-	uint64_t count;
-	IndexFrame *frames = NULL;
-	size_t i;
-
-	if (!path || !frames_out || !count_out) return -1;
-	*frames_out = NULL;
-	*count_out = 0;
-	fp = fopen(path, "rb");
-	if (!fp || fread(header, 1, sizeof(header), fp) != sizeof(header) ||
-		memcmp(header, RECORDER_INDEX_MAGIC, 8) != 0 ||
-		read_u32_le(header + 8) != RECORDER_INDEX_VERSION ||
-		fseek(fp, 0, SEEK_END) != 0 || (size = ftell(fp)) < RECORDER_INDEX_HEADER_SIZE) {
-		if (fp) fclose(fp);
-		return -1;
-	}
-	/* A live index has no footer yet.  Ignore a partial final record. */
-	count = ((uint64_t)size - RECORDER_INDEX_HEADER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
-	if (size >= RECORDER_INDEX_HEADER_SIZE + RECORDER_INDEX_FOOTER_SIZE) {
-		unsigned char footer[RECORDER_INDEX_FOOTER_SIZE];
-		if (fseek(fp, size - RECORDER_INDEX_FOOTER_SIZE, SEEK_SET) == 0 &&
-			fread(footer, 1, sizeof(footer), fp) == sizeof(footer) &&
-			memcmp(footer, RECORDER_INDEX_FOOTER_MAGIC, 8) == 0) {
-			uint64_t footer_count = read_u64_le(footer + 8);
-			uint64_t available = ((uint64_t)size - RECORDER_INDEX_HEADER_SIZE -
-				RECORDER_INDEX_FOOTER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
-			if (footer_count > available) { fclose(fp); return -1; }
-			count = footer_count;
-		}
-	}
-	if (count > SIZE_MAX / sizeof(*frames)) { fclose(fp); return -1; }
-	if (count != 0 && !(frames = calloc((size_t)count, sizeof(*frames)))) {
-		fclose(fp);
-		return -1;
-	}
-	if (fseek(fp, RECORDER_INDEX_HEADER_SIZE, SEEK_SET) != 0) goto fail;
-	for (i = 0; i < (size_t)count; i++) {
-		if (fread(record, 1, sizeof(record), fp) != sizeof(record)) goto fail;
-		decode_index_frame(record, &frames[i]);
-	}
-	fclose(fp);
-	*frames_out = frames;
-	*count_out = (size_t)count;
+	int fd;
+	if (!count_out || index_open_read(path, &fd, count_out) != 0) return -1;
+	close(fd);
 	return 0;
-fail:
-	free(frames);
-	fclose(fp);
-	return -1;
+}
+
+int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out)
+{
+	int fd;
+	size_t count;
+	int rc;
+	if (!frame_out || index_open_read(path, &fd, &count) != 0) return -1;
+	rc = frame_index < count ? index_pread_frame(fd, frame_index, frame_out) : -1;
+	close(fd);
+	return rc;
 }
 
 int index_find_realtime_frame(const char *path, uint64_t usec,
