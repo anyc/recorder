@@ -765,51 +765,64 @@ out:
 	return rv;
 }
 
+static int pread_exact(int fd, void *buf, size_t size, off_t offset)
+{
+	return pread(fd, buf, size, offset) == (ssize_t)size ? 0 : -1;
+}
+
 int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
 					segment_frame_cb cb, void *ctx, size_t file_offset,
 					uint64_t frame_index)
 {
 	int fd = -1;
 	struct stat st;
-	void *map = MAP_FAILED;
 	SegmentHeader header;
 	SegmentEncryptionInfo encryption;
 	SegmentFrameInfo frame;
+	unsigned char fixed[SEGMENT_HEADER_FIXED_SIZE];
+	unsigned char frame_header[SEGMENT_FRAME_HEADER_SIZE];
 	unsigned char dek[SEGMENT_DEK_SIZE] = { 0 };
-	const unsigned char *p;
-	const unsigned char *dict_bytes = NULL;
+	unsigned char *metadata = NULL, *frame_bytes = NULL;
+	const unsigned char *p, *dict_bytes = NULL;
 	const void *payload;
-	void *decrypted_payload = NULL;
-	void *chunk_buf = NULL;
-	size_t data_offset, expected_len, chunk_size;
-	uint32_t tag_len, total_len, stored_crc, calc_crc;
+	void *decrypted_payload = NULL, *chunk_buf = NULL;
+	size_t metadata_size, data_offset, expected_len, chunk_size;
+	uint32_t header_size, tag_len, total_len, stored_crc, calc_crc;
 	int encrypted, verify_rv, rc = -1;
 
 	if (!path || !cb || (fd = open(path, O_RDONLY)) < 0 || fstat(fd, &st) != 0 ||
-		st.st_size == 0 || (uintmax_t)st.st_size > SIZE_MAX) goto out;
-	map = mmap(NULL, st.st_size, PROT_READ, MAP_PRIVATE, fd, 0);
-	if (map == MAP_FAILED || segment_parse_header(map, (size_t)st.st_size, &header,
-			&data_offset, &encryption) != 0 || file_offset < data_offset ||
-		file_offset > (size_t)st.st_size - SEGMENT_FRAME_HEADER_SIZE - 4) goto out;
+		st.st_size < SEGMENT_HEADER_FIXED_SIZE || (uintmax_t)st.st_size > SIZE_MAX ||
+		pread_exact(fd, fixed, sizeof(fixed), 0) != 0) goto out;
+	header_size = read_u32_le(fixed + 12);
+	if (header_size < SEGMENT_HEADER_FIXED_SIZE || header_size > (uint64_t)st.st_size ||
+		read_u32_le(fixed + 144) > (uint64_t)st.st_size - header_size) goto out;
+	metadata_size = header_size + read_u32_le(fixed + 144);
+	metadata = malloc(metadata_size);
+	if (!metadata || pread_exact(fd, metadata, metadata_size, 0) != 0 ||
+		segment_parse_header(metadata, metadata_size, &header, &data_offset, &encryption) != 0 ||
+		file_offset < data_offset || file_offset > (size_t)st.st_size - SEGMENT_FRAME_HEADER_SIZE - 4 ||
+		pread_exact(fd, frame_header, sizeof(frame_header), file_offset) != 0) goto out;
 	encrypted = (header.flags & SEGMENT_FLAG_ENCRYPTED) != 0;
 	tag_len = encrypted ? SEGMENT_GCM_TAG_SIZE : 0;
-	p = (const unsigned char *)map + file_offset;
-	frame.flags = read_u32_le(p);
-	frame.stored_len = read_u32_le(p + 4);
-	frame.uncompressed_len = read_u32_le(p + 8);
-	total_len = read_u32_le(p + 12);
+	frame.flags = read_u32_le(frame_header);
+	frame.stored_len = read_u32_le(frame_header + 4);
+	frame.uncompressed_len = read_u32_le(frame_header + 8);
+	total_len = read_u32_le(frame_header + 12);
 	frame.file_offset = file_offset;
 	frame.frame_len = total_len;
 	expected_len = SEGMENT_FRAME_HEADER_SIZE + (size_t)frame.stored_len + tag_len + 4;
 	if (expected_len > UINT32_MAX || total_len != expected_len || total_len >
 		(size_t)st.st_size - file_offset) { errno = EIO; goto out; }
+	frame_bytes = malloc(total_len);
+	if (!frame_bytes || pread_exact(fd, frame_bytes, total_len, file_offset) != 0) goto out;
+	p = frame_bytes;
 	stored_crc = read_u32_le(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len + tag_len);
 	calc_crc = recorder_crc32(p, SEGMENT_FRAME_HEADER_SIZE) ^
 		recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE, frame.stored_len);
 	if (encrypted) calc_crc ^= recorder_crc32(p + SEGMENT_FRAME_HEADER_SIZE + frame.stored_len,
 		SEGMENT_GCM_TAG_SIZE);
 	if (stored_crc != calc_crc) { errno = EIO; goto out; }
-	if (header.dict_len != 0) dict_bytes = (const unsigned char *)map + data_offset - header.dict_len;
+	if (header.dict_len != 0) dict_bytes = metadata + data_offset - header.dict_len;
 	payload = p + SEGMENT_FRAME_HEADER_SIZE;
 	if (encrypted) {
 		unsigned char nonce[SEGMENT_GCM_NONCE_SIZE];
@@ -828,15 +841,15 @@ int segment_scan_path_frame(const char *path, SegmentDecryptor *decryptor,
 	}
 	if (decompress_payload(&header, dict_bytes, &frame, payload, &chunk_buf, &chunk_size) < 0) goto out;
 	verify_rv = (header.flags & SEGMENT_FLAG_COMPACT_ENTRIES) != 0 ?
-		journal_DefaultChunk_verify_as_root(chunk_buf, chunk_size) :
-		journal_Chunk_verify_as_root(chunk_buf, chunk_size);
+		journal_DefaultChunk_verify_as_root(chunk_buf, chunk_size) : journal_Chunk_verify_as_root(chunk_buf, chunk_size);
 	if (verify_rv != flatcc_verify_ok) goto out;
 	rc = cb(&header, &frame, chunk_buf, chunk_size, ctx);
 out:
 	free(chunk_buf);
 	free(decrypted_payload);
+	free(frame_bytes);
+	free(metadata);
 	recorder_crypto_cleanse(dek, sizeof(dek));
-	if (map != MAP_FAILED) munmap(map, st.st_size);
 	if (fd >= 0) close(fd);
 	return rc;
 }
