@@ -1524,10 +1524,20 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 	uint64_t store_id;
 	uint32_t frame_entry_index;
 	char group[64];
+	const RecorderEntry *entry;
 	if (!reader || !reader->have_store_id ||
 		parse_cursor(cursor, &store_id, group, sizeof(group), &segment_seq, &frame_offset,
 			&frame_entry_index) != 0 ||
-		store_id != reader->store_id || iterator_initialize(reader, 1) != 0) return -1;
+		store_id != reader->store_id) return -1;
+	entry = current_entry(reader);
+	if (entry && entry->group && strcmp(entry->group, group) == 0 &&
+		entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
+		entry->frame_entry_index == frame_entry_index) {
+		reader->current_valid = 0;
+		reader->current_entry_ptr = NULL;
+		return 0;
+	}
+	if (iterator_initialize(reader, 1) != 0) return -1;
 	{
 		IteratorSource *source = NULL;
 		size_t i, frame_index;
