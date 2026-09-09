@@ -1,6 +1,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include "helper.h"
@@ -274,6 +276,60 @@ int index_rebuild_for_segment(const char *segment_path, const char *index_path)
 	return 0;
 }
 
+static void decode_index_frame(const unsigned char record[RECORDER_INDEX_RECORD_SIZE],
+					   IndexFrame *frame)
+{
+	frame->file_offset = read_u64_le(record);
+	frame->frame_len = read_u32_le(record + 8);
+	frame->min_realtime_ts = read_u64_le(record + 12);
+	frame->max_realtime_ts = read_u64_le(record + 20);
+	frame->min_monotonic_ts = read_u64_le(record + 28);
+	frame->max_monotonic_ts = read_u64_le(record + 36);
+	frame->priority = record[44];
+	frame->entry_count = read_u32_le(record + 45);
+}
+
+static int index_open_read(const char *path, int *fd_out, size_t *count_out)
+{
+	unsigned char header[RECORDER_INDEX_HEADER_SIZE];
+	unsigned char footer[RECORDER_INDEX_FOOTER_SIZE];
+	struct stat st;
+	int fd;
+	uint64_t count;
+
+	if (!path || !fd_out || !count_out || (fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 ||
+		fstat(fd, &st) != 0 || st.st_size < RECORDER_INDEX_HEADER_SIZE ||
+		pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header) ||
+		memcmp(header, RECORDER_INDEX_MAGIC, 8) != 0 ||
+		read_u32_le(header + 8) != RECORDER_INDEX_VERSION) {
+		if (fd >= 0) close(fd);
+		return -1;
+	}
+	count = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+	if (st.st_size >= RECORDER_INDEX_HEADER_SIZE + RECORDER_INDEX_FOOTER_SIZE &&
+		pread(fd, footer, sizeof(footer), st.st_size - RECORDER_INDEX_FOOTER_SIZE) ==
+			(ssize_t)sizeof(footer) && memcmp(footer, RECORDER_INDEX_FOOTER_MAGIC, 8) == 0) {
+		uint64_t available = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE -
+			RECORDER_INDEX_FOOTER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+		count = read_u64_le(footer + 8);
+		if (count > available) { close(fd); return -1; }
+	}
+	if (count > SIZE_MAX) { close(fd); return -1; }
+	*fd_out = fd;
+	*count_out = (size_t)count;
+	return 0;
+}
+
+static int index_pread_frame(int fd, size_t index, IndexFrame *frame)
+{
+	unsigned char record[RECORDER_INDEX_RECORD_SIZE];
+	off_t offset;
+	offset = RECORDER_INDEX_HEADER_SIZE + (off_t)index * RECORDER_INDEX_RECORD_SIZE;
+	if (pread(fd, record, sizeof(record), offset) != (ssize_t)sizeof(record)) return -1;
+	decode_index_frame(record, frame);
+	return 0;
+}
+
 int index_read_frames(const char *path, IndexFrame **frames_out, size_t *count_out)
 {
 	unsigned char header[RECORDER_INDEX_HEADER_SIZE];
@@ -317,14 +373,7 @@ int index_read_frames(const char *path, IndexFrame **frames_out, size_t *count_o
 	if (fseek(fp, RECORDER_INDEX_HEADER_SIZE, SEEK_SET) != 0) goto fail;
 	for (i = 0; i < (size_t)count; i++) {
 		if (fread(record, 1, sizeof(record), fp) != sizeof(record)) goto fail;
-		frames[i].file_offset = read_u64_le(record);
-		frames[i].frame_len = read_u32_le(record + 8);
-		frames[i].min_realtime_ts = read_u64_le(record + 12);
-		frames[i].max_realtime_ts = read_u64_le(record + 20);
-		frames[i].min_monotonic_ts = read_u64_le(record + 28);
-		frames[i].max_monotonic_ts = read_u64_le(record + 36);
-		frames[i].priority = record[44];
-		frames[i].entry_count = read_u32_le(record + 45);
+		decode_index_frame(record, &frames[i]);
 	}
 	fclose(fp);
 	*frames_out = frames;
@@ -334,4 +383,54 @@ fail:
 	free(frames);
 	fclose(fp);
 	return -1;
+}
+
+int index_find_realtime_frame(const char *path, uint64_t usec,
+					  IndexFrame *frame_out, size_t *frame_index_out)
+{
+	IndexFrame frame;
+	size_t count = 0, lo = 0, hi;
+	int fd;
+	int rc = -1;
+	if (!frame_out || !frame_index_out || index_open_read(path, &fd, &count) != 0) return -1;
+	hi = count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (index_pread_frame(fd, mid, &frame) != 0) goto out;
+		if (frame.max_realtime_ts < usec) lo = mid + 1;
+		else hi = mid;
+	}
+	if (lo < count) {
+		if (index_pread_frame(fd, lo, frame_out) != 0) goto out;
+		*frame_index_out = lo;
+		rc = 0;
+	}
+out:
+	close(fd);
+	return rc;
+}
+
+int index_find_offset_frame(const char *path, uint64_t file_offset,
+					IndexFrame *frame_out, size_t *frame_index_out)
+{
+	IndexFrame frame;
+	size_t count = 0, lo = 0, hi;
+	int fd;
+	int rc = -1;
+	if (!frame_out || !frame_index_out || index_open_read(path, &fd, &count) != 0) return -1;
+	hi = count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (index_pread_frame(fd, mid, &frame) != 0) goto out;
+		if (frame.file_offset < file_offset) lo = mid + 1;
+		else hi = mid;
+	}
+	if (lo < count && index_pread_frame(fd, lo, frame_out) == 0 &&
+		frame_out->file_offset == file_offset) {
+		*frame_index_out = lo;
+		rc = 0;
+	}
+out:
+	close(fd);
+	return rc;
 }
