@@ -49,6 +49,17 @@ make PCRE2=0 LIBC_REGEX=0
 
 This produces `./recorder` and `./player`.
 
+For cursor-pagination performance checks, build `make batch-reader` and run
+`./batch-reader LOG-DIRECTORY`. It seeks to the head, reads 50 entries, then
+seeks to the cursor of the last entry before reading the next batch. Use
+`-b SIZE` to change the batch size. The reported entry count includes the
+cursor entry at every batch boundary because `rec_player_seek_cursor()`
+positions the reader at that entry.
+
+`player --stats` uses sidecar indexes when available and warns before falling
+back to decoding a segment. Recreate a missing index with
+`player --rebuild-index -i PATH/SEGMENT.seg`.
+
 By default, it also builds the versioned shared library
 `./librecorder.so.1.0.0` with SONAME `librecorder.so.1`; `librecorder.so` and
 `librecorder.so.1` are symlinks. To build the static library instead, use:

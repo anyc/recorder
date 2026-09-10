@@ -31,7 +31,8 @@ int index_writer_append(IndexWriter *writer, const SegmentHeader *header,
 int index_writer_close(IndexWriter *writer, uint64_t segment_committed_end);
 void index_writer_abort(IndexWriter *writer, int unlink_path);
 
-int index_rebuild_for_segment(const char *segment_path, const char *index_path);
+int index_rebuild_for_segment(const char *segment_path, const char *index_path,
+				  SegmentDecryptor *decryptor);
 int index_get_frame_count(const char *path, size_t *count_out);
 int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out);
 int index_reader_open(const char *path, IndexReader **reader_out);

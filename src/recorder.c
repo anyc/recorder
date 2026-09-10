@@ -2195,7 +2195,7 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 			build_index_path(idx_path, sizeof(idx_path), dir_name, header.segment_seq);
 			if ((header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 &&
 				(stat(idx_path, &idx_st) != 0 || idx_st.st_mtime < st.st_mtime)) {
-				index_rebuild_for_segment(path, idx_path);
+				index_rebuild_for_segment(path, idx_path, NULL);
 			}
 		}
 	}

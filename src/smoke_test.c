@@ -563,7 +563,7 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
-	if (index_rebuild_for_segment(segment_path, index_path) != 0) {
+	if (index_rebuild_for_segment(segment_path, index_path, NULL) != 0) {
 		fprintf(stderr, "smoke: build reader index failed\n");
 		return 1;
 	}
@@ -601,17 +601,21 @@ int main(void)
 			unlink(segment_path);
 			return 1;
 		}
-		if (unlink(index_path) != 0 || rec_player_seek_head(reader) != 0 ||
-			rec_player_next(reader) != 1 || rec_player_get_data(reader, "MESSAGE", &data,
+		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_get_cursor(reader, &cursor) != 0 || unlink(index_path) != 0 ||
+			rec_player_seek_cursor(reader, cursor) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_get_data(reader, "MESSAGE", &data,
 				&data_size) != 0 || data_size != strlen("MESSAGE=hello smoke") ||
 			memcmp(data, "MESSAGE=hello smoke", data_size) != 0 ||
 			rec_player_seek_realtime_usec(reader, 1234) != 0 || rec_player_next(reader) != 1 ||
-			index_rebuild_for_segment(segment_path, index_path) != 0) {
+			index_rebuild_for_segment(segment_path, index_path, NULL) != 0) {
 			fprintf(stderr, "smoke: librecorder index fallback failed\n");
 			rec_player_close(reader);
 			unlink(segment_path);
 			return 1;
 		}
+		free(cursor);
+		cursor = NULL;
 		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
 			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
 			data_size != strlen("MESSAGE=hello smoke") ||
@@ -660,7 +664,7 @@ int main(void)
 			if (rec_player_seek_tail(reader) != 0 || rec_player_next(reader) != 0 ||
 				read_file(segment_path, &segment_copy, &segment_copy_size) != 0 ||
 				write_file(second_segment_path, segment_copy, segment_copy_size) != 0 ||
-				index_rebuild_for_segment(second_segment_path, second_index_path) != 0 ||
+			index_rebuild_for_segment(second_segment_path, second_index_path, NULL) != 0 ||
 				poll(&pfd, 1, 1000) <= 0 ||
 				rec_player_process(reader) == RECORDER_PROCESS_NOP ||
 				rec_player_next(reader) != 1 ||

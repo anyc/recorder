@@ -1194,6 +1194,52 @@ static int iterator_seek_realtime(RecorderPlayer *reader, uint64_t usec)
 	return 0;
 }
 
+static int source_seek_cursor(RecorderPlayer *reader, IteratorSource *source,
+				  uint64_t segment_seq, uint64_t frame_offset,
+				  uint32_t frame_entry_index, uint64_t *realtime_ts_out)
+{
+	IndexFrame frame;
+	char index_path[512];
+	size_t i;
+	size_t frame_index;
+
+	if (!source || !realtime_ts_out) return -1;
+	for (i = 0; i < source->segment_count; i++)
+		if (source->segments[i].segment_seq == segment_seq) break;
+	if (i == source->segment_count) return -1;
+	source->segment_index = i;
+	if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
+		index_find_offset_frame(index_path, frame_offset, &frame, &frame_index) != 0 ||
+		source_load_index(source) != 0 ||
+		source_load_frame(reader, source, frame_index, 1) != 0) {
+		if (source_load_segment_fallback(reader, source, 1) < 0) return -1;
+	}
+	for (i = 0; i < source->entry_count; i++) {
+		const RecorderEntry *entry = &source->entries[i].entry;
+
+		if (entry->frame_offset == frame_offset &&
+			entry->frame_entry_index == frame_entry_index) {
+			source->entry_index = (ssize_t)i;
+			*realtime_ts_out = entry->realtime_ts;
+			return 0;
+		}
+	}
+	if (!source->segment_scan_fallback &&
+		source_load_segment_fallback(reader, source, 1) >= 0) {
+		for (i = 0; i < source->entry_count; i++) {
+			const RecorderEntry *entry = &source->entries[i].entry;
+
+			if (entry->frame_offset == frame_offset &&
+				entry->frame_entry_index == frame_entry_index) {
+				source->entry_index = (ssize_t)i;
+				*realtime_ts_out = entry->realtime_ts;
+				return 0;
+			}
+		}
+	}
+	return -1;
+}
+
 static int iterator_initialize(RecorderPlayer *reader, int direction)
 {
 	SegmentPath *paths = NULL;
@@ -1543,32 +1589,18 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 	if (iterator_initialize(reader, 1) != 0) return -1;
 	{
 		IteratorSource *source = NULL;
-		size_t i, frame_index;
-		IndexFrame frame;
-		char index_path[512];
+		size_t i;
 		uint64_t realtime_ts;
 		for (i = 0; i < reader->source_count; i++)
 			if (strcmp(reader->sources[i].group, group) == 0) { source = &reader->sources[i]; break; }
 		if (!source) return -1;
-		for (i = 0; i < source->segment_count; i++)
-			if (source->segments[i].segment_seq == segment_seq) break;
-		if (i == source->segment_count ||
-			segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
-			index_find_offset_frame(index_path, frame_offset, &frame, &frame_index) != 0) return -1;
-		source->segment_index = i;
-		if (source_load_index(source) != 0 || source_load_frame(reader, source, frame_index, 1) != 0 ||
-			frame_entry_index >= source->entry_count) return -1;
-		realtime_ts = source->entries[frame_entry_index].entry.realtime_ts;
+		if (source_seek_cursor(reader, source, segment_seq, frame_offset,
+			frame_entry_index, &realtime_ts) != 0) return -1;
 		if (iterator_seek_realtime(reader, realtime_ts) != 0) return -1;
 		for (i = 0; i < reader->source_count; i++)
 			if (strcmp(reader->sources[i].group, group) == 0) { source = &reader->sources[i]; break; }
-		for (i = 0; source && i < source->segment_count; i++)
-			if (source->segments[i].segment_seq == segment_seq) break;
-		if (!source || i == source->segment_count) return -1;
-		source->segment_index = i;
-		if (source_load_index(source) != 0 || source_load_frame(reader, source, frame_index, 1) != 0 ||
-			frame_entry_index >= source->entry_count) return -1;
-		source->entry_index = (ssize_t)frame_entry_index;
+		if (source_seek_cursor(reader, source, segment_seq, frame_offset,
+			frame_entry_index, &realtime_ts) != 0) return -1;
 		reader->current_valid = 0;
 		reader->current_entry_ptr = NULL;
 	}

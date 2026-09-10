@@ -74,6 +74,7 @@ typedef struct {
 	int list_boots;
 	int disk_usage;
 	int stats;
+	int rebuild_index;
 	int sanitize_output;
 } PlayerOptions;
 
@@ -381,49 +382,129 @@ typedef struct {
     const char *group_name;
 } StatsIndexContext;
 
-static int collect_stats_frame(const IndexFrame *frame, void *userdata)
+static StatsGroup *stats_get_group(StatsContext *stats, const char *group_name)
 {
-    StatsIndexContext *context = userdata;
     StatsGroup *group = NULL;
     size_t i;
 
-    if (frame->entry_count == 0) return 0;
-    for (i = 0; i < context->stats->group_count; i++) {
-        if (strcmp(context->stats->groups[i].name, context->group_name) == 0) {
-            group = &context->stats->groups[i];
+    for (i = 0; i < stats->group_count; i++) {
+        if (strcmp(stats->groups[i].name, group_name) == 0) {
+            group = &stats->groups[i];
             break;
         }
     }
     if (!group) {
-        if (context->stats->group_count == context->stats->group_capacity) {
-            size_t capacity = context->stats->group_capacity ?
-                context->stats->group_capacity * 2 : 8;
-            StatsGroup *groups = realloc(context->stats->groups, capacity * sizeof(*groups));
-            if (!groups) return -1;
-            context->stats->groups = groups;
-            context->stats->group_capacity = capacity;
+        if (stats->group_count == stats->group_capacity) {
+            size_t capacity = stats->group_capacity ? stats->group_capacity * 2 : 8;
+            StatsGroup *groups = realloc(stats->groups, capacity * sizeof(*groups));
+            if (!groups) return NULL;
+            stats->groups = groups;
+            stats->group_capacity = capacity;
         }
-        group = &context->stats->groups[context->stats->group_count++];
+        group = &stats->groups[stats->group_count++];
         memset(group, 0, sizeof(*group));
-        if (snprintf(group->name, sizeof(group->name), "%s", context->group_name) >=
-            (int)sizeof(group->name)) return -1;
+        if (snprintf(group->name, sizeof(group->name), "%s", group_name) >=
+            (int)sizeof(group->name)) return NULL;
     }
-    if (group->count == 0 || frame->min_realtime_ts < group->first_realtime_ts)
-        group->first_realtime_ts = frame->min_realtime_ts;
-    if (group->count == 0 || frame->max_realtime_ts > group->last_realtime_ts)
-        group->last_realtime_ts = frame->max_realtime_ts;
-    group->count += frame->entry_count;
-    context->stats->total_count += frame->entry_count;
+    return group;
+}
+
+static int stats_add(StatsContext *stats, const char *group_name, uint64_t count,
+				 uint64_t first_realtime_ts, uint64_t last_realtime_ts)
+{
+    StatsGroup *group;
+
+    if (count == 0) return 0;
+    group = stats_get_group(stats, group_name);
+    if (!group) return -1;
+    if (group->count == 0 || first_realtime_ts < group->first_realtime_ts)
+        group->first_realtime_ts = first_realtime_ts;
+    if (group->count == 0 || last_realtime_ts > group->last_realtime_ts)
+        group->last_realtime_ts = last_realtime_ts;
+    group->count += count;
+    stats->total_count += count;
     return 0;
+}
+
+static int collect_stats_frame(const IndexFrame *frame, void *userdata)
+{
+    StatsIndexContext *context = userdata;
+
+    return stats_add(context->stats, context->group_name, frame->entry_count,
+        frame->min_realtime_ts, frame->max_realtime_ts);
 }
 
 static int stats_scan_index(const char *path, const char *group, StatsContext *stats)
 {
-    StatsIndexContext context = { .stats = stats, .group_name = group };
-    return index_scan_frames(path, collect_stats_frame, &context);
+    StatsContext scanned = { 0 };
+    StatsIndexContext context = { .stats = &scanned, .group_name = group };
+    size_t i;
+    int rc;
+
+    rc = index_scan_frames(path, collect_stats_frame, &context);
+    if (rc == 0) {
+        for (i = 0; i < scanned.group_count; i++) {
+            if (stats_add(stats, scanned.groups[i].name, scanned.groups[i].count,
+                    scanned.groups[i].first_realtime_ts,
+                    scanned.groups[i].last_realtime_ts) != 0) {
+                rc = -1;
+                break;
+            }
+        }
+    }
+    free(scanned.groups);
+    return rc;
 }
 
-static int stats_scan_directory(const char *path, const char *group, StatsContext *stats)
+static int collect_stats_entry(const RecorderEntry *entry, void *userdata)
+{
+    StatsIndexContext *context = userdata;
+
+    return stats_add(context->stats, context->group_name, 1,
+        entry->realtime_ts, entry->realtime_ts);
+}
+
+static int stats_scan_segment(RecorderPlayer *reader, const char *path,
+				  const char *group, StatsContext *stats)
+{
+    StatsIndexContext context = { .stats = stats, .group_name = group };
+
+    return rec_player_scan_file(reader, path, collect_stats_entry, &context, 0, NULL);
+}
+
+static int stats_scan_segment_with_fallback(RecorderPlayer *reader, const char *segment_path,
+						 const char *group, const char *private_key, StatsContext *stats)
+{
+    char index_path[512];
+    size_t len = strlen(segment_path);
+    int saved_errno;
+
+    if (len < 5 || strcmp(segment_path + len - 4, ".seg") != 0 ||
+        snprintf(index_path, sizeof(index_path), "%.*s.idx", (int)(len - 4), segment_path) >=
+            (int)sizeof(index_path)) return -1;
+    errno = 0;
+    if (stats_scan_index(index_path, group, stats) == 0) return 0;
+    saved_errno = errno;
+    if (saved_errno == ENOENT) {
+        fprintf(stderr, "player: warning: index '%s' is missing; scanning '%s' instead\n",
+            index_path, segment_path);
+		if (private_key) {
+			fprintf(stderr, "player: warning: recreate it with: player --rebuild-index "
+				"--encryption-private-key %s -i %s\n", private_key, segment_path);
+		} else {
+			fprintf(stderr, "player: warning: recreate it with: player --rebuild-index -i %s\n",
+				segment_path);
+		}
+    } else {
+        fprintf(stderr, "player: warning: cannot use index '%s' (%s); scanning '%s' instead\n",
+            index_path, saved_errno ? strerror(saved_errno) : "invalid or incompatible format",
+            segment_path);
+    }
+    return stats_scan_segment(reader, segment_path, group, stats);
+}
+
+static int stats_scan_directory(RecorderPlayer *reader, const char *path, const char *group,
+						const char *private_key, StatsContext *stats)
 {
     DIR *dir = opendir(path);
     struct dirent *de;
@@ -434,10 +515,10 @@ static int stats_scan_directory(const char *path, const char *group, StatsContex
         char child[512];
         size_t len = strlen(de->d_name);
         struct stat st;
-        if (len < 5 || strcmp(de->d_name + len - 4, ".idx") != 0 ||
+        if (len < 5 || strcmp(de->d_name + len - 4, ".seg") != 0 ||
             snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
             stat(child, &st) != 0 || !S_ISREG(st.st_mode)) continue;
-        if (stats_scan_index(child, group, stats) != 0) goto out;
+		if (stats_scan_segment_with_fallback(reader, child, group, private_key, stats) != 0) goto out;
     }
     rc = 0;
 out:
@@ -445,15 +526,11 @@ out:
     return rc;
 }
 
-static int scan_stats_path(const char *path, int is_directory, StatsContext *stats)
+static int scan_stats_path(RecorderPlayer *reader, const char *path, int is_directory,
+				   const char *private_key, StatsContext *stats)
 {
     if (!is_directory) {
-        char index_path[512];
-        size_t len = strlen(path);
-        if (len < 5 || strcmp(path + len - 4, ".seg") != 0 ||
-            snprintf(index_path, sizeof(index_path), "%.*s.idx", (int)(len - 4), path) >=
-                (int)sizeof(index_path)) return -1;
-        return stats_scan_index(index_path, "-", stats);
+		return stats_scan_segment_with_fallback(reader, path, "-", private_key, stats);
     }
     {
         DIR *dir = opendir(path);
@@ -467,10 +544,10 @@ static int scan_stats_path(const char *path, int is_directory, StatsContext *sta
             if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
                 stat(child, &st) != 0) continue;
             if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name)) {
-                if (stats_scan_directory(child, de->d_name, stats) != 0) goto out;
+				if (stats_scan_directory(reader, child, de->d_name, private_key, stats) != 0) goto out;
             } else if (S_ISREG(st.st_mode) && len >= 5 &&
-                strcmp(de->d_name + len - 4, ".idx") == 0 &&
-                stats_scan_index(child, "-", stats) != 0) goto out;
+                strcmp(de->d_name + len - 4, ".seg") == 0 &&
+				stats_scan_segment_with_fallback(reader, child, "-", private_key, stats) != 0) goto out;
         }
         rc = 0;
 out:
@@ -490,8 +567,8 @@ static int print_stats(const PlayerOptions *opts)
 	if (rec_player_open(&reader, opts->path) != 0) goto out;
 	if (opts->encryption_private_key &&
 		rec_player_set_private_key(reader, opts->encryption_private_key) != 0) goto out;
-	if (scan_stats_path(opts->path, opts->dir_path != NULL || opts->file_path == NULL,
-			&stats) != 0) {
+	if (scan_stats_path(reader, opts->path, opts->dir_path != NULL || opts->file_path == NULL,
+			opts->encryption_private_key, &stats) != 0) {
 		fprintf(stderr, "player: failed to scan log statistics\n");
 		goto out;
 	}
@@ -516,6 +593,39 @@ static int print_stats(const PlayerOptions *opts)
 out:
 	free(stats.groups);
 	rec_player_close(reader);
+	return rc;
+}
+
+static int rebuild_index(const PlayerOptions *opts)
+{
+	char index_path[512];
+	size_t len;
+	SegmentDecryptor *decryptor = NULL;
+	int rc = 1;
+
+	if (!opts->file_path || !opts->path) return 1;
+	len = strlen(opts->path);
+	if (len < 5 || strcmp(opts->path + len - 4, ".seg") != 0 ||
+		snprintf(index_path, sizeof(index_path), "%.*s.idx", (int)(len - 4), opts->path) >=
+			(int)sizeof(index_path)) {
+		fprintf(stderr, "player: --rebuild-index requires -i SEGMENT.seg\n");
+		return 1;
+	}
+	if (opts->encryption_private_key &&
+		segment_decryptor_create(opts->encryption_private_key, &decryptor) != 0) {
+		fprintf(stderr, "player: failed to load encryption private key %s\n",
+			opts->encryption_private_key);
+		return 1;
+	}
+	if (index_rebuild_for_segment(opts->path, index_path, decryptor) != 0) {
+		fprintf(stderr, "player: failed to rebuild index '%s': %s\n", index_path,
+			strerror(errno));
+		goto out;
+	}
+	printf("rebuilt %s\n", index_path);
+	rc = 0;
+out:
+	segment_decryptor_free(decryptor);
 	return rc;
 }
 
@@ -1219,7 +1329,7 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage|--stats] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats|--rebuild-index] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
@@ -1272,6 +1382,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->disk_usage = 1;
 		} else if (strcmp(arg, "--stats") == 0) {
 			opts->stats = 1;
+		} else if (strcmp(arg, "--rebuild-index") == 0) {
+			opts->rebuild_index = 1;
 		} else if (strcmp(arg, "--sanitize-output") == 0) {
 			opts->sanitize_output = 1;
 		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
@@ -1304,8 +1416,10 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	if (opts->dir_path && opts->file_path) {
 		return -1;
 	}
-	if ((opts->disk_usage + opts->stats + opts->list_boots > 1) ||
+	if ((opts->disk_usage + opts->stats + opts->list_boots + opts->rebuild_index > 1) ||
 		(opts->stats && opts->follow) ||
+		(opts->rebuild_index && (!opts->file_path || opts->follow || opts->unit_filter ||
+			opts->boot_filter || opts->since_arg || opts->until_arg)) ||
 		(opts->follow && (is_cursor_arg(opts->since_arg) || is_cursor_arg(opts->until_arg)))) {
 		return -1;
 	}
@@ -1363,6 +1477,9 @@ int main(int argc, char **argv)
 	}
 	if (opts.list_boots) {
 		return print_boots(&opts);
+	}
+	if (opts.rebuild_index) {
+		return rebuild_index(&opts);
 	}
 	if (opts.stats) {
 		return print_stats(&opts);

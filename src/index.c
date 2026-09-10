@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
@@ -248,7 +249,8 @@ void index_writer_abort(IndexWriter *writer, int unlink_path)
 	free(writer);
 }
 
-int index_rebuild_for_segment(const char *segment_path, const char *index_path)
+int index_rebuild_for_segment(const char *segment_path, const char *index_path,
+				  SegmentDecryptor *decryptor)
 {
 	char tmp_path[512];
 	SegmentHeader header;
@@ -259,13 +261,13 @@ int index_rebuild_for_segment(const char *segment_path, const char *index_path)
 	size_t committed_end = 0;
 
 	snprintf(tmp_path, sizeof(tmp_path), "%s.tmp", index_path);
-	if (segment_scan_path(segment_path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
+	if (segment_scan_path(segment_path, decryptor, NULL, NULL, &header, &footer, &committed_end) != 0) {
 		unlink(tmp_path);
 		return -1;
 	}
 	if (index_writer_open(tmp_path, header.segment_seq, header.flags, &writer) != 0) return -1;
 	ctx.writer = writer;
-	if (segment_scan_path(segment_path, NULL, append_index_frame_cb, &ctx, NULL, NULL, NULL) != 0) {
+	if (segment_scan_path(segment_path, decryptor, append_index_frame_cb, &ctx, NULL, NULL, NULL) != 0) {
 		index_writer_abort(writer, 1);
 		return -1;
 	}
@@ -304,10 +306,18 @@ static int index_open_read(const char *path, int *fd_out, size_t *count_out)
 
 	if (!path || !fd_out || !count_out || (fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 ||
 		fstat(fd, &st) != 0 || st.st_size < RECORDER_INDEX_HEADER_SIZE ||
-		pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header) ||
-		memcmp(header, RECORDER_INDEX_MAGIC, 8) != 0 ||
-		read_u32_le(header + 8) != RECORDER_INDEX_VERSION) {
+		pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) {
 		if (fd >= 0) close(fd);
+		return -1;
+	}
+	if (memcmp(header, RECORDER_INDEX_MAGIC, 8) != 0) {
+		close(fd);
+		errno = EINVAL;
+		return -1;
+	}
+	if (read_u32_le(header + 8) != RECORDER_INDEX_VERSION) {
+		close(fd);
+		errno = EPROTONOSUPPORT;
 		return -1;
 	}
 	count = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
@@ -317,7 +327,13 @@ static int index_open_read(const char *path, int *fd_out, size_t *count_out)
 		uint64_t available = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE -
 			RECORDER_INDEX_FOOTER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
 		count = read_u64_le(footer + 8);
-		if (count > available) { close(fd); return -1; }
+		if (count != available ||
+			((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE - RECORDER_INDEX_FOOTER_SIZE) %
+				RECORDER_INDEX_RECORD_SIZE != 0) {
+			close(fd);
+			errno = EPROTONOSUPPORT;
+			return -1;
+		}
 	}
 	if (count > SIZE_MAX) { close(fd); return -1; }
 	*fd_out = fd;
