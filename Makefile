@@ -133,6 +133,9 @@ librecorder.a: $(LIBRECORDER_OBJS)
 smoke-test: src/smoke_test.o $(LIBRECORDER_TARGET)
 	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
+batch-reader: src/batch_reader.o $(LIBRECORDER_TARGET)
+	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
+
 install: all librecorder.pc
 	install -d $(DESTDIR)$(bindir)
 	install -d $(DESTDIR)$(libdir)
@@ -190,6 +193,6 @@ benchmark-capacity: repo
 FORCE:
 
 clean:
-	rm -f recorder player smoke-test librecorder.a librecorder.so librecorder.so.* librecorder.pc *.o *.d src/*.o src/*.d flatcc/src/runtime/*.pic.o flatcc/src/runtime/*.pic.d
+	rm -f recorder player smoke-test batch-reader librecorder.a librecorder.so librecorder.so.* librecorder.pc *.o *.d src/*.o src/*.d flatcc/src/runtime/*.pic.o flatcc/src/runtime/*.pic.d
 
 -include $(wildcard *.d) $(wildcard src/*.d) $(wildcard flatcc/src/runtime/*.pic.d)
