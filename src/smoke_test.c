@@ -583,10 +583,13 @@ int main(void)
 		return 1;
 	}
 	{
+		IndexFrame frame;
 		size_t frame_count;
+		size_t frame_index;
 
 		if (index_get_frame_count(index_path, segment_path, &frame_count) != 0 ||
-			frame_count != 1 || flip_file_byte(index_path, 24) != 0 ||
+			frame_count != 1 || index_find_realtime_frame(index_path, segment_path,
+				UINT64_MAX, &frame, &frame_index) != 1 || flip_file_byte(index_path, 24) != 0 ||
 			index_get_frame_count(index_path, segment_path, &frame_count) == 0 ||
 			index_rebuild_for_segment(segment_path, index_path, NULL) != 0 ||
 			truncate(index_path, 24) != 0 ||

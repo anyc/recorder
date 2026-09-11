@@ -508,7 +508,7 @@ int index_find_realtime_frame(const char *path, const char *segment_path, uint64
 		if (index_pread_frame(fd, lo, frame_out) != 0) goto out;
 		*frame_index_out = lo;
 		rc = 0;
-	}
+	} else rc = 1;
 out:
 	close(fd);
 	return rc;

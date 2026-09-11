@@ -1158,9 +1158,13 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 		IndexFrame frame;
 		size_t frame_index;
 		size_t j;
-		if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
-			index_find_realtime_frame(index_path, source->segments[i].path, usec,
-				&frame, &frame_index) != 0) {
+		int find_rc;
+		if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0)
+			find_rc = -1;
+		else find_rc = index_find_realtime_frame(index_path, source->segments[i].path,
+			usec, &frame, &frame_index);
+		if (find_rc > 0) continue;
+		if (find_rc < 0) {
 			source->segment_index = i;
 			if (source_load_segment_fallback(reader, source, 1) < 0) return -1;
 			for (j = 0; j < source->entry_count; j++) {
