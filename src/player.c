@@ -1264,16 +1264,18 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		else if (direction < 0) rc = rec_player_seek_tail(reader);
 		else if (opts->have_since) rc = rec_player_seek_realtime_usec(reader, opts->since_ts);
 		else rc = rec_player_seek_head(reader);
-		while (rc == 0 && (rc = direction > 0 ? rec_player_next(reader) :
-			rec_player_previous(reader)) > 0) {
-			if (rec_player_get_entry(reader, &entry) != 0 ||
-				print_record(entry, &output) != 0) {
-				rc = -1;
-				break;
-			}
-			if (opts->have_line_count && output.entry_count >= opts->line_count) {
-				rc = 0;
-				break;
+		if (rc == 0) {
+			while ((rc = direction > 0 ? rec_player_next(reader) :
+				rec_player_previous(reader)) > 0) {
+				if (rec_player_get_entry(reader, &entry) != 0 ||
+					print_record(entry, &output) != 0) {
+					rc = -1;
+					break;
+				}
+				if (opts->have_line_count && output.entry_count >= opts->line_count) {
+					rc = 0;
+					break;
+				}
 			}
 		}
 	}
