@@ -871,29 +871,6 @@ static int print_record(const RecorderEntry *entry, void *ctx)
 		append_player_entry(pc, entry) : 0;
 }
 
-static int scan_segment_file_with_context(RecorderPlayer *reader, const char *path, const PlayerOptions *opts,
-								uint64_t min_frame_offset, PrintContext *ctx,
-								uint64_t *committed_end_out)
-{
-	ctx->unit_filter = opts->unit_filter;
-	ctx->boot_id_filter = opts->boot_id_filter;
-	ctx->boot_seq_filter = opts->boot_seq_filter;
-	ctx->have_boot_seq_filter = opts->have_boot_seq_filter;
-	ctx->since_ts = opts->since_ts;
-	ctx->until_ts = opts->until_ts;
-	ctx->have_since = opts->have_since;
-	ctx->have_until = opts->have_until;
-	ctx->min_frame_offset = min_frame_offset;
-	ctx->follow_start_ts = opts->follow_start_ts;
-	ctx->initial_follow_scan = opts->follow && opts->follow_start_ts != 0;
-	if (rec_player_scan_file(reader, path, print_record, ctx,
-							  min_frame_offset, committed_end_out) != 0) {
-		fprintf(stderr, "player: failed to scan %s\n", path);
-		return -1;
-	}
-	return 0;
-}
-
 static int add_segment_file(SegmentPath **items, size_t *count, size_t *cap,
 							const char *path, uint64_t segment_seq)
 {
@@ -1236,7 +1213,7 @@ static void print_selected_entries(const PlayerEntry *entries, size_t count,
 }
 
 static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
-						 int *follow_initialized)
+							 int *follow_initialized)
 {
 	PrintContext output;
 	int initial_follow_scan = opts->follow && !*follow_initialized;
@@ -1280,7 +1257,25 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		}
 		if (rc == 0 && opts->until_cursor && !reached_until) rc = -1;
 	} else {
-		rc = rec_player_scan_all(reader, print_record, &output);
+		const RecorderEntry *entry;
+		int direction = opts->have_line_count && !opts->lines_from_head ? -1 : 1;
+
+		if (opts->have_line_count && opts->line_count == 0) rc = 0;
+		else if (direction < 0) rc = rec_player_seek_tail(reader);
+		else if (opts->have_since) rc = rec_player_seek_realtime_usec(reader, opts->since_ts);
+		else rc = rec_player_seek_head(reader);
+		while (rc == 0 && (rc = direction > 0 ? rec_player_next(reader) :
+			rec_player_previous(reader)) > 0) {
+			if (rec_player_get_entry(reader, &entry) != 0 ||
+				print_record(entry, &output) != 0) {
+				rc = -1;
+				break;
+			}
+			if (opts->have_line_count && output.entry_count >= opts->line_count) {
+				rc = 0;
+				break;
+			}
+		}
 	}
 	if (rc != 0) {
 		fprintf(stderr, "player: failed to scan log\n");
@@ -1567,33 +1562,5 @@ int main(int argc, char **argv)
 		fprintf(stderr, "player: -f requires a log directory\n");
 		return 1;
 	}
-	{
-		RecorderPlayer *reader = NULL;
-		PrintContext output;
-
-		memset(&output, 0, sizeof(output));
-		if (rec_player_open(&reader, opts.path) != 0) {
-			fprintf(stderr, "player: failed to open %s\n", opts.path);
-			return 1;
-		}
-		if (opts.encryption_private_key &&
-			rec_player_set_private_key(reader, opts.encryption_private_key) != 0) {
-			fprintf(stderr, "player: failed to load encryption private key %s\n",
-					opts.encryption_private_key);
-			rec_player_close(reader);
-			return 1;
-		}
-		if (scan_segment_file_with_context(reader, opts.path, &opts, 0, &output,
-										   NULL) != 0) {
-			free_player_entries(output.entries, output.entry_count);
-			rec_player_close(reader);
-			return 1;
-		}
-		qsort(output.entries, output.entry_count, sizeof(*output.entries),
-				compare_player_entries);
-		print_selected_entries(output.entries, output.entry_count, &opts, 0);
-		free_player_entries(output.entries, output.entry_count);
-		rec_player_close(reader);
-	}
-	return 0;
+	return scan_log_root(&opts);
 }
