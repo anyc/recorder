@@ -75,6 +75,9 @@ typedef struct {
 	int disk_usage;
 	int stats;
 	int rebuild_index;
+	size_t line_count;
+	int have_line_count;
+	int lines_from_head;
 	int sanitize_output;
 } PlayerOptions;
 
@@ -1197,13 +1200,46 @@ static int resolve_boot_filter(PlayerOptions *opts)
 	return 0;
 }
 
+static void print_selected_entries(const PlayerEntry *entries, size_t count,
+					   const PlayerOptions *opts, int initial_follow_scan)
+{
+	size_t i;
+
+	if (!initial_follow_scan) {
+		size_t first = 0;
+		size_t last = count;
+
+		if (opts->have_line_count) {
+			if (opts->lines_from_head) {
+				if (last > opts->line_count) last = opts->line_count;
+			} else if (count > opts->line_count) {
+				first = count - opts->line_count;
+			}
+		}
+		for (i = first; i < last; i++) print_entry(&entries[i], opts->sanitize_output);
+		return;
+	}
+	{
+		size_t old_count = 0;
+		size_t old_seen = 0;
+		size_t initial_count = opts->have_line_count ? opts->line_count :
+			FOLLOW_INITIAL_ENTRY_COUNT;
+
+		for (i = 0; i < count; i++) if (!entries[i].follow_new) old_count++;
+		for (i = 0; i < count; i++) {
+			if (entries[i].follow_new || old_count - old_seen <= initial_count)
+				print_entry(&entries[i], opts->sanitize_output);
+			if (!entries[i].follow_new) old_seen++;
+		}
+	}
+}
+
 static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 						 int *follow_initialized)
 {
 	PrintContext output;
 	int initial_follow_scan = opts->follow && !*follow_initialized;
 	int rc;
-	size_t i;
 
 	memset(&output, 0, sizeof(output));
 	output.unit_filter = opts->unit_filter;
@@ -1219,7 +1255,7 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 
 	if (opts->follow) {
 		rc = rec_player_scan_follow(reader, print_record, &output,
-								FOLLOW_INITIAL_ENTRY_COUNT);
+			opts->have_line_count ? opts->line_count : FOLLOW_INITIAL_ENTRY_COUNT);
 		*follow_initialized = 1;
 	} else if (opts->since_cursor || opts->until_cursor) {
 		int reached_until = 0;
@@ -1253,23 +1289,7 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 
 	qsort(output.entries, output.entry_count, sizeof(*output.entries),
 			compare_player_entries);
-	{
-		size_t old_count = 0;
-		size_t old_seen = 0;
-
-		if (initial_follow_scan) {
-			for (i = 0; i < output.entry_count; i++) {
-				if (!output.entries[i].follow_new) old_count++;
-			}
-		}
-		for (i = 0; i < output.entry_count; i++) {
-			if (!initial_follow_scan || output.entries[i].follow_new ||
-				(old_count - old_seen <= FOLLOW_INITIAL_ENTRY_COUNT)) {
-				print_entry(&output.entries[i], opts->sanitize_output);
-			}
-			if (initial_follow_scan && !output.entries[i].follow_new) old_seen++;
-		}
-	}
+	print_selected_entries(output.entries, output.entry_count, opts, initial_follow_scan);
 	free_player_entries(output.entries, output.entry_count);
 	return 0;
 }
@@ -1329,12 +1349,36 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage|--stats|--rebuild-index] [-f] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats|--rebuild-index] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
 			prog);
 	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, YYYY-MM-DD HH:MM[:SS], or a rec1: cursor\n");
+	fprintf(stderr, "       COUNT selects newest entries; +COUNT selects oldest entries\n");
+}
+
+static int parse_line_count(const char *text, size_t *count_out, int *from_head_out)
+{
+	char *end = NULL;
+	const char *number = text;
+	unsigned long long count;
+	int from_head = 0;
+
+	if (!text || !text[0]) return -1;
+	if (*number == '+') {
+		from_head = 1;
+		number++;
+	} else if (*number == '-') {
+		number++;
+	}
+	if (!number[0]) return -1;
+	errno = 0;
+	count = strtoull(number, &end, 10);
+	if (errno != 0 || !end || *end != '\0' || count > SIZE_MAX) return -1;
+	*count_out = (size_t)count;
+	*from_head_out = from_head;
+	return 0;
 }
 
 static int parse_options(int argc, char **argv, PlayerOptions *opts)
@@ -1348,6 +1392,14 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 
 		if (strcmp(arg, "-f") == 0) {
 			opts->follow = 1;
+		} else if (strcmp(arg, "-n") == 0) {
+			if (++i >= argc || parse_line_count(argv[i], &opts->line_count,
+					&opts->lines_from_head) != 0) return -1;
+			opts->have_line_count = 1;
+		} else if (strncmp(arg, "-n", 2) == 0 && arg[2] != '\0') {
+			if (parse_line_count(arg + 2, &opts->line_count, &opts->lines_from_head) != 0)
+				return -1;
+			opts->have_line_count = 1;
 		} else if (strcmp(arg, "-D") == 0) {
 			if (++i >= argc) {
 				return -1;
@@ -1418,6 +1470,7 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	}
 	if ((opts->disk_usage + opts->stats + opts->list_boots + opts->rebuild_index > 1) ||
 		(opts->stats && opts->follow) ||
+		(opts->follow && opts->have_line_count && opts->lines_from_head) ||
 		(opts->rebuild_index && (!opts->file_path || opts->follow || opts->unit_filter ||
 			opts->boot_filter || opts->since_arg || opts->until_arg)) ||
 		(opts->follow && (is_cursor_arg(opts->since_arg) || is_cursor_arg(opts->until_arg)))) {
@@ -1516,7 +1569,6 @@ int main(int argc, char **argv)
 	{
 		RecorderPlayer *reader = NULL;
 		PrintContext output;
-		size_t i;
 
 		memset(&output, 0, sizeof(output));
 		if (rec_player_open(&reader, opts.path) != 0) {
@@ -1538,9 +1590,7 @@ int main(int argc, char **argv)
 		}
 		qsort(output.entries, output.entry_count, sizeof(*output.entries),
 				compare_player_entries);
-		for (i = 0; i < output.entry_count; i++) {
-			print_entry(&output.entries[i], opts.sanitize_output);
-		}
+		print_selected_entries(output.entries, output.entry_count, &opts, 0);
 		free_player_entries(output.entries, output.entry_count);
 		rec_player_close(reader);
 	}
