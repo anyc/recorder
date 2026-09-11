@@ -130,6 +130,21 @@ static int write_file(const char *path, const void *buf, size_t size)
 	return rv;
 }
 
+static int flip_file_byte(const char *path, off_t offset)
+{
+	unsigned char value;
+	FILE *fp = fopen(path, "r+b");
+	int rc = -1;
+
+	if (!fp || fseeko(fp, offset, SEEK_SET) != 0 || fread(&value, 1, 1, fp) != 1 ||
+		fseeko(fp, offset, SEEK_SET) != 0) goto out;
+	value ^= 0x01;
+	if (fwrite(&value, 1, 1, fp) == 1 && fflush(fp) == 0) rc = 0;
+out:
+	if (fp) fclose(fp);
+	return rc;
+}
+
 static void update_encrypted_frame_crc(unsigned char *frame)
 {
 	uint32_t stored_len = read_u32_le(frame + 4);
@@ -566,6 +581,20 @@ int main(void)
 	if (index_rebuild_for_segment(segment_path, index_path, NULL) != 0) {
 		fprintf(stderr, "smoke: build reader index failed\n");
 		return 1;
+	}
+	{
+		size_t frame_count;
+
+		if (index_get_frame_count(index_path, segment_path, &frame_count) != 0 ||
+			frame_count != 1 || flip_file_byte(index_path, 24) != 0 ||
+			index_get_frame_count(index_path, segment_path, &frame_count) == 0 ||
+			index_rebuild_for_segment(segment_path, index_path, NULL) != 0 ||
+			truncate(index_path, 24) != 0 ||
+			index_get_frame_count(index_path, segment_path, &frame_count) == 0 ||
+			index_rebuild_for_segment(segment_path, index_path, NULL) != 0) {
+			fprintf(stderr, "smoke: stale index validation failed\n");
+			return 1;
+		}
 	}
 	fp = fopen(store_id_path, "wb");
 	if (!fp || fputs("0123456789abcdef\n", fp) < 0) {

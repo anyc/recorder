@@ -437,14 +437,15 @@ static int collect_stats_frame(const IndexFrame *frame, void *userdata)
         frame->min_realtime_ts, frame->max_realtime_ts);
 }
 
-static int stats_scan_index(const char *path, const char *group, StatsContext *stats)
+static int stats_scan_index(const char *path, const char *segment_path,
+					const char *group, StatsContext *stats)
 {
     StatsContext scanned = { 0 };
     StatsIndexContext context = { .stats = &scanned, .group_name = group };
     size_t i;
     int rc;
 
-    rc = index_scan_frames(path, collect_stats_frame, &context);
+	rc = index_scan_frames(path, segment_path, collect_stats_frame, &context);
     if (rc == 0) {
         for (i = 0; i < scanned.group_count; i++) {
             if (stats_add(stats, scanned.groups[i].name, scanned.groups[i].count,
@@ -486,7 +487,7 @@ static int stats_scan_segment_with_fallback(RecorderPlayer *reader, const char *
         snprintf(index_path, sizeof(index_path), "%.*s.idx", (int)(len - 4), segment_path) >=
             (int)sizeof(index_path)) return -1;
     errno = 0;
-    if (stats_scan_index(index_path, group, stats) == 0) return 0;
+	if (stats_scan_index(index_path, segment_path, group, stats) == 0) return 0;
     saved_errno = errno;
     if (saved_errno == ENOENT) {
         fprintf(stderr, "player: warning: index '%s' is missing; scanning '%s' instead\n",

@@ -122,6 +122,8 @@ int segment_write_frame(FILE *fp, SegmentEncryptor *encryptor,
 int segment_write_footer(FILE *fp, const SegmentFooter *footer);
 int segment_read_header(const void *buf, size_t size,
                         SegmentHeader *header, size_t *offset_out);
+int segment_read_path_header(const char *path, SegmentHeader *header,
+					 size_t *data_offset_out, size_t *file_size_out);
 /* A decryptor is optional for metadata-only scans (cb == NULL). */
 int segment_scan_path(const char *path, SegmentDecryptor *decryptor,
 						segment_frame_cb cb, void *ctx,

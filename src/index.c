@@ -38,6 +38,8 @@ struct IndexReader {
 	size_t frame_count;
 };
 
+static int index_pread_frame(int fd, size_t index, IndexFrame *frame);
+
 static int append_index_frame_cb(const SegmentHeader *header,
 							 const SegmentFrameInfo *frame,
 							 const void *chunk_buf, size_t chunk_size, void *ctx)
@@ -296,15 +298,52 @@ static void decode_index_frame(const unsigned char record[RECORDER_INDEX_RECORD_
 	frame->entry_count = read_u32_le(record + 45);
 }
 
-static int index_open_read(const char *path, int *fd_out, size_t *count_out)
+static int index_validate_segment(int fd, size_t count, uint64_t index_segment_seq,
+					 uint32_t index_flags, int has_footer, uint64_t committed_end,
+					 const char *segment_path)
+{
+	SegmentHeader header;
+	IndexFrame frame;
+	size_t data_offset, segment_size, i;
+	uint64_t expected_end;
+
+	if (segment_read_path_header(segment_path, &header, &data_offset, &segment_size) != 0 ||
+		header.segment_seq != index_segment_seq || header.flags != index_flags) {
+		errno = EINVAL;
+		return -1;
+	}
+	expected_end = data_offset;
+	for (i = 0; i < count; i++) {
+		if (index_pread_frame(fd, i, &frame) != 0 || frame.frame_len < 20 ||
+			frame.file_offset != expected_end || frame.frame_len > segment_size - expected_end) {
+			errno = EINVAL;
+			return -1;
+		}
+		expected_end += frame.frame_len;
+	}
+	if ((has_footer && committed_end != segment_size) ||
+		(!has_footer && expected_end != segment_size)) {
+		errno = ESTALE;
+		return -1;
+	}
+	return 0;
+}
+
+static int index_open_read(const char *path, const char *segment_path,
+					   int *fd_out, size_t *count_out)
 {
 	unsigned char header[RECORDER_INDEX_HEADER_SIZE];
 	unsigned char footer[RECORDER_INDEX_FOOTER_SIZE];
+	unsigned char *contents = NULL;
 	struct stat st;
-	int fd;
+	int fd = -1;
+	int has_footer = 0;
 	uint64_t count;
+	uint64_t committed_end = 0;
+	size_t indexed_size;
 
-	if (!path || !fd_out || !count_out || (fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 ||
+	if (!path || !segment_path || !fd_out || !count_out ||
+		(fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 ||
 		fstat(fd, &st) != 0 || st.st_size < RECORDER_INDEX_HEADER_SIZE ||
 		pread(fd, header, sizeof(header), 0) != (ssize_t)sizeof(header)) {
 		if (fd >= 0) close(fd);
@@ -320,13 +359,16 @@ static int index_open_read(const char *path, int *fd_out, size_t *count_out)
 		errno = EPROTONOSUPPORT;
 		return -1;
 	}
-	count = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+	indexed_size = (size_t)st.st_size - RECORDER_INDEX_HEADER_SIZE;
 	if (st.st_size >= RECORDER_INDEX_HEADER_SIZE + RECORDER_INDEX_FOOTER_SIZE &&
 		pread(fd, footer, sizeof(footer), st.st_size - RECORDER_INDEX_FOOTER_SIZE) ==
 			(ssize_t)sizeof(footer) && memcmp(footer, RECORDER_INDEX_FOOTER_MAGIC, 8) == 0) {
 		uint64_t available = ((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE -
 			RECORDER_INDEX_FOOTER_SIZE) / RECORDER_INDEX_RECORD_SIZE;
+		has_footer = 1;
+		indexed_size -= RECORDER_INDEX_FOOTER_SIZE;
 		count = read_u64_le(footer + 8);
+		committed_end = read_u64_le(footer + 16);
 		if (count != available ||
 			((uint64_t)st.st_size - RECORDER_INDEX_HEADER_SIZE - RECORDER_INDEX_FOOTER_SIZE) %
 				RECORDER_INDEX_RECORD_SIZE != 0) {
@@ -334,8 +376,32 @@ static int index_open_read(const char *path, int *fd_out, size_t *count_out)
 			errno = EPROTONOSUPPORT;
 			return -1;
 		}
+		contents = malloc((size_t)st.st_size - RECORDER_INDEX_FOOTER_SIZE);
+		if (!contents || pread(fd, contents,
+			(size_t)st.st_size - RECORDER_INDEX_FOOTER_SIZE, 0) !=
+			(ssize_t)((size_t)st.st_size - RECORDER_INDEX_FOOTER_SIZE) ||
+			recorder_crc32(contents, (size_t)st.st_size - RECORDER_INDEX_FOOTER_SIZE) !=
+				read_u32_le(footer + 24)) {
+			free(contents);
+			close(fd);
+			errno = EINVAL;
+			return -1;
+		}
+		free(contents);
+	} else {
+		if (indexed_size % RECORDER_INDEX_RECORD_SIZE != 0) {
+			close(fd);
+			errno = EINVAL;
+			return -1;
+		}
+		count = indexed_size / RECORDER_INDEX_RECORD_SIZE;
 	}
-	if (count > SIZE_MAX) { close(fd); return -1; }
+	if (count > SIZE_MAX || index_validate_segment(fd, (size_t)count,
+		read_u64_le(header + 12), read_u32_le(header + 20), has_footer,
+		committed_end, segment_path) != 0) {
+		close(fd);
+		return -1;
+	}
 	*fd_out = fd;
 	*count_out = (size_t)count;
 	return 0;
@@ -351,13 +417,13 @@ static int index_pread_frame(int fd, size_t index, IndexFrame *frame)
 	return 0;
 }
 
-int index_reader_open(const char *path, IndexReader **reader_out)
+int index_reader_open(const char *path, const char *segment_path, IndexReader **reader_out)
 {
 	IndexReader *reader;
 
 	if (!reader_out || !(reader = calloc(1, sizeof(*reader)))) return -1;
 	reader->fd = -1;
-	if (index_open_read(path, &reader->fd, &reader->frame_count) != 0) {
+	if (index_open_read(path, segment_path, &reader->fd, &reader->frame_count) != 0) {
 		free(reader);
 		return -1;
 	}
@@ -383,33 +449,35 @@ int index_reader_read_frame(IndexReader *reader, size_t frame_index, IndexFrame 
 	return index_pread_frame(reader->fd, frame_index, frame_out);
 }
 
-int index_get_frame_count(const char *path, size_t *count_out)
+int index_get_frame_count(const char *path, const char *segment_path, size_t *count_out)
 {
 	int fd;
-	if (!count_out || index_open_read(path, &fd, count_out) != 0) return -1;
+	if (!count_out || index_open_read(path, segment_path, &fd, count_out) != 0) return -1;
 	close(fd);
 	return 0;
 }
 
-int index_read_frame(const char *path, size_t frame_index, IndexFrame *frame_out)
+int index_read_frame(const char *path, const char *segment_path, size_t frame_index,
+					 IndexFrame *frame_out)
 {
 	int fd;
 	size_t count;
 	int rc;
-	if (!frame_out || index_open_read(path, &fd, &count) != 0) return -1;
+	if (!frame_out || index_open_read(path, segment_path, &fd, &count) != 0) return -1;
 	rc = frame_index < count ? index_pread_frame(fd, frame_index, frame_out) : -1;
 	close(fd);
 	return rc;
 }
 
-int index_scan_frames(const char *path, index_frame_cb callback, void *userdata)
+int index_scan_frames(const char *path, const char *segment_path,
+				  index_frame_cb callback, void *userdata)
 {
 	int fd;
 	size_t count, i;
 	IndexFrame frame;
 	int rc = -1;
 
-	if (!callback || index_open_read(path, &fd, &count) != 0) return -1;
+	if (!callback || index_open_read(path, segment_path, &fd, &count) != 0) return -1;
 	for (i = 0; i < count; i++) {
 		if (index_pread_frame(fd, i, &frame) != 0) goto out;
 		if (callback(&frame, userdata) != 0) goto out;
@@ -420,14 +488,15 @@ out:
 	return rc;
 }
 
-int index_find_realtime_frame(const char *path, uint64_t usec,
+int index_find_realtime_frame(const char *path, const char *segment_path, uint64_t usec,
 					  IndexFrame *frame_out, size_t *frame_index_out)
 {
 	IndexFrame frame;
 	size_t count = 0, lo = 0, hi;
 	int fd;
 	int rc = -1;
-	if (!frame_out || !frame_index_out || index_open_read(path, &fd, &count) != 0) return -1;
+	if (!frame_out || !frame_index_out ||
+		index_open_read(path, segment_path, &fd, &count) != 0) return -1;
 	hi = count;
 	while (lo < hi) {
 		size_t mid = lo + (hi - lo) / 2;
@@ -445,14 +514,15 @@ out:
 	return rc;
 }
 
-int index_find_offset_frame(const char *path, uint64_t file_offset,
+int index_find_offset_frame(const char *path, const char *segment_path, uint64_t file_offset,
 					IndexFrame *frame_out, size_t *frame_index_out)
 {
 	IndexFrame frame;
 	size_t count = 0, lo = 0, hi;
 	int fd;
 	int rc = -1;
-	if (!frame_out || !frame_index_out || index_open_read(path, &fd, &count) != 0) return -1;
+	if (!frame_out || !frame_index_out ||
+		index_open_read(path, segment_path, &fd, &count) != 0) return -1;
 	hi = count;
 	while (lo < hi) {
 		size_t mid = lo + (hi - lo) / 2;

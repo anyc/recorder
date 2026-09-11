@@ -1020,7 +1020,8 @@ static int source_load_index(IteratorSource *source)
 	if (!source->index_reader || strcmp(source->index_reader_path, path) != 0) {
 		index_reader_close(source->index_reader);
 		source->index_reader = NULL;
-		if (index_reader_open(path, &source->index_reader) != 0 ||
+		if (index_reader_open(path, source->segments[source->segment_index].path,
+			&source->index_reader) != 0 ||
 			snprintf(source->index_reader_path, sizeof(source->index_reader_path), "%s", path) >=
 				(int)sizeof(source->index_reader_path)) return -1;
 	}
@@ -1158,7 +1159,8 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 		size_t frame_index;
 		size_t j;
 		if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
-			index_find_realtime_frame(index_path, usec, &frame, &frame_index) != 0) {
+			index_find_realtime_frame(index_path, source->segments[i].path, usec,
+				&frame, &frame_index) != 0) {
 			source->segment_index = i;
 			if (source_load_segment_fallback(reader, source, 1) < 0) return -1;
 			for (j = 0; j < source->entry_count; j++) {
@@ -1209,7 +1211,8 @@ static int source_seek_cursor(RecorderPlayer *reader, IteratorSource *source,
 	if (i == source->segment_count) return -1;
 	source->segment_index = i;
 	if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
-		index_find_offset_frame(index_path, frame_offset, &frame, &frame_index) != 0 ||
+		index_find_offset_frame(index_path, source->segments[i].path, frame_offset,
+			&frame, &frame_index) != 0 ||
 		source_load_index(source) != 0 ||
 		source_load_frame(reader, source, frame_index, 1) != 0) {
 		if (source_load_segment_fallback(reader, source, 1) < 0) return -1;

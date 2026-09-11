@@ -72,6 +72,8 @@ struct SegmentFrameReader {
 	int encrypted;
 };
 
+static int pread_exact(int fd, void *buf, size_t size, off_t offset);
+
 static void secure_clear(void *ptr, size_t len)
 {
 	volatile unsigned char *p = ptr;
@@ -500,9 +502,40 @@ static int segment_parse_header(const void *buf, size_t size,
 }
 
 int segment_read_header(const void *buf, size_t size,
-						SegmentHeader *header, size_t *offset_out)
+							SegmentHeader *header, size_t *offset_out)
 {
 	return segment_parse_header(buf, size, header, offset_out, NULL);
+}
+
+int segment_read_path_header(const char *path, SegmentHeader *header,
+					 size_t *data_offset_out, size_t *file_size_out)
+{
+	unsigned char fixed[SEGMENT_HEADER_FIXED_SIZE];
+	unsigned char *metadata = NULL;
+	struct stat st;
+	size_t metadata_size;
+	uint32_t header_size;
+	int fd = -1;
+	int rc = -1;
+
+	if (!path || !header || !data_offset_out || !file_size_out ||
+		(fd = open(path, O_RDONLY | O_CLOEXEC)) < 0 || fstat(fd, &st) != 0 ||
+		st.st_size < SEGMENT_HEADER_FIXED_SIZE || (uintmax_t)st.st_size > SIZE_MAX ||
+		pread_exact(fd, fixed, sizeof(fixed), 0) != 0) goto out;
+	header_size = read_u32_le(fixed + 12);
+	if (header_size < SEGMENT_HEADER_FIXED_SIZE || header_size > (uint64_t)st.st_size ||
+		read_u32_le(fixed + 144) > (uint64_t)st.st_size - header_size) goto out;
+	metadata_size = header_size + read_u32_le(fixed + 144);
+	metadata = malloc(metadata_size);
+	if (!metadata || pread_exact(fd, metadata, metadata_size, 0) != 0 ||
+		segment_parse_header(metadata, metadata_size, header, data_offset_out, NULL) != 0)
+		goto out;
+	*file_size_out = (size_t)st.st_size;
+	rc = 0;
+out:
+	free(metadata);
+	if (fd >= 0) close(fd);
+	return rc;
 }
 
 static int segment_scan_impl(const void *buf, size_t size,
