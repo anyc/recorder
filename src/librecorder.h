@@ -71,9 +71,9 @@ void rec_player_close(RecorderPlayer *reader);
  * lifetime ends at the next reader call. Cursors use the opaque rec1: format
  * and include the 64-bit store ID; they require a store with state/store-id.
  * get_cursor() allocates its result; release it with free(). Cursors include
- * the priority group. Iterator seeks require the recorder-generated .idx
- * sidecar for every traversed segment; this unreleased format does not fall
- * back to decoding complete segments when an index is absent.
+ * the priority group. Iterators use recorder-generated .idx sidecars for
+ * frame-at-a-time reads and seeks. Missing, stale, incompatible, or damaged
+ * indexes fall back to decoding the corresponding complete segment.
  */
 int rec_player_seek_head(RecorderPlayer *reader);
 int rec_player_seek_tail(RecorderPlayer *reader);

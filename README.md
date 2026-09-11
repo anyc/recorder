@@ -56,9 +56,11 @@ seeks to the cursor of the last entry before reading the next batch. Use
 cursor entry at every batch boundary because `rec_player_seek_cursor()`
 positions the reader at that entry.
 
-`player --stats` uses sidecar indexes when available and warns before falling
-back to decoding a segment. Recreate a missing index with
-`player --rebuild-index -i PATH/SEGMENT.seg`.
+Normal player queries and `player --stats` use sidecar indexes when available.
+Timestamp seeks skip older indexed segments, `-n` reads from the requested
+edge, and `-u UNIT` uses the per-frame service filter as a skip hint. Missing,
+stale, incompatible, or damaged indexes fall back to decoding the matching
+segment. Recreate an index with `player --rebuild-index -i PATH/SEGMENT.seg`.
 
 By default, it also builds the versioned shared library
 `./librecorder.so.1.0.0` with SONAME `librecorder.so.1`; `librecorder.so` and
