@@ -1094,6 +1094,33 @@ static int source_load_segment_fallback(RecorderPlayer *reader, IteratorSource *
 	return source->entry_count != 0;
 }
 
+static int source_position_fallback_after(RecorderPlayer *reader, IteratorSource *source,
+									  const RecorderEntry *previous, int direction)
+{
+	StoredEntry key = { .entry = *previous };
+	ssize_t i;
+
+	key.entry.group = source->group;
+	if (source_load_segment_fallback(reader, source, direction) < 0) return -1;
+	if (direction > 0) {
+		for (i = 0; i < (ssize_t)source->entry_count; i++) {
+			if (compare_stored_entries(&source->entries[i], &key) > 0) {
+				source->entry_index = i;
+				return 1;
+			}
+		}
+	} else {
+		for (i = (ssize_t)source->entry_count - 1; i >= 0; i--) {
+			if (compare_stored_entries(&source->entries[i], &key) < 0) {
+				source->entry_index = i;
+				return 1;
+			}
+		}
+	}
+	source_clear_frame(source);
+	return 0;
+}
+
 static int source_load_segment_edge(RecorderPlayer *reader, IteratorSource *source,
 								 int direction)
 {
@@ -1121,17 +1148,28 @@ static int source_position_edge(RecorderPlayer *reader, IteratorSource *source, 
 
 static int source_advance(RecorderPlayer *reader, IteratorSource *source, int direction)
 {
+	RecorderEntry previous;
+	int have_previous;
+
 	if (!source->entries) return 0;
 	source->entry_index += direction;
 	if (source->entry_index >= 0 && source->entry_index < (ssize_t)source->entry_count) return 1;
+	have_previous = source->entry_count != 0;
+	if (have_previous) previous = source->entries[direction > 0 ?
+		source->entry_count - 1 : 0].entry;
 	for (;;) {
 		if (!source->segment_scan_fallback &&
 			((direction > 0 && ++source->frame_index < source->frame_count) ||
 			(direction < 0 && source->frame_index-- > 0))) {
 			if (source_load_frame(reader, source, source->frame_index, direction) == 0 &&
 				source->entry_count != 0) return 1;
-			if (source_load_segment_fallback(reader, source, direction) < 0) return -1;
-			if (source->entry_count != 0) return 1;
+			if (have_previous) {
+				int rc = source_position_fallback_after(reader, source, &previous, direction);
+				if (rc != 0) return rc;
+			} else {
+				if (source_load_segment_fallback(reader, source, direction) < 0) return -1;
+				if (source->entry_count != 0) return 1;
+			}
 			continue;
 		}
 		if ((direction > 0 && ++source->segment_index >= source->segment_count) ||
