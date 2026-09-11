@@ -588,7 +588,10 @@ int main(void)
 		size_t frame_index;
 
 		if (index_get_frame_count(index_path, segment_path, &frame_count) != 0 ||
-			frame_count != 1 || index_find_realtime_frame(index_path, segment_path,
+			frame_count != 1 || index_read_frame(index_path, segment_path, 0, &frame) != 0 ||
+			!index_frame_may_contain_service(&frame, "smoke.service") ||
+			index_frame_may_contain_service(&frame, "absent.service") ||
+			index_find_realtime_frame(index_path, segment_path,
 				UINT64_MAX, &frame, &frame_index) != 1 || flip_file_byte(index_path, 24) != 0 ||
 			index_get_frame_count(index_path, segment_path, &frame_count) == 0 ||
 			index_rebuild_for_segment(segment_path, index_path, NULL) != 0 ||

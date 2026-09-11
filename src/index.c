@@ -164,7 +164,7 @@ static int write_index_frame(const SegmentHeader *header,
 	fputc(priority, ib->fp);
 	store_u32(ib->fp, (uint32_t)n);
 	fputc(service_kind, ib->fp);
-	fwrite(service_hashes, 1, RECORDER_SERVICE_HASH_BYTES, ib->fp);
+	for (i = 0; i < RECORDER_SERVICE_HASH_SLOTS; i++) store_u64(ib->fp, service_hashes[i]);
 	fputc(overflow, ib->fp);
 	return ferror(ib->fp) ? -1 : 0;
 }
@@ -296,6 +296,23 @@ static void decode_index_frame(const unsigned char record[RECORDER_INDEX_RECORD_
 	frame->max_monotonic_ts = read_u64_le(record + 36);
 	frame->priority = record[44];
 	frame->entry_count = read_u32_le(record + 45);
+	frame->service_filter_kind = record[49];
+	for (size_t i = 0; i < RECORDER_SERVICE_HASH_SLOTS; i++)
+		frame->service_hashes[i] = read_u64_le(record + 50 + i * sizeof(uint64_t));
+	frame->service_overflow = record[82];
+}
+
+int index_frame_may_contain_service(const IndexFrame *frame, const char *unit)
+{
+	size_t i;
+	uint64_t hash;
+
+	if (!frame || !unit || frame->service_filter_kind != 1 || frame->service_overflow)
+		return 1;
+	hash = fnv1a64(unit);
+	for (i = 0; i < RECORDER_SERVICE_HASH_SLOTS; i++)
+		if (frame->service_hashes[i] == hash) return 1;
+	return 0;
 }
 
 static int index_validate_segment(int fd, size_t count, uint64_t index_segment_seq,

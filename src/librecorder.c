@@ -37,6 +37,7 @@ struct RecorderPlayer {
 	size_t history_count;
 	char *data;
 	SegmentDecryptor *decryptor;
+	char *unit_filter;
 	struct FollowSegment *follow_segments;
 	size_t follow_count;
 	size_t follow_capacity;
@@ -684,6 +685,7 @@ void rec_player_close(RecorderPlayer *reader)
 	if (reader->inotify_fd >= 0) close(reader->inotify_fd);
 	clear_entries(reader);
 	segment_decryptor_free(reader->decryptor);
+	free(reader->unit_filter);
 	free(reader->follow_segments);
 	free(reader->data);
 	free(reader->path);
@@ -759,6 +761,17 @@ int rec_player_set_private_key(RecorderPlayer *reader, const char *path)
 	clear_entries(reader);
 	segment_decryptor_free(reader->decryptor);
 	reader->decryptor = decryptor;
+	return 0;
+}
+
+int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit)
+{
+	char *copy = NULL;
+
+	if (!reader || (unit && (!unit[0] || !(copy = strdup(unit))))) return -1;
+	clear_entries(reader);
+	free(reader->unit_filter);
+	reader->unit_filter = copy;
 	return 0;
 }
 
@@ -1064,6 +1077,8 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	segment = &source->segments[source->segment_index];
 	if (!source->index_reader || index_reader_read_frame(source->index_reader, frame_index,
 			&frame) != 0) return -1;
+	source->frame_index = frame_index;
+	if (!index_frame_may_contain_service(&frame, reader->unit_filter)) return 1;
 	if (!source->frame_reader || strcmp(source->frame_reader_path, segment->path) != 0) {
 		segment_frame_reader_close(source->frame_reader);
 		source->frame_reader = NULL;
@@ -1075,9 +1090,21 @@ static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
 	if (segment_frame_reader_scan(source->frame_reader, scan_source_frame,
 							&context, frame.file_offset, frame_index) != 0)
 		return -1;
-	source->frame_index = frame_index;
 	source->entry_index = direction > 0 ? 0 : (ssize_t)source->entry_count - 1;
 	return 0;
+}
+
+static int source_load_indexed_from(RecorderPlayer *reader, IteratorSource *source,
+									size_t frame_index, int direction)
+{
+	for (;;) {
+		int rc = source_load_frame(reader, source, frame_index, direction);
+
+		if (rc < 0) return -1;
+		if (rc == 0 && source->entry_count != 0) return 1;
+		if ((direction > 0 && ++frame_index >= source->frame_count) ||
+			(direction < 0 && frame_index-- == 0)) return 0;
+	}
 }
 
 static int source_load_segment_fallback(RecorderPlayer *reader, IteratorSource *source,
@@ -1126,8 +1153,11 @@ static int source_load_segment_edge(RecorderPlayer *reader, IteratorSource *sour
 {
 	if (source_load_index(source) == 0) {
 		if (source->frame_count == 0) return 0;
-		if (source_load_frame(reader, source, direction > 0 ? 0 : source->frame_count - 1,
-				direction) == 0 && source->entry_count != 0) return 1;
+		{
+			int rc = source_load_indexed_from(reader, source,
+				direction > 0 ? 0 : source->frame_count - 1, direction);
+			if (rc >= 0) return rc;
+		}
 	}
 	return source_load_segment_fallback(reader, source, direction);
 }
@@ -1161,8 +1191,10 @@ static int source_advance(RecorderPlayer *reader, IteratorSource *source, int di
 		if (!source->segment_scan_fallback &&
 			((direction > 0 && ++source->frame_index < source->frame_count) ||
 			(direction < 0 && source->frame_index-- > 0))) {
-			if (source_load_frame(reader, source, source->frame_index, direction) == 0 &&
-				source->entry_count != 0) return 1;
+			int load_rc = source_load_indexed_from(reader, source, source->frame_index,
+				direction);
+			if (load_rc > 0) return 1;
+			if (load_rc == 0) continue;
 			if (have_previous) {
 				int rc = source_position_fallback_after(reader, source, &previous, direction);
 				if (rc != 0) return rc;
@@ -1214,8 +1246,12 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 			continue;
 		}
 		source->segment_index = i;
-		if (source_load_index(source) != 0 ||
-			source_load_frame(reader, source, frame_index, 1) != 0) return -1;
+		if (source_load_index(source) != 0) return -1;
+		{
+			int load_rc = source_load_indexed_from(reader, source, frame_index, 1);
+			if (load_rc < 0) return -1;
+			if (load_rc == 0) continue;
+		}
 		for (j = 0; j < source->entry_count; j++) {
 			if (source->entries[j].entry.realtime_ts >= usec) {
 				source->entry_index = (ssize_t)j;

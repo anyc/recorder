@@ -1330,6 +1330,11 @@ static int scan_log_root(const PlayerOptions *opts)
 		rec_player_close(reader);
 		return 1;
 	}
+	if (opts->unit_filter && rec_player_set_unit_filter(reader, opts->unit_filter) != 0) {
+		fprintf(stderr, "player: failed to configure unit filter\n");
+		rec_player_close(reader);
+		return 1;
+	}
 	do {
 		rc = scan_log_once(reader, opts, &follow_initialized);
 		if (rc != 0 || !opts->follow) {

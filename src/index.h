@@ -19,6 +19,9 @@ typedef struct {
 	uint64_t max_monotonic_ts;
 	uint8_t priority;
 	uint32_t entry_count;
+	uint8_t service_filter_kind;
+	uint64_t service_hashes[4];
+	uint8_t service_overflow;
 } IndexFrame;
 
 typedef int (*index_frame_cb)(const IndexFrame *frame, void *userdata);
@@ -40,6 +43,7 @@ int index_reader_open(const char *path, const char *segment_path, IndexReader **
 void index_reader_close(IndexReader *reader);
 size_t index_reader_frame_count(const IndexReader *reader);
 int index_reader_read_frame(IndexReader *reader, size_t frame_index, IndexFrame *frame_out);
+int index_frame_may_contain_service(const IndexFrame *frame, const char *unit);
 int index_scan_frames(const char *path, const char *segment_path,
 				  index_frame_cb callback, void *userdata);
 /* Locate the first frame whose realtime range can contain usec. Returns zero
