@@ -1,0 +1,12 @@
+.git
+.recorder-log
+*.o
+*.d
+*.so
+*.so.*
+recorder
+player
+smoke-test
+batch-reader
+librecorder.pc
+scripts/__pycache__
