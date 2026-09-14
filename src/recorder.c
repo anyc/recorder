@@ -89,17 +89,43 @@ typedef void sd_journal;
 
 static char g_log_dir[PATH_MAX] = LOG_DIR;
 
-static int build_log_path(char *path, size_t path_size, const char *suffix)
+static int join_path_suffix(char *path, size_t path_size, const char *base,
+							const char *suffix)
 {
-	size_t base_len = strlen(g_log_dir);
+	size_t base_len = strlen(base);
 	size_t suffix_len = strlen(suffix);
 
-	if (base_len + suffix_len + 1 > path_size) {
+	if (base_len >= path_size || suffix_len >= path_size - base_len) {
+		errno = ENAMETOOLONG;
 		return -1;
 	}
-	memcpy(path, g_log_dir, base_len);
+	if (path != base) {
+		memcpy(path, base, base_len);
+	}
 	memcpy(path + base_len, suffix, suffix_len + 1);
 	return 0;
+}
+
+static int join_path_component(char *path, size_t path_size, const char *base,
+							   const char *name)
+{
+	size_t base_len = strlen(base);
+	size_t name_len = strlen(name);
+
+	if (base_len >= path_size || name_len >= path_size - base_len ||
+		path_size - base_len - name_len <= 1) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	memcpy(path, base, base_len);
+	path[base_len] = '/';
+	memcpy(path + base_len + 1, name, name_len + 1);
+	return 0;
+}
+
+static int build_log_path(char *path, size_t path_size, const char *suffix)
+{
+	return join_path_suffix(path, path_size, g_log_dir, suffix);
 }
 
 typedef enum {
@@ -340,7 +366,9 @@ static void on_signal(int sig)
 
 	(void)sig;
 	g_shutdown = 1;
-	(void)write(STDERR_FILENO, message, sizeof(message) - 1);
+	if (write(STDERR_FILENO, message, sizeof(message) - 1) < 0) {
+		/* There is no async-signal-safe recovery for a diagnostic write. */
+	}
 }
 
 static int install_signal_handlers(void)
@@ -1225,8 +1253,8 @@ static int json_get_priority_groups(json_t *root, RecorderConfig *cfg)
 			fprintf(stderr, "recorder: invalid priority group name '%s'\n", json_string_value(name));
 			return -1;
 		}
-		strncpy(cfg->groups[i].name, json_string_value(name), MAX_GROUP_NAME_LEN);
-		cfg->groups[i].name[MAX_GROUP_NAME_LEN] = '\0';
+		memcpy(cfg->groups[i].name, json_string_value(name),
+			   strlen(json_string_value(name)) + 1);
 		cfg->groups[i].min_priority = 255;
 		cfg->groups[i].durability_flush_frames = cfg->durability_flush_frames;
 		cfg->groups[i].durability_flush_interval_sec = cfg->durability_flush_interval_sec;
@@ -1590,6 +1618,7 @@ static void boot_registry_init(BootRegistry *r)
 static BootEntry *boot_registry_get(BootRegistry *r, const char *boot_id)
 {
 	uint32_t i;
+	size_t boot_id_len;
 
 	if (!boot_id) {
 		return NULL;
@@ -1602,8 +1631,9 @@ static BootEntry *boot_registry_get(BootRegistry *r, const char *boot_id)
 	if (r->count >= MAX_BOOTS) {
 		return &r->boots[r->count - 1];
 	}
-	strncpy(r->boots[r->count].id, boot_id, RECORDER_BOOT_ID_SIZE);
-	r->boots[r->count].id[RECORDER_BOOT_ID_SIZE] = '\0';
+	boot_id_len = strnlen(boot_id, RECORDER_BOOT_ID_SIZE);
+	memcpy(r->boots[r->count].id, boot_id, boot_id_len);
+	r->boots[r->count].id[boot_id_len] = '\0';
 	r->boots[r->count].seq = r->count;
 	r->boots[r->count].first_realtime_ts = 0;
 	r->boots[r->count].last_clean_realtime_ts = 0;
@@ -1690,29 +1720,29 @@ static int is_segment_dir_name(const char *name)
 	return valid_group_name(name) && !is_state_dir_name(name);
 }
 
-static void build_segment_dir(char *buf, size_t bufsz, const char *dir_name)
+static int build_segment_dir(char *buf, size_t bufsz, const char *dir_name)
 {
-	snprintf(buf, bufsz, "%s/%s", g_log_dir, dir_name);
+	return join_path_component(buf, bufsz, g_log_dir, dir_name);
 }
 
-static void build_state_segment_seq_path(char *buf, size_t bufsz)
+static int build_state_segment_seq_path(char *buf, size_t bufsz)
 {
-	snprintf(buf, bufsz, "%s/state/segment_seq", g_log_dir);
+	return build_log_path(buf, bufsz, "/state/segment_seq");
 }
 
-static void build_state_boots_path(char *buf, size_t bufsz)
+static int build_state_boots_path(char *buf, size_t bufsz)
 {
-	snprintf(buf, bufsz, "%s/state/boots", g_log_dir);
+	return build_log_path(buf, bufsz, "/state/boots");
 }
 
-static void build_state_lock_path(char *buf, size_t bufsz)
+static int build_state_lock_path(char *buf, size_t bufsz)
 {
-	snprintf(buf, bufsz, "%s/state/store.lock", g_log_dir);
+	return build_log_path(buf, bufsz, "/state/store.lock");
 }
 
-static void build_state_store_id_path(char *buf, size_t bufsz)
+static int build_state_store_id_path(char *buf, size_t bufsz)
 {
-	snprintf(buf, bufsz, "%s/state/store-id", g_log_dir);
+	return build_log_path(buf, bufsz, "/state/store-id");
 }
 
 static int atomic_write_text_file(const char *path, const char *text);
@@ -1730,7 +1760,9 @@ static int ensure_store_id(void)
 	uint64_t random_value;
 	ssize_t n;
 
-	build_state_store_id_path(path, sizeof(path));
+	if (build_state_store_id_path(path, sizeof(path)) != 0) {
+		return -1;
+	}
 	if (access(path, F_OK) == 0) {
 		char *end = NULL;
 		int valid;
@@ -1769,31 +1801,43 @@ static int ensure_store_id(void)
 	return 0;
 }
 
-static void build_segment_path(char *buf, size_t bufsz, const char *dir_name,
+static int build_segment_path(char *buf, size_t bufsz, const char *dir_name,
 								uint64_t seq)
 {
 	char dir[PATH_MAX];
+	char name[32];
 
-	build_segment_dir(dir, sizeof(dir), dir_name);
-	snprintf(buf, bufsz, "%s/%" PRIu64 ".seg", dir, seq);
+	if (build_segment_dir(dir, sizeof(dir), dir_name) != 0 ||
+		snprintf(name, sizeof(name), "%" PRIu64 ".seg", seq) >= (int)sizeof(name)) {
+		return -1;
+	}
+	return join_path_component(buf, bufsz, dir, name);
 }
 
-static void build_segment_tmp_path(char *buf, size_t bufsz, const char *dir_name,
+static int build_segment_tmp_path(char *buf, size_t bufsz, const char *dir_name,
 									uint64_t seq)
 {
-	char dir[256];
+	char dir[PATH_MAX];
+	char name[32];
 
-	build_segment_dir(dir, sizeof(dir), dir_name);
-	snprintf(buf, bufsz, "%s/%" PRIu64 ".seg.tmp", dir, seq);
+	if (build_segment_dir(dir, sizeof(dir), dir_name) != 0 ||
+		snprintf(name, sizeof(name), "%" PRIu64 ".seg.tmp", seq) >= (int)sizeof(name)) {
+		return -1;
+	}
+	return join_path_component(buf, bufsz, dir, name);
 }
 
-static void build_index_path(char *buf, size_t bufsz, const char *dir_name,
+static int build_index_path(char *buf, size_t bufsz, const char *dir_name,
 								uint64_t seq)
 {
-	char dir[256];
+	char dir[PATH_MAX];
+	char name[32];
 
-	build_segment_dir(dir, sizeof(dir), dir_name);
-	snprintf(buf, bufsz, "%s/%" PRIu64 ".idx", dir, seq);
+	if (build_segment_dir(dir, sizeof(dir), dir_name) != 0 ||
+		snprintf(name, sizeof(name), "%" PRIu64 ".idx", seq) >= (int)sizeof(name)) {
+		return -1;
+	}
+	return join_path_component(buf, bufsz, dir, name);
 }
 
 typedef struct {
@@ -1804,11 +1848,13 @@ typedef struct {
 static void scan_existing_segment_seq_max_cb(const char *dir_name, void *ctx)
 {
 	ScanMaxCtx *scan = ctx;
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) {
+		return;
+	}
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
@@ -1844,7 +1890,9 @@ static int read_persisted_next_segment_seq(uint64_t *value_out)
 	char *end = NULL;
 	unsigned long long value;
 
-	build_state_segment_seq_path(path, sizeof(path));
+	if (build_state_segment_seq_path(path, sizeof(path)) != 0) {
+		return -1;
+	}
 	if (access(path, F_OK) != 0) {
 		return -1;
 	}
@@ -1867,7 +1915,9 @@ static int persist_next_segment_seq(uint64_t value)
 	char path[512];
 	char text[64];
 
-	build_state_segment_seq_path(path, sizeof(path));
+	if (build_state_segment_seq_path(path, sizeof(path)) != 0) {
+		return -1;
+	}
 	snprintf(text, sizeof(text), "%" PRIu64 "\n", value);
 	return atomic_write_text_file(path, text);
 }
@@ -2072,7 +2122,9 @@ static int recorder_acquire_store_lock(void)
 	if (mkdir_p(g_log_dir) != 0 || mkdir_p(dir) != 0) {
 		return -1;
 	}
-	build_state_lock_path(path, sizeof(path));
+	if (build_state_lock_path(path, sizeof(path)) != 0) {
+		return -1;
+	}
 	fd = open(path, O_CREAT | O_RDWR | O_CLOEXEC, 0644);
 	if (fd < 0) {
 		return -1;
@@ -2091,13 +2143,15 @@ static int recorder_acquire_store_lock(void)
 
 static void cleanup_segment_dir_cb(const char *dir_name, void *ctx)
 {
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 	int changed = 0;
 	(void)ctx;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) {
+		return;
+	}
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
@@ -2108,14 +2162,16 @@ static void cleanup_segment_dir_cb(const char *dir_name, void *ctx)
 		if (len > 8 && strcmp(de->d_name + len - 8, ".seg.tmp") == 0) {
 			char path[512];
 
-			snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+			if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+				continue;
 			if (unlink(path) == 0) {
 				changed = 1;
 			}
 		} else if (len > 8 && strcmp(de->d_name + len - 8, ".idx.tmp") == 0) {
 			char path[512];
 
-			snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+			if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+				continue;
 			if (unlink(path) == 0) {
 				changed = 1;
 			}
@@ -2129,20 +2185,20 @@ static void cleanup_segment_dir_cb(const char *dir_name, void *ctx)
 
 static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 {
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 	int changed = 0;
 	(void)ctx;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) return;
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
 	}
 	while ((de = readdir(dir)) != NULL) {
 		size_t len = strlen(de->d_name);
-		char path[512];
+		char path[PATH_MAX];
 		uint64_t seq = 0;
 		SegmentHeader header;
 		SegmentFooter footer;
@@ -2153,15 +2209,16 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 			continue;
 		}
 		segment_seq_from_name(de->d_name, &seq);
-		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+		if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+			continue;
 		if (stat(path, &st) != 0) {
 			continue;
 		}
 		if (st.st_size == 0) {
 			char idx_path[512];
 
-			build_index_path(idx_path, sizeof(idx_path), dir_name, seq);
-			unlink(idx_path);
+			if (build_index_path(idx_path, sizeof(idx_path), dir_name, seq) == 0)
+				unlink(idx_path);
 			if (unlink(path) == 0) {
 				changed = 1;
 			}
@@ -2170,8 +2227,8 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 		if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 			char idx_path[512];
 
-			build_index_path(idx_path, sizeof(idx_path), dir_name, seq);
-			unlink(idx_path);
+			if (build_index_path(idx_path, sizeof(idx_path), dir_name, seq) == 0)
+				unlink(idx_path);
 			if (unlink(path) == 0) {
 				changed = 1;
 			}
@@ -2192,8 +2249,8 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 			char idx_path[512];
 			struct stat idx_st;
 
-			build_index_path(idx_path, sizeof(idx_path), dir_name, header.segment_seq);
-			if ((header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 &&
+			if (build_index_path(idx_path, sizeof(idx_path), dir_name,
+				header.segment_seq) == 0 && (header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 &&
 				(stat(idx_path, &idx_st) != 0 || idx_st.st_mtime < st.st_mtime)) {
 				index_rebuild_for_segment(path, idx_path, NULL);
 			}
@@ -2247,13 +2304,13 @@ static void for_each_segment_dir(void (*fn)(const char *dir_name, void *ctx), vo
 		return;
 	}
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
+		char path[PATH_MAX];
 		struct stat st;
 
 		if (!is_segment_dir_name(de->d_name)) {
 			continue;
 		}
-		build_segment_dir(path, sizeof(path), de->d_name);
+		if (build_segment_dir(path, sizeof(path), de->d_name) != 0) continue;
 		if (stat(path, &st) == 0 && S_ISDIR(st.st_mode)) {
 			fn(de->d_name, ctx);
 		}
@@ -2268,20 +2325,21 @@ typedef struct {
 static void count_store_bytes_cb(const char *dir_name, void *ctx)
 {
 	CountBytesCtx *count = ctx;
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) return;
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
 	}
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
+		char path[PATH_MAX];
 		struct stat st;
 
-		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+		if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+			continue;
 		if (stat(path, &st) == 0 && S_ISREG(st.st_mode)) {
 			count->total += (uint64_t)st.st_size;
 		}
@@ -2334,17 +2392,17 @@ typedef struct {
 static void collect_closed_segments_cb(const char *dir_name, void *ctx)
 {
 	CollectSegmentsCtx *collect = ctx;
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) return;
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
 	}
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
+		char path[PATH_MAX];
 		struct stat st;
 		uint64_t seq;
 
@@ -2355,17 +2413,17 @@ static void collect_closed_segments_cb(const char *dir_name, void *ctx)
 		if (segment_seq_from_name(de->d_name, &seq) != 0) {
 			continue;
 		}
-		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+		if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+			continue;
 		if (path_is_active_segment(collect->recorder, path) ||
 			stat(path, &st) != 0 || !S_ISREG(st.st_mode)) {
 			continue;
 		}
-		strncpy(collect->files[collect->count].path, path,
-				sizeof(collect->files[collect->count].path) - 1);
-		collect->files[collect->count].path[sizeof(collect->files[collect->count].path) - 1] = '\0';
-		strncpy(collect->files[collect->count].dir_name, dir_name,
-				sizeof(collect->files[collect->count].dir_name) - 1);
-		collect->files[collect->count].dir_name[sizeof(collect->files[collect->count].dir_name) - 1] = '\0';
+		if (snprintf(collect->files[collect->count].path,
+				sizeof(collect->files[collect->count].path), "%s", path) >=
+			(int)sizeof(collect->files[collect->count].path)) continue;
+		memcpy(collect->files[collect->count].dir_name, dir_name,
+			   strlen(dir_name) + 1);
 		collect->files[collect->count].min_priority = 7;
 		collect->files[collect->count].group_index = -1;
 		collect->files[collect->count].segment_seq = seq;
@@ -2430,19 +2488,19 @@ static int retention_remove_file(Recorder *r, RetainedFile *file,
 						 uint64_t *total, uint64_t *group_bytes)
 {
 	char idx_path[512];
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 
 	if (unlink(file->path) != 0) {
 		return 0;
 	}
-	build_index_path(idx_path, sizeof(idx_path), file->dir_name, file->segment_seq);
-	unlink(idx_path);
+	if (build_index_path(idx_path, sizeof(idx_path), file->dir_name,
+		file->segment_seq) == 0) unlink(idx_path);
 	*total = *total > file->size ? *total - file->size : 0;
 	if (file->group_index >= 0 && group_bytes[file->group_index] >= file->size) {
 		group_bytes[file->group_index] -= file->size;
 	}
-	build_segment_dir(dir_path, sizeof(dir_path), file->dir_name);
-	fsync_dir_path(dir_path);
+	if (build_segment_dir(dir_path, sizeof(dir_path), file->dir_name) == 0)
+		fsync_dir_path(dir_path);
 	recorder_verbose_log(r,
 						"retention removed segment seq=%" PRIu64 " group=%s size=%" PRIu64 " bytes",
 						file->segment_seq, file->dir_name, file->size);
@@ -2540,17 +2598,17 @@ typedef struct {
 static void boot_registry_rebuild_from_segments_cb(const char *dir_name, void *ctx)
 {
 	BootRebuildCtx *rebuild = ctx;
-	char dir_path[256];
+	char dir_path[PATH_MAX];
 	DIR *dir;
 	struct dirent *de;
 
-	build_segment_dir(dir_path, sizeof(dir_path), dir_name);
+	if (build_segment_dir(dir_path, sizeof(dir_path), dir_name) != 0) return;
 	dir = opendir(dir_path);
 	if (!dir) {
 		return;
 	}
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
+		char path[PATH_MAX];
 		SegmentHeader header;
 		SegmentFooter footer;
 		size_t committed_end = 0;
@@ -2559,7 +2617,8 @@ static void boot_registry_rebuild_from_segments_cb(const char *dir_name, void *c
 		if (!strstr(de->d_name, ".seg")) {
 			continue;
 		}
-		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+		if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0)
+			continue;
 		if (segment_scan_path(path, NULL, NULL, NULL, &header, &footer, &committed_end) != 0) {
 			continue;
 		}
@@ -2599,7 +2658,7 @@ static int load_boot_state(BootRegistry *boots)
 	size_t idx;
 	json_t *node;
 
-	build_state_boots_path(path, sizeof(path));
+	if (build_state_boots_path(path, sizeof(path)) != 0) return -1;
 	if (access(path, F_OK) != 0) {
 		return -1;
 	}
@@ -2642,7 +2701,7 @@ static int persist_boot_state(const BootRegistry *boots)
 {
 	char path[512];
 	json_t *root = json_array();
-	char *text;
+	char *text = NULL;
 	uint32_t i;
 	int rc = -1;
 
@@ -2675,10 +2734,12 @@ static int persist_boot_state(const BootRegistry *boots)
 	if (!text) {
 		goto out;
 	}
-	build_state_boots_path(path, sizeof(path));
+	if (build_state_boots_path(path, sizeof(path)) != 0) {
+		goto out;
+	}
 	rc = atomic_write_text_file(path, text);
-	free(text);
 out:
+	free(text);
 	json_decref(root);
 	return rc;
 }
@@ -3266,8 +3327,7 @@ static void writer_init(PriorityWriter *w, const PriorityGroup *group, uint8_t g
 {
 	memset(w, 0, sizeof(*w));
 	w->group_index = group_index;
-	strncpy(w->group_name, group->name, sizeof(w->group_name) - 1);
-	w->group_name[sizeof(w->group_name) - 1] = '\0';
+	memcpy(w->group_name, group->name, strlen(group->name) + 1);
 }
 
 static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *entry,
@@ -3279,16 +3339,18 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	char *dict_buf = NULL;
 	size_t dict_len = 0;
 
-	build_segment_dir(dir, sizeof(dir), w->group_name);
-	if (mkdir_p(dir) != 0) {
+	if (build_segment_dir(dir, sizeof(dir), w->group_name) != 0 || mkdir_p(dir) != 0) {
 		return -1;
 	}
 	w->segment_seq = r->next_segment_seq++;
 	if (persist_next_segment_seq(r->next_segment_seq) != 0) {
 		return -1;
 	}
-	build_segment_path(w->path, sizeof(w->path), w->group_name, w->segment_seq);
-	build_segment_tmp_path(w->tmp_path, sizeof(w->tmp_path), w->group_name, w->segment_seq);
+	if (build_segment_path(w->path, sizeof(w->path), w->group_name, w->segment_seq) != 0 ||
+		build_segment_tmp_path(w->tmp_path, sizeof(w->tmp_path), w->group_name,
+			w->segment_seq) != 0) {
+		return -1;
+	}
 	w->fp = fopen(w->tmp_path, "wb");
 	if (!w->fp) {
 		fprintf(stderr, "recorder: fopen(%s): %m\n", w->tmp_path);
@@ -3307,7 +3369,8 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	memset(&header, 0, sizeof(header));
 	header.segment_seq = w->segment_seq;
 	header.boot_seq = entry->boot_seq;
-	strncpy(header.boot_id, entry->boot_id, RECORDER_BOOT_ID_SIZE);
+	memcpy(header.boot_id, entry->boot_id, RECORDER_BOOT_ID_SIZE);
+	header.boot_id[RECORDER_BOOT_ID_SIZE] = '\0';
 	current_timezone_string(header.timezone);
 	header.first_realtime_ts = entry->realtime_ts;
 	header.first_monotonic_ts = entry->monotonic_ts;
@@ -3338,7 +3401,15 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 		w->fp = NULL;
 		return -1;
 	}
-	build_index_path(idx_path, sizeof(idx_path), w->group_name, w->segment_seq);
+	if (build_index_path(idx_path, sizeof(idx_path), w->group_name, w->segment_seq) != 0) {
+		fclose(w->fp);
+		free(dict_buf);
+		segment_encryptor_free(w->encryptor);
+		w->encryptor = NULL;
+		w->fp = NULL;
+		unlink(w->tmp_path);
+		return -1;
+	}
 	if (index_writer_open(idx_path, header.segment_seq, header.flags, &w->index_writer) != 0) {
 		fclose(w->fp);
 		free(dict_buf);
@@ -3379,10 +3450,9 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 		return -1;
 	}
 
-	strncpy(w->boot_id, header.boot_id, RECORDER_BOOT_ID_SIZE);
+	memcpy(w->boot_id, header.boot_id, RECORDER_BOOT_ID_SIZE);
 	w->boot_id[RECORDER_BOOT_ID_SIZE] = '\0';
-	strncpy(w->timezone, header.timezone, sizeof(w->timezone) - 1);
-	w->timezone[sizeof(w->timezone) - 1] = '\0';
+	memcpy(w->timezone, header.timezone, sizeof(w->timezone));
 	w->boot_seq = entry->boot_seq;
 	{
 		off_t pos = ftello(w->fp);
@@ -3594,8 +3664,8 @@ static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reas
 	{
 		char dir[256];
 
-		build_segment_dir(dir, sizeof(dir), w->group_name);
-		fsync_dir_path(dir);
+		if (build_segment_dir(dir, sizeof(dir), w->group_name) == 0)
+			fsync_dir_path(dir);
 	}
 	w->fp = NULL;
 	w->open = 0;
@@ -3671,11 +3741,14 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 		r->script_worker = NULL;
 	}
 	r->persistent_cursor_enabled = journal_mode;
-	if (snprintf(r->persistent_cursor_path, sizeof(r->persistent_cursor_path),
-				 "%s/state/journal.cursor%s%s", g_log_dir,
-				 journal_namespace ? "." : "",
-				 journal_namespace ? journal_namespace : "") >=
-		(int)sizeof(r->persistent_cursor_path)) {
+	if (build_log_path(r->persistent_cursor_path, sizeof(r->persistent_cursor_path),
+			"/state/journal.cursor") != 0 ||
+		(journal_namespace &&
+			(join_path_suffix(r->persistent_cursor_path,
+				sizeof(r->persistent_cursor_path), r->persistent_cursor_path, ".") != 0 ||
+			 join_path_suffix(r->persistent_cursor_path,
+				sizeof(r->persistent_cursor_path), r->persistent_cursor_path,
+				journal_namespace) != 0))) {
 		return -1;
 	}
 	if (!journal_mode) {
@@ -3690,9 +3763,10 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 										 sizeof(r->cursor_path)) == 0) {
 		r->cursor_enabled = 1;
 		if (journal_namespace &&
-			snprintf(runtime_cursor_path, sizeof(runtime_cursor_path), "%s.%s",
-					 r->cursor_path, journal_namespace) >=
-			(int)sizeof(runtime_cursor_path)) {
+			(join_path_suffix(runtime_cursor_path, sizeof(runtime_cursor_path),
+				r->cursor_path, ".") != 0 ||
+			 join_path_suffix(runtime_cursor_path, sizeof(runtime_cursor_path),
+				runtime_cursor_path, journal_namespace) != 0)) {
 			return -1;
 		}
 		if (journal_namespace) {
@@ -4148,7 +4222,7 @@ static void recorder_shutdown(Recorder *r)
 			r->writers[i].last_realtime_ts > max_last_rt[i]) {
 			max_last_rt[i] = r->writers[i].last_realtime_ts;
 		}
-		strncpy(boot_ids[i], r->writers[i].boot_id, RECORDER_BOOT_ID_SIZE);
+		memcpy(boot_ids[i], r->writers[i].boot_id, RECORDER_BOOT_ID_SIZE);
 		boot_ids[i][RECORDER_BOOT_ID_SIZE] = '\0';
 		if (r->writers[i].open) {
 			if (writer_close_segment(r, &r->writers[i], "shutdown",

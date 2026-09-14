@@ -233,9 +233,11 @@ int segment_write_header(FILE *fp, const SegmentHeader *header,
 	write_u64_le(buf + 20, header->segment_seq);
 	write_u32_le(buf + 28, header->boot_seq);
 	memset(buf + 32, 0, RECORDER_BOOT_ID_SIZE);
-	strncpy((char *)buf + 32, header->boot_id, RECORDER_BOOT_ID_SIZE);
+	memcpy(buf + 32, header->boot_id,
+		strnlen(header->boot_id, RECORDER_BOOT_ID_SIZE));
 	memset(buf + 64, 0, RECORDER_SEGMENT_TZ_SIZE);
-	strncpy((char *)buf + 64, header->timezone, RECORDER_SEGMENT_TZ_SIZE - 1);
+	memcpy(buf + 64, header->timezone,
+		strnlen(header->timezone, RECORDER_SEGMENT_TZ_SIZE - 1));
 	write_u64_le(buf + 128, header->first_realtime_ts);
 	write_u64_le(buf + 136, header->first_monotonic_ts);
 	write_u32_le(buf + 144, (uint32_t)dict_len);

@@ -3,6 +3,7 @@
 #include <errno.h>
 #include <dirent.h>
 #include <inttypes.h>
+#include <limits.h>
 #include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -18,7 +19,7 @@
 #define FOLLOW_INITIAL_ENTRY_COUNT 10
 
 typedef struct {
-	char path[512];
+	char path[PATH_MAX];
 	uint64_t segment_seq;
 } SegmentPath;
 
@@ -104,6 +105,23 @@ typedef struct {
 	size_t group_capacity;
 	uint64_t total_count;
 } StatsContext;
+
+static int join_path_component(char *path, size_t path_size, const char *base,
+							   const char *name)
+{
+	size_t base_len = strlen(base);
+	size_t name_len = strlen(name);
+
+	if (base_len >= path_size || name_len >= path_size - base_len ||
+		path_size - base_len - name_len <= 1) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
+	memcpy(path, base, base_len);
+	path[base_len] = '/';
+	memcpy(path + base_len + 1, name, name_len + 1);
+	return 0;
+}
 
 static int compare_disk_usage_groups(const void *left, const void *right)
 {
@@ -241,9 +259,7 @@ static int print_disk_usage(const char *root_path)
 			groups = new_groups;
 			group_capacity = new_capacity;
 		}
-		strncpy(groups[group_count].name, de->d_name,
-				sizeof(groups[group_count].name) - 1);
-		groups[group_count].name[sizeof(groups[group_count].name) - 1] = '\0';
+		memcpy(groups[group_count].name, de->d_name, strlen(de->d_name) + 1);
 		groups[group_count].bytes = group_bytes;
 		group_count++;
 	}
@@ -875,6 +891,12 @@ static int add_segment_file(SegmentPath **items, size_t *count, size_t *cap,
 							const char *path, uint64_t segment_seq)
 {
 	SegmentPath *tmp;
+	size_t path_len = strlen(path);
+
+	if (path_len >= sizeof((*items)[0].path)) {
+		errno = ENAMETOOLONG;
+		return -1;
+	}
 
 	if (*count == *cap) {
 		size_t new_cap = *cap ? (*cap * 2) : 32;
@@ -885,8 +907,7 @@ static int add_segment_file(SegmentPath **items, size_t *count, size_t *cap,
 		*items = tmp;
 		*cap = new_cap;
 	}
-	strncpy((*items)[*count].path, path, sizeof((*items)[*count].path) - 1);
-	(*items)[*count].path[sizeof((*items)[*count].path) - 1] = '\0';
+	memcpy((*items)[*count].path, path, path_len + 1);
 	(*items)[*count].segment_seq = segment_seq;
 	(*count)++;
 	return 0;
@@ -972,7 +993,7 @@ static int add_boot(BootInfo **boots, size_t *count, size_t *cap,
 	}
 	memset(&(*boots)[*count], 0, sizeof((*boots)[*count]));
 	(*boots)[*count].boot_seq = header->boot_seq;
-	strncpy((*boots)[*count].boot_id, header->boot_id, RECORDER_BOOT_ID_SIZE);
+	memcpy((*boots)[*count].boot_id, header->boot_id, RECORDER_BOOT_ID_SIZE);
 	(*boots)[*count].boot_id[RECORDER_BOOT_ID_SIZE] = '\0';
 	(*boots)[*count].first_realtime_ts = header->first_realtime_ts;
 	(*boots)[*count].last_realtime_ts = last_realtime_ts;
@@ -992,12 +1013,15 @@ static int collect_segments_in_dir(const char *dir_path, SegmentPath **items,
 	}
 	while ((de = readdir(dir)) != NULL) {
 		uint64_t seq;
-		char path[512];
+		char path[PATH_MAX];
 
 		if (segment_seq_from_name(de->d_name, &seq) != 0) {
 			continue;
 		}
-		snprintf(path, sizeof(path), "%s/%s", dir_path, de->d_name);
+		if (join_path_component(path, sizeof(path), dir_path, de->d_name) != 0) {
+			closedir(dir);
+			return -1;
+		}
 		if (add_segment_file(items, count, cap, path, seq) != 0) {
 			closedir(dir);
 			return -1;
@@ -1025,13 +1049,16 @@ static int collect_log_segments(const char *root_path, SegmentPath **items,
 		return -1;
 	}
 	while ((de = readdir(dir)) != NULL) {
-		char path[512];
+		char path[PATH_MAX];
 		struct stat child_st;
 
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0) {
 			continue;
 		}
-		snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name);
+		if (join_path_component(path, sizeof(path), root_path, de->d_name) != 0) {
+			rc = -1;
+			break;
+		}
 		if (stat(path, &child_st) != 0) {
 			continue;
 		}
