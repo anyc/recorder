@@ -22,6 +22,7 @@ OPENSSL_PKG ?= libcrypto
 PCRE2 ?= auto
 LIBC_REGEX ?= 1
 SYSTEMD ?= auto
+OPTFLAGS ?= -O2
 COMPARE_STORAGE_ARGS ?=
 BENCHMARK_STORAGE_ARGS ?=
 BENCHMARK_CAPACITY_ARGS ?=
@@ -89,6 +90,7 @@ LDLIBS += $(if $(HAVE_SYSTEMD),$(shell $(PKG_CONFIG) --libs libsystemd))
 LDLIBS += $(if $(HAVE_PCRE2),$(shell $(PKG_CONFIG) --libs $(PCRE2_PKG)))
 LDLIBS += $(FLATCC_LIBS)
 
+CFLAGS ?= $(OPTFLAGS)
 CFLAGS += -ggdb -Wall -MMD -MP -pthread -fPIC
 LDLIBS += -pthread
 
