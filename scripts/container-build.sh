@@ -74,8 +74,21 @@ if [ "$engine" = podman ]; then
 	# Relabel the bind mount when Podman is running with SELinux enabled.
 	volume_suffix=:Z
 fi
+run_build='created_flatcc=0
+if [ ! -e flatcc ]; then
+    ln -s /opt/flatcc-src flatcc
+    created_flatcc=1
+fi
+cleanup()
+{
+    if [ "$created_flatcc" -eq 1 ]; then
+        rm -f flatcc
+    fi
+}
+trap cleanup EXIT
+make -B'
 if [ "$run_tests" -eq 1 ]; then
-	"$engine" run --rm -v "$repo_dir:/workspace$volume_suffix" "$image_name" sh -c 'make -B test'
+	"$engine" run --rm -v "$repo_dir:/workspace$volume_suffix" "$image_name" sh -c "$run_build test"
 else
-	"$engine" run --rm -v "$repo_dir:/workspace$volume_suffix" "$image_name" make repo
+	"$engine" run --rm -v "$repo_dir:/workspace$volume_suffix" "$image_name" sh -c "$run_build repo"
 fi

@@ -30,7 +30,8 @@ RUN cmake -S /tmp/flatcc -B /tmp/flatcc-build \
         -DCMAKE_INSTALL_PREFIX=/opt/flatcc \
     && cmake --build /tmp/flatcc-build --parallel \
     && cmake --install /tmp/flatcc-build \
-    && rm -rf /tmp/flatcc /tmp/flatcc-build
+    && mv /tmp/flatcc /opt/flatcc-src \
+    && rm -rf /tmp/flatcc-build
 
 ENV PATH="/opt/flatcc/bin:${PATH}"
 WORKDIR /workspace
