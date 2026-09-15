@@ -230,6 +230,7 @@ typedef struct {
 typedef struct {
 	JournalField name;
 	JournalField value;
+	char *owned_data;
 } JournalExtraField;
 
 typedef struct {
@@ -2790,6 +2791,8 @@ static int capture_extra_journal_fields(LogEntry *entry, sd_journal *j,
 		while (sd_journal_enumerate_data(j, &data, &len) > 0) {
 			const char *equals = memchr(data, '=', len);
 			JournalExtraField *tmp;
+			JournalExtraField *field;
+			char *owned_data;
 			size_t name_len;
 
 			if (!equals) {
@@ -2812,12 +2815,17 @@ static int capture_extra_journal_fields(LogEntry *entry, sd_journal *j,
 				return -1;
 			}
 			entry->extra_fields = tmp;
-			entry->extra_fields[entry->extra_field_count].name.data = data;
-			entry->extra_fields[entry->extra_field_count].name.len = name_len;
-			entry->extra_fields[entry->extra_field_count].value.data =
-				(const char *)equals + 1;
-			entry->extra_fields[entry->extra_field_count].value.len =
-				len - name_len - 1;
+			owned_data = malloc(len + 1);
+			if (!owned_data) return -1;
+			memcpy(owned_data, data, len);
+			owned_data[len] = '\0';
+			field = &entry->extra_fields[entry->extra_field_count];
+			memset(field, 0, sizeof(*field));
+			field->owned_data = owned_data;
+			field->name.data = owned_data;
+			field->name.len = name_len;
+			field->value.data = owned_data + name_len + 1;
+			field->value.len = len - name_len - 1;
 			entry->extra_field_count++;
 		}
 	}
@@ -2827,6 +2835,11 @@ static int capture_extra_journal_fields(LogEntry *entry, sd_journal *j,
 
 static void free_extra_journal_fields(LogEntry *entry)
 {
+	size_t i;
+
+	for (i = 0; i < entry->extra_field_count; i++) {
+		free(entry->extra_fields[i].owned_data);
+	}
 	free(entry->extra_fields);
 	entry->extra_fields = NULL;
 	entry->extra_field_count = 0;
@@ -2862,6 +2875,24 @@ static JournalField journal_field_for_capture(sd_journal *j, const char *name,
 	return capture_all_fields ? value : journal_field_nonempty(value);
 }
 
+static int capture_owned_journal_field(sd_journal *j, const char *name,
+								int capture_all_fields, JournalField *field,
+								char **owned)
+{
+	JournalField value = journal_field_for_capture(j, name, capture_all_fields);
+	char *copy;
+
+	if (!value.data) return 0;
+	copy = malloc(value.len + 1);
+	if (!copy) return -1;
+	memcpy(copy, value.data, value.len);
+	copy[value.len] = '\0';
+	*owned = copy;
+	field->data = copy;
+	field->len = value.len;
+	return 0;
+}
+
 static int extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 								BootRegistry *boots)
 {
@@ -2891,17 +2922,26 @@ static int extract_entry(LogEntry *entry, sd_journal *j, RecorderConfig *cfg,
 			boot->first_realtime_ts = entry->realtime_ts;
 		}
 	}
-	entry->message = journal_field_for_capture(j, "MESSAGE", cfg->capture_all_fields);
-	entry->message_id = (cfg->capture_all_fields || cfg->capture_message_id) ?
-						journal_field_for_capture(j, "MESSAGE_ID", cfg->capture_all_fields) : (JournalField){0};
-	entry->unit = (cfg->capture_all_fields || cfg->capture_unit) ?
-					journal_field_for_capture(j, "_SYSTEMD_UNIT", cfg->capture_all_fields) : (JournalField){0};
-	entry->hostname = (cfg->capture_all_fields || cfg->capture_hostname) ?
-						journal_field_for_capture(j, "_HOSTNAME", cfg->capture_all_fields) : (JournalField){0};
-	entry->comm = (cfg->capture_all_fields || cfg->capture_comm) ?
-					journal_field_for_capture(j, "_COMM", cfg->capture_all_fields) : (JournalField){0};
-	entry->exe = (cfg->capture_all_fields || cfg->capture_exe) ?
-					journal_field_for_capture(j, "_EXE", cfg->capture_all_fields) : (JournalField){0};
+	if (capture_owned_journal_field(j, "MESSAGE", cfg->capture_all_fields,
+			&entry->message, &entry->owned_message) != 0 ||
+		((cfg->capture_all_fields || cfg->capture_message_id) &&
+		 capture_owned_journal_field(j, "MESSAGE_ID", cfg->capture_all_fields,
+			&entry->message_id, &entry->owned_message_id) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_unit) &&
+		 capture_owned_journal_field(j, "_SYSTEMD_UNIT", cfg->capture_all_fields,
+			&entry->unit, &entry->owned_unit) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_hostname) &&
+		 capture_owned_journal_field(j, "_HOSTNAME", cfg->capture_all_fields,
+			&entry->hostname, &entry->owned_hostname) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_comm) &&
+		 capture_owned_journal_field(j, "_COMM", cfg->capture_all_fields,
+			&entry->comm, &entry->owned_comm) != 0) ||
+		((cfg->capture_all_fields || cfg->capture_exe) &&
+		 capture_owned_journal_field(j, "_EXE", cfg->capture_all_fields,
+			&entry->exe, &entry->owned_exe) != 0)) {
+		free_owned_journal_fields(entry);
+		return -1;
+	}
 	entry->pid = (cfg->capture_all_fields || cfg->capture_pid || !config_uses_full_entries(cfg)) ?
 		journal_get_u32(j, "_PID") : 0;
 	entry->uid = (cfg->capture_all_fields || cfg->capture_uid) ? journal_get_u32(j, "_UID") : 0;
