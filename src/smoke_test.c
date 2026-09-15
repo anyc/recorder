@@ -235,7 +235,8 @@ static int check_frame(const SegmentHeader *header,
 		fprintf(stderr, "smoke: bad segment header\n");
 		return -1;
 	}
-	if (flatbuffers_uint32_vec_len(entries) != 1) {
+	if (flatbuffers_uint32_vec_len(entries) != 1 &&
+		flatbuffers_uint32_vec_len(entries) != 3) {
 		fprintf(stderr, "smoke: bad entry count\n");
 		return -1;
 	}
@@ -309,7 +310,7 @@ static int check_encrypted_segment(const void *chunk_buf, size_t chunk_size)
 	header.first_realtime_ts = 1234;
 	header.first_monotonic_ts = 5678;
 	memset(&footer, 0, sizeof(footer));
-	footer.entry_count = 1;
+	footer.entry_count = 3;
 	footer.last_realtime_ts = 1234;
 	footer.last_monotonic_ts = 5678;
 	if (segment_write_header(fp, &header, NULL, 0, encryptor) != 0 ||
@@ -327,7 +328,7 @@ static int check_encrypted_segment(const void *chunk_buf, size_t chunk_size)
 	if (segment_scan_path(segment_path, NULL, NULL, NULL, &header, &footer,
 						  &committed_end) != 0 ||
 		(header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 ||
-		footer.entry_count != 1 || committed_end == 0) {
+		footer.entry_count != 3 || committed_end == 0) {
 		fprintf(stderr, "smoke: encrypted metadata-only scan failed\n");
 		goto out;
 	}
@@ -346,7 +347,7 @@ static int check_encrypted_segment(const void *chunk_buf, size_t chunk_size)
 	ctx.seen = 0;
 	if (segment_scan_path(segment_path, decryptor, check_frame, &ctx, &header,
 						  &footer, &committed_end) != 0 || ctx.seen != 1 ||
-		footer.entry_count != 1) {
+		footer.entry_count != 3) {
 		fprintf(stderr, "smoke: encrypted round-trip failed\n");
 		goto out;
 	}
@@ -420,6 +421,14 @@ static int check_reader_entry(const RecorderEntry *entry, void *ctx)
 	return 0;
 }
 
+static int current_entry_index_is(RecorderPlayer *reader, uint32_t expected)
+{
+	const RecorderEntry *entry = NULL;
+
+	return rec_player_get_entry(reader, &entry) == 0 &&
+		entry->frame_entry_index == expected;
+}
+
 int main(void)
 {
 	flatcc_builder_t B;
@@ -430,6 +439,7 @@ int main(void)
 	journal_Field_ref_t field_ref;
 	journal_Field_vec_ref_t fields_ref;
 	journal_FullEntry_ref_t entry_ref;
+	journal_FullEntry_ref_t entry_refs[3];
 	journal_FullEntry_vec_ref_t entries_ref;
 	void *chunk_buf = NULL;
 	size_t chunk_size_raw;
@@ -503,7 +513,10 @@ int main(void)
 	journal_FullEntry_fields_add(&B, fields_ref);
 	entry_ref = journal_FullEntry_end(&B);
 
-	entries_ref = journal_FullEntry_vec_create(&B, &entry_ref, 1);
+	entry_refs[0] = entry_ref;
+	entry_refs[1] = entry_ref;
+	entry_refs[2] = entry_ref;
+	entries_ref = journal_FullEntry_vec_create(&B, entry_refs, 3);
 	if (!entries_ref || !journal_Chunk_create_as_root(&B, entries_ref)) {
 		fprintf(stderr, "smoke: build chunk failed\n");
 		fclose(fp);
@@ -525,7 +538,7 @@ int main(void)
 		return 1;
 	}
 	memset(&footer, 0, sizeof(footer));
-	footer.entry_count = 1;
+	footer.entry_count = 3;
 	footer.last_realtime_ts = 1234;
 	footer.last_monotonic_ts = 5678;
 	if (segment_write_footer(fp, &footer) != 0) {
@@ -558,7 +571,7 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
-	if (ctx.seen != 1 || footer.entry_count != 1 || committed_end == 0) {
+	if (ctx.seen != 1 || footer.entry_count != 3 || committed_end == 0) {
 		fprintf(stderr, "smoke: wrong scan result\n");
 		unlink(path);
 		return 1;
@@ -623,6 +636,7 @@ int main(void)
 	}
 	{
 		RecorderPlayer *reader = NULL;
+		const RecorderEntry *entry = NULL;
 		const void *data;
 		size_t data_size;
 		char *cursor = NULL;
@@ -630,15 +644,17 @@ int main(void)
 		ctx.seen = 0;
 		if (rec_player_open(&reader, store_dir) != 0 ||
 			rec_player_scan_file(reader, segment_path, check_reader_entry, &ctx, 0, NULL) != 0 ||
-			ctx.seen != 1) {
+			ctx.seen != 3) {
 			fprintf(stderr, "smoke: librecorder scan failed\n");
 			rec_player_close(reader);
 			unlink(segment_path);
 			return 1;
 		}
 		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
 			rec_player_get_cursor(reader, &cursor) != 0 || unlink(index_path) != 0 ||
 			rec_player_seek_cursor(reader, cursor) != 0 || rec_player_next(reader) != 1 ||
+			!current_entry_index_is(reader, 1) ||
 			rec_player_get_data(reader, "MESSAGE", &data,
 				&data_size) != 0 || data_size != strlen("MESSAGE=hello smoke") ||
 			memcmp(data, "MESSAGE=hello smoke", data_size) != 0 ||
@@ -652,14 +668,54 @@ int main(void)
 		free(cursor);
 		cursor = NULL;
 		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
 			rec_player_get_data(reader, "MESSAGE", &data, &data_size) != 0 ||
 			data_size != strlen("MESSAGE=hello smoke") ||
 			memcmp(data, "MESSAGE=hello smoke", data_size) != 0 ||
 			rec_player_get_cursor(reader, &cursor) != 0 ||
 			rec_player_test_cursor(reader, cursor) != 1 ||
 			rec_player_seek_cursor(reader, cursor) != 0 ||
-			rec_player_next(reader) != 1) {
+			rec_player_test_cursor(reader, cursor) != -1 ||
+			rec_player_get_entry(reader, &entry) != -1 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1)) {
 			fprintf(stderr, "smoke: librecorder iterator failed\n");
+			free(cursor);
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		if (rec_player_seek_head(reader) != 0 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 0) ||
+			rec_player_seek_tail(reader) != 0 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
+			rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 0) ||
+			rec_player_seek_tail(reader) != 0 || rec_player_previous(reader) != 1 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1)) {
+			fprintf(stderr, "smoke: cursor seek direction state failed\n");
+			free(cursor);
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		if (rec_player_seek_head(reader) != 0 ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 0) ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 0) ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 2) ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 1) ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 0) ||
+			rec_player_next(reader) != 1 || !current_entry_index_is(reader, 1) ||
+			rec_player_seek_tail(reader) != 0 ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 2) ||
+			rec_player_next(reader) != 0 || rec_player_get_entry(reader, &entry) != -1 ||
+			rec_player_previous(reader) != 1 || !current_entry_index_is(reader, 2)) {
+			fprintf(stderr, "smoke: iterator direction switch failed\n");
 			free(cursor);
 			rec_player_close(reader);
 			unlink(segment_path);
@@ -705,6 +761,8 @@ int main(void)
 				rec_player_next(reader) != 1 ||
 				rec_player_get_entry(reader, &entry) != 0 ||
 				strcmp(entry->message, "hello smoke") != 0 ||
+				rec_player_next(reader) != 1 ||
+				rec_player_next(reader) != 1 ||
 				rec_player_next(reader) != 0) {
 				fprintf(stderr, "smoke: librecorder follow rotation failed\n");
 				free(segment_copy);

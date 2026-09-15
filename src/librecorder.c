@@ -24,6 +24,7 @@ enum {
 	ITERATOR_STATE_FORWARD = 1,
 	ITERATOR_STATE_REVERSE = -1,
 	ITERATOR_STATE_FOLLOW = 2,
+	ITERATOR_STATE_CURSOR_PENDING = 3,
 };
 
 struct RecorderPlayer {
@@ -1328,6 +1329,48 @@ static int source_seek_cursor(RecorderPlayer *reader, IteratorSource *source,
 	return -1;
 }
 
+static int source_has_current(const IteratorSource *source)
+{
+	return source && source->entry_index >= 0 &&
+		source->entry_index < (ssize_t)source->entry_count;
+}
+
+static int iterator_position_at_cursor(RecorderPlayer *reader, size_t source_index)
+{
+	IteratorSource *cursor_source;
+	StoredEntry cursor_entry;
+	size_t i;
+
+	if (!reader || source_index >= reader->source_count) return -1;
+	cursor_source = &reader->sources[source_index];
+	if (!source_has_current(cursor_source)) return -1;
+	cursor_entry = cursor_source->entries[cursor_source->entry_index];
+
+	/* source_seek_realtime() leaves every source near the cursor timestamp.
+	 * Normalize each one to its first entry at or after the exact cursor so
+	 * either direction can be selected by the next iterator operation. */
+	for (i = 0; i < reader->source_count; i++) {
+		IteratorSource *source = &reader->sources[i];
+
+		while (source_has_current(source) &&
+			compare_stored_entries(&source->entries[source->entry_index],
+				&cursor_entry) < 0) {
+			int rc = source_advance(reader, source, ITERATOR_STATE_FORWARD);
+
+			if (rc < 0) return -1;
+			if (rc == 0) break;
+		}
+	}
+	if (!source_has_current(cursor_source) ||
+		compare_stored_entries(&cursor_source->entries[cursor_source->entry_index],
+			&cursor_entry) != 0) return -1;
+	reader->current_source = source_index;
+	reader->current_entry_ptr = NULL;
+	reader->current_valid = 0;
+	reader->iterator_state = ITERATOR_STATE_CURSOR_PENDING;
+	return 0;
+}
+
 static int iterator_initialize(RecorderPlayer *reader, int direction)
 {
 	SegmentPath *paths = NULL;
@@ -1658,26 +1701,15 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 	uint64_t store_id;
 	uint32_t frame_entry_index;
 	char group[64];
-	const RecorderEntry *entry;
-	const IteratorSource *current_source;
 	if (!reader || !reader->have_store_id ||
 		parse_cursor(cursor, &store_id, group, sizeof(group), &segment_seq, &frame_offset,
 			&frame_entry_index) != 0 ||
 		store_id != reader->store_id) return -1;
-	entry = current_entry(reader);
-	current_source = reader->current_source < reader->source_count ?
-		&reader->sources[reader->current_source] : NULL;
-	if (entry && current_source && strcmp(current_source->group, group) == 0 &&
-		entry->segment_seq == segment_seq && entry->frame_offset == frame_offset &&
-		entry->frame_entry_index == frame_entry_index) {
-		reader->current_valid = 0;
-		reader->current_entry_ptr = NULL;
-		return 0;
-	}
 	if (iterator_initialize(reader, 1) != 0) return -1;
 	{
 		IteratorSource *source = NULL;
 		size_t i;
+		size_t source_index;
 		uint64_t realtime_ts;
 		for (i = 0; i < reader->source_count; i++)
 			if (strcmp(reader->sources[i].group, group) == 0) { source = &reader->sources[i]; break; }
@@ -1689,8 +1721,8 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 			if (strcmp(reader->sources[i].group, group) == 0) { source = &reader->sources[i]; break; }
 		if (source_seek_cursor(reader, source, segment_seq, frame_offset,
 			frame_entry_index, &realtime_ts) != 0) return -1;
-		reader->current_valid = 0;
-		reader->current_entry_ptr = NULL;
+		source_index = (size_t)(source - reader->sources);
+		if (iterator_position_at_cursor(reader, source_index) != 0) return -1;
 	}
 	return 0;
 }
@@ -1713,6 +1745,52 @@ int rec_player_test_cursor(RecorderPlayer *reader, const char *cursor)
 		entry->frame_entry_index == frame_entry_index;
 }
 
+static int iterator_reposition_after_current(RecorderPlayer *reader, int direction)
+{
+	const RecorderEntry *current = current_entry(reader);
+	StoredEntry key;
+	char group[64];
+	size_t i;
+
+	if (!current || !current->group ||
+		snprintf(group, sizeof(group), "%s", current->group) >= (int)sizeof(group)) return -1;
+	memset(&key, 0, sizeof(key));
+	key.entry = *current;
+	key.entry.group = group;
+	if (iterator_seek_realtime(reader, key.entry.realtime_ts) != 0) return -1;
+	for (i = 0; i < reader->source_count; i++) {
+		IteratorSource *source = &reader->sources[i];
+
+		if (direction == ITERATOR_STATE_FORWARD) {
+			while (source_has_current(source) &&
+				compare_stored_entries(&source->entries[source->entry_index], &key) <= 0) {
+				int rc = source_advance(reader, source, ITERATOR_STATE_FORWARD);
+
+				if (rc < 0) return -1;
+				if (rc == 0) break;
+			}
+		} else {
+			while (source_has_current(source) &&
+				compare_stored_entries(&source->entries[source->entry_index], &key) < 0) {
+				int rc = source_advance(reader, source, ITERATOR_STATE_FORWARD);
+
+				if (rc < 0) return -1;
+				if (rc == 0) break;
+			}
+			if (source_has_current(source)) {
+				if (source_advance(reader, source, ITERATOR_STATE_REVERSE) < 0) return -1;
+			} else if (source_position_edge(reader, source, ITERATOR_STATE_REVERSE) < 0) {
+				return -1;
+			}
+		}
+	}
+	reader->current_source = SIZE_MAX;
+	reader->current_entry_ptr = NULL;
+	reader->current_valid = 0;
+	reader->iterator_state = direction;
+	return 0;
+}
+
 int rec_player_next(RecorderPlayer *reader)
 {
 	ssize_t pick;
@@ -1727,12 +1805,20 @@ int rec_player_next(RecorderPlayer *reader)
 		reader->current_valid = 1;
 		return 1;
 	}
-	if (reader->iterator_state != ITERATOR_STATE_FORWARD &&
+	if (reader->iterator_state == ITERATOR_STATE_CURSOR_PENDING) {
+		reader->iterator_state = ITERATOR_STATE_FORWARD;
+	} else if (reader->iterator_state == ITERATOR_STATE_REVERSE && reader->current_valid) {
+		if (iterator_reposition_after_current(reader, ITERATOR_STATE_FORWARD) != 0) return -1;
+	} else if (reader->iterator_state != ITERATOR_STATE_FORWARD &&
 		rec_player_seek_head(reader) != 0) return -1;
-	if (reader->current_valid && source_advance(reader,
+	else if (reader->current_valid && source_advance(reader,
 		&reader->sources[reader->current_source], ITERATOR_STATE_FORWARD) < 0) return -1;
 	pick = iterator_pick(reader, ITERATOR_STATE_FORWARD);
-	if (pick < 0) return 0;
+	if (pick < 0) {
+		reader->current_entry_ptr = NULL;
+		reader->current_valid = 0;
+		return 0;
+	}
 	reader->current_source = (size_t)pick;
 	reader->current_entry_ptr = &reader->sources[pick].entries[
 		reader->sources[pick].entry_index];
@@ -1743,13 +1829,35 @@ int rec_player_next(RecorderPlayer *reader)
 int rec_player_previous(RecorderPlayer *reader)
 {
 	ssize_t pick;
+	size_t i;
 	if (!reader) return -1;
-	if (reader->iterator_state != ITERATOR_STATE_REVERSE &&
+	if (reader->iterator_state == ITERATOR_STATE_CURSOR_PENDING) {
+		for (i = 0; i < reader->source_count; i++) {
+			IteratorSource *source = &reader->sources[i];
+			int rc = source_has_current(source) ?
+				source_advance(reader, source, ITERATOR_STATE_REVERSE) :
+				source_position_edge(reader, source, ITERATOR_STATE_REVERSE);
+
+			if (rc < 0) return -1;
+		}
+		reader->current_valid = 0;
+		reader->current_entry_ptr = NULL;
+		reader->iterator_state = ITERATOR_STATE_REVERSE;
+	} else if ((reader->iterator_state == ITERATOR_STATE_FORWARD ||
+		reader->iterator_state == ITERATOR_STATE_FOLLOW) && reader->current_valid) {
+		if (iterator_reposition_after_current(reader, ITERATOR_STATE_REVERSE) != 0) return -1;
+	} else if (reader->iterator_state == ITERATOR_STATE_FOLLOW) {
+		reader->iterator_state = ITERATOR_STATE_REVERSE;
+	} else if (reader->iterator_state != ITERATOR_STATE_REVERSE &&
 		rec_player_seek_tail(reader) != 0) return -1;
-	if (reader->current_valid && source_advance(reader,
+	else if (reader->current_valid && source_advance(reader,
 		&reader->sources[reader->current_source], ITERATOR_STATE_REVERSE) < 0) return -1;
 	pick = iterator_pick(reader, ITERATOR_STATE_REVERSE);
-	if (pick < 0) return 0;
+	if (pick < 0) {
+		reader->current_entry_ptr = NULL;
+		reader->current_valid = 0;
+		return 0;
+	}
 	reader->current_source = (size_t)pick;
 	reader->current_entry_ptr = &reader->sources[pick].entries[
 		reader->sources[pick].entry_index];

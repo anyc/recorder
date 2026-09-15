@@ -79,6 +79,8 @@ int rec_player_seek_head(RecorderPlayer *reader);
 int rec_player_seek_tail(RecorderPlayer *reader);
 /** Position before the first entry with realtime timestamp at or after usec. */
 int rec_player_seek_realtime_usec(RecorderPlayer *reader, uint64_t usec);
+/** Seek to a cursor position without making an entry current. The following
+ * next() returns the cursor entry; previous() returns its predecessor. */
 int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_test_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_next(RecorderPlayer *reader);
