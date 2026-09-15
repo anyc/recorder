@@ -19,6 +19,13 @@
 typedef struct SegmentPath SegmentPath;
 typedef struct IteratorSource IteratorSource;
 
+enum {
+	ITERATOR_STATE_NONE = 0,
+	ITERATOR_STATE_FORWARD = 1,
+	ITERATOR_STATE_REVERSE = -1,
+	ITERATOR_STATE_FOLLOW = 2,
+};
+
 struct RecorderPlayer {
 	char *path;
 	int inotify_fd;
@@ -49,7 +56,7 @@ struct RecorderPlayer {
 	IteratorSource *sources;
 	size_t source_count;
 	size_t current_source;
-	int iterator_direction;
+	int iterator_state;
 };
 
 typedef struct StoredEntry {
@@ -997,7 +1004,7 @@ static void iterator_reset(RecorderPlayer *reader)
 	reader->current_source = SIZE_MAX;
 	reader->current_entry_ptr = NULL;
 	reader->current_valid = 0;
-	reader->iterator_direction = 0;
+	reader->iterator_state = ITERATOR_STATE_NONE;
 }
 
 static int source_add_segment(IteratorSource *source, const SegmentPath *path)
@@ -1352,7 +1359,7 @@ static int iterator_initialize(RecorderPlayer *reader, int direction)
 	free(paths);
 	for (i = 0; i < reader->source_count; i++)
 		if (source_position_edge(reader, &reader->sources[i], direction) < 0) goto fail_reset;
-	reader->iterator_direction = direction;
+	reader->iterator_state = direction;
 	return 0;
 fail:
 	free(paths);
@@ -1634,7 +1641,7 @@ int rec_player_seek_tail(RecorderPlayer *reader)
 	}
 	/* The frame cursors are retained for previous(); next() after tail is fed
 	 * only by the high-water-mark follow queue. */
-	reader->iterator_direction = 2;
+	reader->iterator_state = ITERATOR_STATE_FOLLOW;
 	reader->current = 0;
 	return 0;
 }
@@ -1710,7 +1717,7 @@ int rec_player_next(RecorderPlayer *reader)
 {
 	ssize_t pick;
 	if (!reader) return -1;
-	if (reader->iterator_direction == 2) {
+	if (reader->iterator_state == ITERATOR_STATE_FOLLOW) {
 		if (reader->follow_pending) {
 			if (append_pending_entries(reader) != 0) return -1;
 			reader->follow_pending = 0;
@@ -1720,10 +1727,11 @@ int rec_player_next(RecorderPlayer *reader)
 		reader->current_valid = 1;
 		return 1;
 	}
-	if (reader->iterator_direction != 1 && rec_player_seek_head(reader) != 0) return -1;
+	if (reader->iterator_state != ITERATOR_STATE_FORWARD &&
+		rec_player_seek_head(reader) != 0) return -1;
 	if (reader->current_valid && source_advance(reader,
-		&reader->sources[reader->current_source], 1) < 0) return -1;
-	pick = iterator_pick(reader, 1);
+		&reader->sources[reader->current_source], ITERATOR_STATE_FORWARD) < 0) return -1;
+	pick = iterator_pick(reader, ITERATOR_STATE_FORWARD);
 	if (pick < 0) return 0;
 	reader->current_source = (size_t)pick;
 	reader->current_entry_ptr = &reader->sources[pick].entries[
@@ -1736,10 +1744,11 @@ int rec_player_previous(RecorderPlayer *reader)
 {
 	ssize_t pick;
 	if (!reader) return -1;
-	if (reader->iterator_direction != -1 && rec_player_seek_tail(reader) != 0) return -1;
+	if (reader->iterator_state != ITERATOR_STATE_REVERSE &&
+		rec_player_seek_tail(reader) != 0) return -1;
 	if (reader->current_valid && source_advance(reader,
-		&reader->sources[reader->current_source], -1) < 0) return -1;
-	pick = iterator_pick(reader, -1);
+		&reader->sources[reader->current_source], ITERATOR_STATE_REVERSE) < 0) return -1;
+	pick = iterator_pick(reader, ITERATOR_STATE_REVERSE);
 	if (pick < 0) return 0;
 	reader->current_source = (size_t)pick;
 	reader->current_entry_ptr = &reader->sources[pick].entries[
