@@ -68,6 +68,13 @@ int main(int argc, char **argv)
 				fprintf(stderr, "batch-reader: cannot resume from cursor\n");
 				goto out;
 			}
+			/* Like sd_journal_seek_cursor(), seeking does not make an entry
+			 * current. Select and skip the last entry from the prior batch. */
+			if (rec_player_next(reader) != 1 ||
+				rec_player_test_cursor(reader, cursor) != 1) {
+				fprintf(stderr, "batch-reader: resume cursor is unavailable\n");
+				goto out;
+			}
 			free(cursor);
 			cursor = NULL;
 			resumes++;
