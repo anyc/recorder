@@ -4270,6 +4270,7 @@ int main(int argc, char **argv)
 	Recorder r;
 	RecorderConfig cfg;
 	const char *cfg_path;
+	const char *config_path = NULL;
 	const char *cursor_path = NULL;
 	const char *journal_namespace = NULL;
 	const char *syslog_path = NULL;
@@ -4285,6 +4286,7 @@ int main(int argc, char **argv)
 		{ "cursor", required_argument, NULL, 'c' },
 		{ "namespace", required_argument, NULL, 'n' },
 		{ "log-dir", required_argument, NULL, 'l' },
+		{ "config", required_argument, NULL, 'C' },
 		{ "fallback", no_argument, NULL, 'F' },
 		{ "syslog-socket", required_argument, NULL, 's' },
 		{ "kernel-path", required_argument, NULL, 'k' },
@@ -4293,7 +4295,7 @@ int main(int argc, char **argv)
 	};
 
 	opterr = 0;
-	while ((opt = getopt_long(argc, argv, "v1c:n:l:Fs:k:K", options, NULL)) != -1) {
+	while ((opt = getopt_long(argc, argv, "v1c:n:l:C:Fs:k:K", options, NULL)) != -1) {
 		switch (opt) {
 		case 'v':
 			verbose++;
@@ -4314,6 +4316,9 @@ int main(int argc, char **argv)
 				return 1;
 			}
 			break;
+		case 'C':
+			config_path = optarg;
+			break;
 		case 'F':
 			fallback_mode = 1;
 			break;
@@ -4330,7 +4335,7 @@ int main(int argc, char **argv)
 			kernel_path = NULL;
 			break;
 		default:
-			fprintf(stderr, "usage: %s [-v] [-1|--last] [-c PATH|--cursor PATH] [-n NAME|--namespace NAME] [-l PATH|--log-dir PATH] [--fallback [--syslog-socket PATH] [--kernel-path PATH|--no-kmsg]]\n", argv[0]);
+			fprintf(stderr, "usage: %s [-v] [-1|--last] [-c PATH|--cursor PATH] [-n NAME|--namespace NAME] [-l PATH|--log-dir PATH] [-C PATH|--config PATH] [--fallback [--syslog-socket PATH] [--kernel-path PATH|--no-kmsg]]\n", argv[0]);
 			return 1;
 		}
 	}
@@ -4346,7 +4351,7 @@ int main(int argc, char **argv)
 	#endif
 
 	recorder_config_init(&cfg);
-	cfg_path = recorder_config_path();
+	cfg_path = config_path ? config_path : recorder_config_path();
 	if (recorder_config_load(&cfg, cfg_path) != 0) {
 		recorder_config_destroy(&cfg);
 		return 1;
