@@ -1,10 +1,12 @@
 #define _POSIX_C_SOURCE 200809L
 
+#include <signal.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <poll.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
 #include <flatcc/flatcc_builder.h>
@@ -127,6 +129,17 @@ static int write_file(const char *path, const void *buf, size_t size)
 	if (fwrite(buf, 1, size, fp) != size) rv = -1;
 	if (fclose(fp) != 0) rv = -1;
 	if (rv != 0) unlink(path);
+	return rv;
+}
+
+static int append_file(const char *path, const void *buf, size_t size)
+{
+	FILE *fp = fopen(path, "ab");
+	int rv = 0;
+
+	if (!fp) return -1;
+	if (fwrite(buf, 1, size, fp) != size || fflush(fp) != 0) rv = -1;
+	if (fclose(fp) != 0) rv = -1;
 	return rv;
 }
 
@@ -429,6 +442,129 @@ static int current_entry_index_is(RecorderPlayer *reader, uint32_t expected)
 		entry->frame_entry_index == expected;
 }
 
+static int seek_cursor_is_current(RecorderPlayer *reader, const char *cursor)
+{
+	return rec_player_seek_cursor(reader, cursor) == 0 &&
+		rec_player_next(reader) == 1 && rec_player_test_cursor(reader, cursor) == 1;
+}
+
+static int check_cursor_during_store_updates(const char *store_dir,
+									 const char *source_segment)
+{
+	unsigned char *segment = NULL;
+	size_t segment_size = 0;
+	size_t active_size;
+	size_t frame_offset;
+	size_t frame_size;
+	char active_group[512];
+	char active_segment[512];
+	char active_index[512];
+	char rotating_group[512];
+	char rotating_segment[512];
+	char rotating_swap[512];
+	char cursor[192];
+	char missing_cursor[192];
+	RecorderPlayer *reader = NULL;
+	pid_t child = -1;
+	int child_status = 0;
+	int rv = -1;
+	int i;
+
+	if (snprintf(active_group, sizeof(active_group), "%s/p5", store_dir) >=
+			(int)sizeof(active_group) ||
+		snprintf(active_segment, sizeof(active_segment), "%s/7.seg", active_group) >=
+			(int)sizeof(active_segment) ||
+		snprintf(active_index, sizeof(active_index), "%s/7.idx", active_group) >=
+			(int)sizeof(active_index) ||
+		snprintf(rotating_group, sizeof(rotating_group), "%s/p6", store_dir) >=
+			(int)sizeof(rotating_group) ||
+		snprintf(rotating_segment, sizeof(rotating_segment), "%s/7.seg", rotating_group) >=
+			(int)sizeof(rotating_segment) ||
+		snprintf(rotating_swap, sizeof(rotating_swap), "%s/7.swap", rotating_group) >=
+			(int)sizeof(rotating_swap) ||
+		mkdir(active_group, 0755) != 0 || mkdir(rotating_group, 0755) != 0 ||
+		read_file(source_segment, &segment, &segment_size) != 0 ||
+		segment_size <= segment_footer_encoded_size() + segment_header_encoded_size()) goto out;
+	active_size = segment_size - segment_footer_encoded_size();
+	frame_offset = segment_header_encoded_size();
+	frame_size = active_size - frame_offset;
+	if (write_file(active_segment, segment, active_size) != 0 ||
+		index_rebuild_for_segment(active_segment, active_index, NULL) != 0 ||
+		append_file(active_segment, segment + frame_offset, frame_size) != 0 ||
+		write_file(rotating_swap, segment, segment_size) != 0 ||
+		snprintf(cursor, sizeof(cursor), "rec1:0123456789abcdef:p5:7:%llx:1",
+			(unsigned long long)active_size) >= (int)sizeof(cursor) ||
+		snprintf(missing_cursor, sizeof(missing_cursor),
+			"rec1:0123456789abcdef:p5:ffffffff:%llx:1",
+			(unsigned long long)active_size) >= (int)sizeof(missing_cursor) ||
+		rec_player_open(&reader, store_dir) != 0 ||
+		rec_player_set_repair_indexes(reader, 1) != 0 ||
+		!seek_cursor_is_current(reader, cursor)) goto out;
+
+	/* Grow the active segment while its index remains one complete frame behind. */
+	child = fork();
+	if (child < 0) goto out;
+	if (child == 0) {
+		FILE *fp = fopen(active_segment, "ab");
+		size_t offset = 0;
+		struct timespec delay = { .tv_sec = 0, .tv_nsec = 100000 };
+
+		if (!fp) _exit(1);
+		while (offset < frame_size) {
+			size_t count = frame_size - offset > 17 ? 17 : frame_size - offset;
+
+			if (fwrite(segment + frame_offset + offset, 1, count, fp) != count ||
+				fflush(fp) != 0) {
+				fclose(fp);
+				_exit(1);
+			}
+			offset += count;
+			nanosleep(&delay, NULL);
+		}
+		_exit(fclose(fp) == 0 ? 0 : 1);
+	}
+	for (i = 0; i < 100; i++) {
+		if (!seek_cursor_is_current(reader, cursor)) goto out;
+	}
+	if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) ||
+		WEXITSTATUS(child_status) != 0) goto out;
+	child = -1;
+
+	/* Repeated atomic appearance/disappearance models another group rotating. */
+	child = fork();
+	if (child < 0) goto out;
+	if (child == 0) {
+		for (i = 0; i < 500; i++) {
+			if (rename(rotating_swap, rotating_segment) != 0 ||
+				rename(rotating_segment, rotating_swap) != 0) _exit(1);
+		}
+		_exit(0);
+	}
+	for (i = 0; i < 100; i++) {
+		if (!seek_cursor_is_current(reader, cursor)) goto out;
+	}
+	if (waitpid(child, &child_status, 0) != child || !WIFEXITED(child_status) ||
+		WEXITSTATUS(child_status) != 0) goto out;
+	child = -1;
+	if (rec_player_seek_cursor(reader, missing_cursor) == 0) goto out;
+	rv = 0;
+
+out:
+	if (child > 0) {
+		kill(child, SIGTERM);
+		waitpid(child, NULL, 0);
+	}
+	rec_player_close(reader);
+	free(segment);
+	unlink(active_index);
+	unlink(active_segment);
+	unlink(rotating_segment);
+	unlink(rotating_swap);
+	rmdir(active_group);
+	rmdir(rotating_group);
+	return rv;
+}
+
 int main(void)
 {
 	flatcc_builder_t B;
@@ -628,6 +764,16 @@ int main(void)
 	if (fclose(fp) != 0) {
 		fprintf(stderr, "smoke: close store ID failed\n");
 		unlink(segment_path);
+		unlink(store_id_path);
+		rmdir(group_path);
+		rmdir(state_path);
+		rmdir(store_dir);
+		return 1;
+	}
+	if (check_cursor_during_store_updates(store_dir, segment_path) != 0) {
+		fprintf(stderr, "smoke: cursor lookup during store updates failed\n");
+		unlink(segment_path);
+		unlink(index_path);
 		unlink(store_id_path);
 		rmdir(group_path);
 		rmdir(state_path);
