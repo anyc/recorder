@@ -25,7 +25,6 @@ enum {
 	ITERATOR_STATE_REVERSE = -1,
 	ITERATOR_STATE_FOLLOW = 2,
 	ITERATOR_STATE_CURSOR_PENDING = 3,
-	CURSOR_SEEK_MAX_ATTEMPTS = 3,
 };
 
 struct RecorderPlayer {
@@ -1794,8 +1793,6 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 	uint64_t store_id;
 	uint32_t frame_entry_index;
 	char group[64];
-	int attempt;
-	int saved_errno = ENOENT;
 
 	if (!reader || !reader->have_store_id ||
 		parse_cursor(cursor, &store_id, group, sizeof(group), &segment_seq, &frame_offset,
@@ -1807,18 +1804,14 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 		errno = ESTALE;
 		return -1;
 	}
-	for (attempt = 0; attempt < CURSOR_SEEK_MAX_ATTEMPTS; attempt++) {
-		if (rec_player_seek_cursor_once(reader, group, segment_seq, frame_offset,
-				frame_entry_index) == 0) return 0;
-		saved_errno = errno;
-		if (attempt + 1 < CURSOR_SEEK_MAX_ATTEMPTS) {
-			struct timespec delay = { .tv_sec = 0, .tv_nsec = 1000000 };
+	if (rec_player_seek_cursor_once(reader, group, segment_seq, frame_offset,
+			frame_entry_index) == 0) return 0;
+	{
+		int saved_errno = errno;
 
-			nanosleep(&delay, NULL);
-		}
+		iterator_reset(reader);
+		errno = saved_errno ? saved_errno : ENOENT;
 	}
-	iterator_reset(reader);
-	errno = saved_errno ? saved_errno : ENOENT;
 	return -1;
 }
 
