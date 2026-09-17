@@ -46,6 +46,7 @@ struct RecorderPlayer {
 	size_t history_count;
 	char *data;
 	SegmentDecryptor *decryptor;
+	int repair_indexes;
 	char *unit_filter;
 	struct FollowSegment *follow_segments;
 	size_t follow_count;
@@ -784,6 +785,13 @@ int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit)
 	return 0;
 }
 
+int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled)
+{
+	if (!reader) return -1;
+	reader->repair_indexes = enabled != 0;
+	return 0;
+}
+
 int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 						  rec_player_entry_cb callback, void *userdata,
 						  uint64_t min_frame_offset,
@@ -1031,7 +1039,29 @@ static int segment_index_path(const char *segment_path, char *index_path, size_t
 	return 0;
 }
 
-static int source_load_index(IteratorSource *source)
+static int source_repair_index(RecorderPlayer *reader, IteratorSource *source,
+						 const char *index_path)
+{
+	SegmentFooter footer;
+	struct stat st;
+	size_t committed_end = 0;
+	const char *segment_path;
+
+	if (!reader->repair_indexes) return -1;
+	segment_path = source->segments[source->segment_index].path;
+	if (stat(segment_path, &st) != 0 ||
+		segment_scan_path(segment_path, reader->decryptor, NULL, NULL, NULL,
+			&footer, &committed_end) != 0 || !footer.present ||
+		committed_end != (size_t)st.st_size) {
+		errno = EAGAIN;
+		return -1;
+	}
+	if (index_rebuild_for_segment(segment_path,
+			index_path, reader->decryptor) != 0) return -1;
+	return 0;
+}
+
+static int source_load_index(RecorderPlayer *reader, IteratorSource *source)
 {
 	char path[512];
 	source->frame_count = 0;
@@ -1042,8 +1072,11 @@ static int source_load_index(IteratorSource *source)
 	if (!source->index_reader || strcmp(source->index_reader_path, path) != 0) {
 		index_reader_close(source->index_reader);
 		source->index_reader = NULL;
-		if (index_reader_open(path, source->segments[source->segment_index].path,
-			&source->index_reader) != 0 ||
+		if ((index_reader_open(path, source->segments[source->segment_index].path,
+			&source->index_reader) != 0 &&
+			(source_repair_index(reader, source, path) != 0 ||
+			 index_reader_open(path, source->segments[source->segment_index].path,
+				&source->index_reader) != 0)) ||
 			snprintf(source->index_reader_path, sizeof(source->index_reader_path), "%s", path) >=
 				(int)sizeof(source->index_reader_path)) return -1;
 	}
@@ -1160,7 +1193,7 @@ static int source_position_fallback_after(RecorderPlayer *reader, IteratorSource
 static int source_load_segment_edge(RecorderPlayer *reader, IteratorSource *source,
 								 int direction)
 {
-	if (source_load_index(source) == 0) {
+	if (source_load_index(reader, source) == 0) {
 		if (source->frame_count == 0) return 0;
 		{
 			int rc = source_load_indexed_from(reader, source,
@@ -1242,6 +1275,10 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 			find_rc = -1;
 		else find_rc = index_find_realtime_frame(index_path, source->segments[i].path,
 			usec, &frame, &frame_index);
+		if (find_rc < 0) source->segment_index = i;
+		if (find_rc < 0 && source_repair_index(reader, source, index_path) == 0)
+			find_rc = index_find_realtime_frame(index_path, source->segments[i].path,
+				usec, &frame, &frame_index);
 		if (find_rc > 0) continue;
 		if (find_rc < 0) {
 			source->segment_index = i;
@@ -1255,7 +1292,7 @@ static int source_seek_realtime(RecorderPlayer *reader, IteratorSource *source,
 			continue;
 		}
 		source->segment_index = i;
-		if (source_load_index(source) != 0) return -1;
+		if (source_load_index(reader, source) != 0) return -1;
 		{
 			int load_rc = source_load_indexed_from(reader, source, frame_index, 1);
 			if (load_rc < 0) return -1;
@@ -1303,7 +1340,7 @@ static int source_seek_cursor(RecorderPlayer *reader, IteratorSource *source,
 	if (segment_index_path(source->segments[i].path, index_path, sizeof(index_path)) != 0 ||
 		index_find_offset_frame(index_path, source->segments[i].path, frame_offset,
 			&frame, &frame_index) != 0 ||
-		source_load_index(source) != 0 ||
+		source_load_index(reader, source) != 0 ||
 		source_load_frame(reader, source, frame_index, 1) != 0) {
 		if (source_load_segment_fallback(reader, source, 1) < 0) return -1;
 	}
