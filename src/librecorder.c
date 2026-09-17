@@ -46,6 +46,7 @@ struct RecorderPlayer {
 	char *data;
 	SegmentDecryptor *decryptor;
 	int repair_indexes;
+	int force_repair_indexes;
 	char *unit_filter;
 	struct FollowSegment *follow_segments;
 	size_t follow_count;
@@ -791,6 +792,13 @@ int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled)
 	return 0;
 }
 
+int rec_player_set_force_repair_indexes(RecorderPlayer *reader, int enabled)
+{
+	if (!reader) return -1;
+	reader->force_repair_indexes = enabled != 0;
+	return 0;
+}
+
 int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 						  rec_player_entry_cb callback, void *userdata,
 						  uint64_t min_frame_offset,
@@ -1047,6 +1055,11 @@ static int source_repair_index(RecorderPlayer *reader, IteratorSource *source,
 	const char *segment_path;
 
 	if (!reader->repair_indexes) return -1;
+	if (!reader->force_repair_indexes &&
+		source->segment_index + 1 == source->segment_count) {
+		errno = EAGAIN;
+		return -1;
+	}
 	segment_path = source->segments[source->segment_index].path;
 	if (stat(segment_path, &st) != 0 ||
 		segment_scan_path(segment_path, reader->decryptor, NULL, NULL, NULL,

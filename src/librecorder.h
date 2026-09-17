@@ -57,6 +57,8 @@ int rec_player_set_private_key(RecorderPlayer *reader, const char *path);
 int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit);
 /** Enable lazy repair of unusable sidecar indexes while reading. */
 int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled);
+/** Allow lazy repair of the latest segment in each group. */
+int rec_player_set_force_repair_indexes(RecorderPlayer *reader, int enabled);
 /** Close a reader and release all associated resources. */
 void rec_player_close(RecorderPlayer *reader);
 
