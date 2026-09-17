@@ -707,7 +707,7 @@ int main(void)
 		unlink(path);
 		return 1;
 	}
-	if (ctx.seen != 1 || footer.entry_count != 3 || committed_end == 0) {
+	if (ctx.seen != 1 || !footer.present || footer.entry_count != 3 || committed_end == 0) {
 		fprintf(stderr, "smoke: wrong scan result\n");
 		unlink(path);
 		return 1;
@@ -807,6 +807,15 @@ int main(void)
 			rec_player_seek_realtime_usec(reader, 1234) != 0 || rec_player_next(reader) != 1 ||
 			index_rebuild_for_segment(segment_path, index_path, NULL) != 0) {
 			fprintf(stderr, "smoke: librecorder index fallback failed\n");
+			rec_player_close(reader);
+			unlink(segment_path);
+			return 1;
+		}
+		if (rec_player_set_repair_indexes(reader, 1) != 0 || unlink(index_path) != 0 ||
+			rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			access(index_path, F_OK) != 0) {
+			fprintf(stderr, "smoke: finalized index lazy repair failed\n");
+			free(cursor);
 			rec_player_close(reader);
 			unlink(segment_path);
 			return 1;
