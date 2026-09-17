@@ -813,8 +813,11 @@ int main(void)
 		}
 		if (rec_player_set_repair_indexes(reader, 1) != 0 || unlink(index_path) != 0 ||
 			rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			access(index_path, F_OK) == 0 ||
+			rec_player_set_force_repair_indexes(reader, 1) != 0 ||
+			rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
 			access(index_path, F_OK) != 0) {
-			fprintf(stderr, "smoke: finalized index lazy repair failed\n");
+			fprintf(stderr, "smoke: latest index repair policy failed\n");
 			free(cursor);
 			rec_player_close(reader);
 			unlink(segment_path);
