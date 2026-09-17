@@ -1153,7 +1153,10 @@ static int source_load_segment_fallback(RecorderPlayer *reader, IteratorSource *
 {
 	source_clear_frame(source);
 	if (rec_player_scan_file(reader, source->segments[source->segment_index].path,
-			append_source_entry, source, 0, NULL) != 0) return -1;
+			append_source_entry, source, 0, NULL) != 0) {
+		if (errno == ENOENT) return 0;
+		return -1;
+	}
 	qsort(source->entries, source->entry_count, sizeof(*source->entries),
 			compare_stored_entries);
 	source->segment_scan_fallback = 1;
