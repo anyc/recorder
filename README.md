@@ -61,6 +61,12 @@ Timestamp seeks skip older indexed segments, `-n` reads from the requested
 edge, and `-u UNIT` uses the per-frame service filter as a skip hint. Missing,
 stale, incompatible, or damaged indexes fall back to decoding the matching
 segment. Recreate an index with `player --rebuild-index -i PATH/SEGMENT.seg`.
+For lazy repair while reading, use `player --repair-index -D PATH`; only an
+unusable index for a segment actually reached by the query is considered. The
+option also accepts a single segment with `-i PATH/SEGMENT.seg` and may be
+combined with `--stats`. Only finalized segments with valid footers are
+repaired. Active or otherwise non-finalized segments, and indexes that cannot
+be repaired, use the normal segment-scan fallback.
 
 By default, it also builds the versioned shared library
 `./librecorder.so.1.0.0` with SONAME `librecorder.so.1`; `librecorder.so` and
