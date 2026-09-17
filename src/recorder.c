@@ -2246,13 +2246,13 @@ static void recover_segment_dir_cb(const char *dir_name, void *ctx)
 				changed = 1;
 			}
 		}
-		{
+		if (footer.present) {
 			char idx_path[512];
-			struct stat idx_st;
+			size_t index_frame_count;
 
 			if (build_index_path(idx_path, sizeof(idx_path), dir_name,
 				header.segment_seq) == 0 && (header.flags & SEGMENT_FLAG_ENCRYPTED) == 0 &&
-				(stat(idx_path, &idx_st) != 0 || idx_st.st_mtime < st.st_mtime)) {
+				index_get_frame_count(idx_path, path, &index_frame_count) != 0) {
 				index_rebuild_for_segment(path, idx_path, NULL);
 			}
 		}
