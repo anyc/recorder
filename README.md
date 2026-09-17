@@ -65,8 +65,13 @@ For lazy repair while reading, use `player --repair-index -D PATH`; only an
 unusable index for a segment actually reached by the query is considered. The
 option also accepts a single segment with `-i PATH/SEGMENT.seg` and may be
 combined with `--stats`. Only finalized segments with valid footers are
-repaired. Active or otherwise non-finalized segments, and indexes that cannot
-be repaired, use the normal segment-scan fallback.
+repaired, and the highest sequence-numbered segment in each group is skipped
+because recorder may still be using it. Active or otherwise non-finalized
+segments, skipped indexes, and indexes that cannot be repaired use the normal
+segment-scan fallback. For offline stores, add `--force-repair` to include the
+latest finalized segment. `--force-repair --rebuild-index -i PATH/SEGMENT.seg`
+also explicitly permits rebuilding a non-finalized segment from its complete
+frames.
 
 By default, it also builds the versioned shared library
 `./librecorder.so.1.0.0` with SONAME `librecorder.so.1`; `librecorder.so` and

@@ -77,6 +77,7 @@ typedef struct {
 	int stats;
 	int rebuild_index;
 	int repair_indexes;
+	int force_repair;
 	size_t line_count;
 	int have_line_count;
 	int lines_from_head;
@@ -493,8 +494,43 @@ static int stats_scan_segment(RecorderPlayer *reader, const char *path,
     return rec_player_scan_file(reader, path, collect_stats_entry, &context, 0, NULL);
 }
 
-static int repair_finalized_index(const char *segment_path, const char *index_path,
-						  const char *private_key)
+static int segment_is_latest(const char *segment_path, int *latest_out)
+{
+	char directory[PATH_MAX];
+	const char *name = strrchr(segment_path, '/');
+	DIR *dir;
+	struct dirent *de;
+	uint64_t sequence;
+	uint64_t highest = 0;
+	int found = 0;
+	size_t directory_len;
+
+	if (!latest_out || segment_seq_from_name(name ? name + 1 : segment_path, &sequence) != 0)
+		return -1;
+	directory_len = name ? (size_t)(name - segment_path) : 0;
+	if (directory_len == 0) strcpy(directory, ".");
+	else if (directory_len >= sizeof(directory)) return -1;
+	else {
+		memcpy(directory, segment_path, directory_len);
+		directory[directory_len] = '\0';
+	}
+	dir = opendir(directory);
+	if (!dir) return -1;
+	while ((de = readdir(dir)) != NULL) {
+		uint64_t candidate;
+
+		if (segment_seq_from_name(de->d_name, &candidate) != 0) continue;
+		if (!found || candidate > highest) highest = candidate;
+		found = 1;
+	}
+	closedir(dir);
+	if (!found) return -1;
+	*latest_out = sequence == highest;
+	return 0;
+}
+
+static int repair_index_file(const char *segment_path, const char *index_path,
+						  const char *private_key, int require_finalized)
 {
 	SegmentDecryptor *decryptor = NULL;
 	SegmentFooter footer;
@@ -505,7 +541,8 @@ static int repair_finalized_index(const char *segment_path, const char *index_pa
 	if (private_key && segment_decryptor_create(private_key, &decryptor) != 0) return -1;
 	if (stat(segment_path, &st) != 0 ||
 		segment_scan_path(segment_path, decryptor, NULL, NULL, NULL, &footer,
-			&committed_end) != 0 || !footer.present || committed_end != (size_t)st.st_size) {
+			&committed_end) != 0 ||
+		(require_finalized && (!footer.present || committed_end != (size_t)st.st_size))) {
 		errno = EAGAIN;
 		goto out;
 	}
@@ -517,6 +554,7 @@ out:
 
 static int stats_scan_segment_with_fallback(RecorderPlayer *reader, const char *segment_path,
 						 const char *group, const char *private_key, int repair_indexes,
+						 int force_repair,
 						 StatsContext *stats)
 {
     char index_path[512];
@@ -529,11 +567,16 @@ static int stats_scan_segment_with_fallback(RecorderPlayer *reader, const char *
 	errno = 0;
 	if (stats_scan_index(index_path, segment_path, group, stats) == 0) return 0;
     saved_errno = errno;
-	if (repair_indexes &&
-		repair_finalized_index(segment_path, index_path, private_key) == 0 &&
+	{
+		int latest = 1;
+
+		if (repair_indexes && segment_is_latest(segment_path, &latest) == 0 &&
+			(force_repair || !latest) &&
+			repair_index_file(segment_path, index_path, private_key, 1) == 0 &&
 		stats_scan_index(index_path, segment_path, group, stats) == 0) {
-		fprintf(stderr, "player: repaired index '%s'\n", index_path);
-		return 0;
+			fprintf(stderr, "player: repaired index '%s'\n", index_path);
+			return 0;
+		}
 	}
     if (saved_errno == ENOENT) {
         fprintf(stderr, "player: warning: index '%s' is missing; scanning '%s' instead\n",
@@ -554,7 +597,8 @@ static int stats_scan_segment_with_fallback(RecorderPlayer *reader, const char *
 }
 
 static int stats_scan_directory(RecorderPlayer *reader, const char *path, const char *group,
-						const char *private_key, int repair_indexes, StatsContext *stats)
+						const char *private_key, int repair_indexes, int force_repair,
+						StatsContext *stats)
 {
     DIR *dir = opendir(path);
     struct dirent *de;
@@ -569,7 +613,7 @@ static int stats_scan_directory(RecorderPlayer *reader, const char *path, const 
             snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
             stat(child, &st) != 0 || !S_ISREG(st.st_mode)) continue;
 		if (stats_scan_segment_with_fallback(reader, child, group, private_key,
-			repair_indexes, stats) != 0) goto out;
+			repair_indexes, force_repair, stats) != 0) goto out;
     }
     rc = 0;
 out:
@@ -578,11 +622,12 @@ out:
 }
 
 static int scan_stats_path(RecorderPlayer *reader, const char *path, int is_directory,
-				   const char *private_key, int repair_indexes, StatsContext *stats)
+				   const char *private_key, int repair_indexes, int force_repair,
+				   StatsContext *stats)
 {
     if (!is_directory) {
 		return stats_scan_segment_with_fallback(reader, path, "-", private_key,
-			repair_indexes, stats);
+			repair_indexes, force_repair, stats);
     }
     {
         DIR *dir = opendir(path);
@@ -597,11 +642,11 @@ static int scan_stats_path(RecorderPlayer *reader, const char *path, int is_dire
                 stat(child, &st) != 0) continue;
             if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name)) {
 				if (stats_scan_directory(reader, child, de->d_name, private_key,
-					repair_indexes, stats) != 0) goto out;
+					repair_indexes, force_repair, stats) != 0) goto out;
             } else if (S_ISREG(st.st_mode) && len >= 5 &&
                 strcmp(de->d_name + len - 4, ".seg") == 0 &&
 				stats_scan_segment_with_fallback(reader, child, "-", private_key,
-					repair_indexes, stats) != 0) goto out;
+					repair_indexes, force_repair, stats) != 0) goto out;
         }
         rc = 0;
 out:
@@ -623,7 +668,8 @@ static int print_stats(const PlayerOptions *opts)
 		rec_player_set_private_key(reader, opts->encryption_private_key) != 0) goto out;
 	if (opts->repair_indexes && rec_player_set_repair_indexes(reader, 1) != 0) goto out;
 	if (scan_stats_path(reader, opts->path, opts->dir_path != NULL || opts->file_path == NULL,
-			opts->encryption_private_key, opts->repair_indexes, &stats) != 0) {
+			opts->encryption_private_key, opts->repair_indexes, opts->force_repair,
+			&stats) != 0) {
 		fprintf(stderr, "player: failed to scan log statistics\n");
 		goto out;
 	}
@@ -655,6 +701,8 @@ static int rebuild_index(const PlayerOptions *opts)
 {
 	char index_path[512];
 	size_t len;
+	int latest = 1;
+	int refused = 0;
 
 	if (!opts->file_path || !opts->path) return 1;
 	len = strlen(opts->path);
@@ -664,11 +712,27 @@ static int rebuild_index(const PlayerOptions *opts)
 		fprintf(stderr, "player: --rebuild-index requires -i SEGMENT.seg\n");
 		return 1;
 	}
-	if (repair_finalized_index(opts->path, index_path,
-			opts->encryption_private_key) != 0) {
+	if (opts->force_repair) {
+		SegmentFooter footer;
+
+		if (segment_scan_path(opts->path, NULL, NULL, NULL, NULL, &footer, NULL) == 0 &&
+			!footer.present)
+			fprintf(stderr, "player: warning: force-rebuilding a non-finalized segment "
+				"from its complete frames\n");
+	}
+	if (!opts->force_repair &&
+		(segment_is_latest(opts->path, &latest) != 0 || latest)) {
+		refused = 1;
+		errno = EAGAIN;
+	}
+	if (refused || repair_index_file(opts->path, index_path,
+			opts->encryption_private_key, !opts->force_repair) != 0) {
 		int saved_errno = errno;
 
-		if (saved_errno == EAGAIN)
+		if (refused)
+			fprintf(stderr, "player: refusing to rebuild the latest segment; use "
+				"--force-repair only for offline logs\n");
+		if (!refused && saved_errno == EAGAIN)
 			fprintf(stderr, "player: refusing to rebuild index for a segment without a "
 				"valid final footer\n");
 		fprintf(stderr, "player: failed to rebuild index '%s': %s\n", index_path,
@@ -1393,6 +1457,10 @@ static int scan_log_root(const PlayerOptions *opts)
 		rec_player_close(reader);
 		return 1;
 	}
+	if (opts->force_repair && rec_player_set_force_repair_indexes(reader, 1) != 0) {
+		rec_player_close(reader);
+		return 1;
+	}
 	if (opts->unit_filter && rec_player_set_unit_filter(reader, opts->unit_filter) != 0) {
 		fprintf(stderr, "player: failed to configure unit filter\n");
 		rec_player_close(reader);
@@ -1413,7 +1481,7 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output]\n",
@@ -1502,6 +1570,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->rebuild_index = 1;
 		} else if (strcmp(arg, "--repair-index") == 0 || strcmp(arg, "--repair-indexes") == 0) {
 			opts->repair_indexes = 1;
+		} else if (strcmp(arg, "--force-repair") == 0) {
+			opts->force_repair = 1;
 		} else if (strcmp(arg, "--sanitize-output") == 0) {
 			opts->sanitize_output = 1;
 		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
@@ -1536,6 +1606,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	}
 	if ((opts->disk_usage + opts->stats + opts->list_boots + opts->rebuild_index > 1) ||
 		(opts->repair_indexes && opts->rebuild_index) ||
+		(opts->force_repair && !opts->repair_indexes && !opts->rebuild_index) ||
+		(opts->force_repair && opts->follow) ||
 		(opts->stats && opts->follow) ||
 		(opts->follow && opts->have_line_count && opts->lines_from_head) ||
 		(opts->rebuild_index && (!opts->file_path || opts->follow || opts->unit_filter ||
