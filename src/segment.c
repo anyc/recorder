@@ -602,6 +602,7 @@ static int segment_scan_impl(const void *buf, size_t size,
 				footer.entry_count = read_u64_le(p + 8);
 				footer.last_realtime_ts = read_u64_le(p + 16);
 				footer.last_monotonic_ts = read_u64_le(p + 24);
+				footer.present = 1;
 				committed_end = offset + sizeof(tmp);
 				offset = committed_end;
 				break;

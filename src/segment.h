@@ -86,6 +86,8 @@ typedef struct {
     uint64_t entry_count;
     uint64_t last_realtime_ts;
     uint64_t last_monotonic_ts;
+	/* Set by readers when a structurally valid footer was present on disk. */
+	int present;
 } SegmentFooter;
 
 typedef int (*segment_frame_cb)(const SegmentHeader *header,
