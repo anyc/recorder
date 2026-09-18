@@ -143,3 +143,5 @@ int rec_player_reliable_fd(RecorderPlayer *reader);
 int rec_player_process(RecorderPlayer *reader);
 
 #endif
+	/** Receipt-order tie breaker for entries sharing a monotonic timestamp. */
+	uint16_t monotonic_tie_order;

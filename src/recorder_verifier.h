@@ -72,6 +72,7 @@ static int journal_CompactEntry_verify_table(flatcc_table_verifier_descriptor_t 
     if ((ret = flatcc_verify_string_field(td, 3, 0) /* message */)) return ret;
     if ((ret = flatcc_verify_field(td, 4, 4, 4) /* pid */)) return ret;
     if ((ret = flatcc_verify_string_field(td, 5, 0) /* unit */)) return ret;
+    if ((ret = flatcc_verify_field(td, 6, 2, 2) /* monotonic_tie_order */)) return ret;
     return flatcc_verify_ok;
 }
 
@@ -132,6 +133,7 @@ static int journal_FullEntry_verify_table(flatcc_table_verifier_descriptor_t *td
     if ((ret = flatcc_verify_string_field(td, 11, 0) /* comm */)) return ret;
     if ((ret = flatcc_verify_string_field(td, 12, 0) /* exe */)) return ret;
     if ((ret = flatcc_verify_field(td, 13, 2, 2) /* errno */)) return ret;
+    if ((ret = flatcc_verify_field(td, 14, 2, 2) /* monotonic_tie_order */)) return ret;
     return flatcc_verify_ok;
 }
 

@@ -236,6 +236,7 @@ typedef struct {
 typedef struct {
 	uint64_t realtime_ts;
 	uint64_t monotonic_ts;
+	uint16_t monotonic_tie_order;
 	uint32_t pid;
 	uint32_t uid;
 	uint32_t gid;
@@ -319,6 +320,10 @@ typedef struct {
 	int64_t clock_jump_usec;
 	int clock_offset_initialized;
 	int64_t last_clock_offset_usec;
+	uint64_t last_received_monotonic_ts;
+	uint32_t last_received_boot_seq;
+	uint16_t monotonic_tie_order;
+	int have_last_received_monotonic_ts;
 	ScriptWorker *script_worker;
 	int startup_catchup;
 	uint64_t startup_replayed_entries;
@@ -3342,6 +3347,8 @@ static journal_FullEntry_ref_t serialize_entry(flatcc_builder_t *B, const LogEnt
 	if (comm_ref) journal_FullEntry_comm_add(B, comm_ref);
 	if (exe_ref) journal_FullEntry_exe_add(B, exe_ref);
 	if (entry->errno_value) journal_FullEntry_errno_add(B, entry->errno_value);
+	if (entry->monotonic_tie_order)
+		journal_FullEntry_monotonic_tie_order_add(B, entry->monotonic_tie_order);
 	if (extra_vec) journal_FullEntry_fields_add(B, extra_vec);
 	return journal_FullEntry_end(B);
 }
@@ -3361,6 +3368,8 @@ static journal_CompactEntry_ref_t serialize_compact_entry(flatcc_builder_t *B,
 	if (entry->pid) journal_CompactEntry_pid_add(B, entry->pid);
 	if (message_ref) journal_CompactEntry_message_add(B, message_ref);
 	if (unit_ref) journal_CompactEntry_unit_add(B, unit_ref);
+	if (entry->monotonic_tie_order)
+		journal_CompactEntry_monotonic_tie_order_add(B, entry->monotonic_tie_order);
 	return journal_CompactEntry_end(B);
 }
 
@@ -4129,6 +4138,27 @@ static int apply_entry_modifiers(Recorder *r, LogEntry *entry, int is_replay)
 	return 1;
 }
 
+static void recorder_assign_monotonic_tie_order(Recorder *r, LogEntry *entry)
+{
+	entry->monotonic_tie_order = 0;
+	if (entry->monotonic_ts == 0) return;
+	if (r->have_last_received_monotonic_ts &&
+		r->last_received_boot_seq == entry->boot_seq &&
+		r->last_received_monotonic_ts == entry->monotonic_ts) {
+		if (r->monotonic_tie_order < UINT16_MAX)
+			entry->monotonic_tie_order = ++r->monotonic_tie_order;
+		else
+			/* UINT16_MAX is saturated; physical position remains the fallback
+			 * tie breaker for this exceptionally large timestamp run. */
+			entry->monotonic_tie_order = UINT16_MAX;
+	} else {
+		r->monotonic_tie_order = 0;
+	}
+	r->last_received_monotonic_ts = entry->monotonic_ts;
+	r->last_received_boot_seq = entry->boot_seq;
+	r->have_last_received_monotonic_ts = 1;
+}
+
 static size_t recorder_step_fallback(Recorder *r)
 {
 	FallbackRecord record;
@@ -4153,6 +4183,7 @@ static size_t recorder_step_fallback(Recorder *r)
 	}
 	fallback_record_destroy(&record);
 	if (r->boots.count != boot_count_before) persist_boot_state(&r->boots);
+	recorder_assign_monotonic_tie_order(r, &entry);
 	modifier_result = apply_entry_modifiers(r, &entry, r->startup_catchup);
 	if (modifier_result < 0) {
 		fprintf(stderr, "recorder: failed to apply entry modifiers\n");
@@ -4199,6 +4230,7 @@ static size_t recorder_step(Recorder *r)
 		if (r->boots.count != boot_count_before) {
 			persist_boot_state(&r->boots);
 		}
+		recorder_assign_monotonic_tie_order(r, &entry);
 		modifier_result = apply_entry_modifiers(r, &entry, r->startup_catchup);
 		if (modifier_result < 0) {
 			fprintf(stderr, "recorder: failed to apply entry modifiers\n");

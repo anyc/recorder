@@ -127,6 +127,7 @@ __flatbuffers_define_scalar_field(2, journal_CompactEntry, priority, flatbuffers
 __flatbuffers_define_string_field(3, journal_CompactEntry, message, 0)
 __flatbuffers_define_scalar_field(4, journal_CompactEntry, pid, flatbuffers_uint32, uint32_t, UINT32_C(0))
 __flatbuffers_define_string_field(5, journal_CompactEntry, unit, 0)
+__flatbuffers_define_scalar_field(6, journal_CompactEntry, monotonic_tie_order, flatbuffers_uint16, uint16_t, UINT16_C(0))
 
 struct journal_FullEntry_table { uint8_t unused__; };
 
@@ -150,6 +151,7 @@ __flatbuffers_define_string_field(10, journal_FullEntry, hostname, 0)
 __flatbuffers_define_string_field(11, journal_FullEntry, comm, 0)
 __flatbuffers_define_string_field(12, journal_FullEntry, exe, 0)
 __flatbuffers_define_scalar_field(13, journal_FullEntry, errno, flatbuffers_uint16, uint16_t, UINT16_C(0))
+__flatbuffers_define_scalar_field(14, journal_FullEntry, monotonic_tie_order, flatbuffers_uint16, uint16_t, UINT16_C(0))
 
 struct journal_Chunk_table { uint8_t unused__; };
 

@@ -25,12 +25,12 @@ __flatbuffers_build_table(flatbuffers_, journal_Field, 2)
 static const flatbuffers_voffset_t __journal_CompactEntry_required[] = { 0 };
 typedef flatbuffers_ref_t journal_CompactEntry_ref_t;
 static journal_CompactEntry_ref_t journal_CompactEntry_clone(flatbuffers_builder_t *B, journal_CompactEntry_table_t t);
-__flatbuffers_build_table(flatbuffers_, journal_CompactEntry, 6)
+__flatbuffers_build_table(flatbuffers_, journal_CompactEntry, 7)
 
 static const flatbuffers_voffset_t __journal_FullEntry_required[] = { 0 };
 typedef flatbuffers_ref_t journal_FullEntry_ref_t;
 static journal_FullEntry_ref_t journal_FullEntry_clone(flatbuffers_builder_t *B, journal_FullEntry_table_t t);
-__flatbuffers_build_table(flatbuffers_, journal_FullEntry, 14)
+__flatbuffers_build_table(flatbuffers_, journal_FullEntry, 15)
 
 static const flatbuffers_voffset_t __journal_Chunk_required[] = { 0 };
 typedef flatbuffers_ref_t journal_Chunk_ref_t;
@@ -48,20 +48,24 @@ static inline journal_Field_ref_t journal_Field_create(flatbuffers_builder_t *B 
 __flatbuffers_build_table_prolog(flatbuffers_, journal_Field, journal_Field_file_identifier, journal_Field_type_identifier)
 
 #define __journal_CompactEntry_formal_args ,\
-  uint64_t v0, uint64_t v1, uint8_t v2, flatbuffers_string_ref_t v3, uint32_t v4, flatbuffers_string_ref_t v5
+  uint64_t v0, uint64_t v1, uint8_t v2, flatbuffers_string_ref_t v3,\
+  uint32_t v4, flatbuffers_string_ref_t v5, uint16_t v6
 #define __journal_CompactEntry_call_args ,\
-  v0, v1, v2, v3, v4, v5
+  v0, v1, v2, v3,\
+  v4, v5, v6
 static inline journal_CompactEntry_ref_t journal_CompactEntry_create(flatbuffers_builder_t *B __journal_CompactEntry_formal_args);
 __flatbuffers_build_table_prolog(flatbuffers_, journal_CompactEntry, journal_CompactEntry_file_identifier, journal_CompactEntry_type_identifier)
 
 #define __journal_FullEntry_formal_args ,\
   uint64_t v0, uint64_t v1, uint8_t v2, flatbuffers_string_ref_t v3,\
   journal_Field_vec_ref_t v4, flatbuffers_string_ref_t v5, flatbuffers_string_ref_t v6, uint32_t v7,\
-  uint32_t v8, uint32_t v9, flatbuffers_string_ref_t v10, flatbuffers_string_ref_t v11, flatbuffers_string_ref_t v12, uint16_t v13
+  uint32_t v8, uint32_t v9, flatbuffers_string_ref_t v10, flatbuffers_string_ref_t v11,\
+  flatbuffers_string_ref_t v12, uint16_t v13, uint16_t v14
 #define __journal_FullEntry_call_args ,\
   v0, v1, v2, v3,\
   v4, v5, v6, v7,\
-  v8, v9, v10, v11, v12, v13
+  v8, v9, v10, v11,\
+  v12, v13, v14
 static inline journal_FullEntry_ref_t journal_FullEntry_create(flatbuffers_builder_t *B __journal_FullEntry_formal_args);
 __flatbuffers_build_table_prolog(flatbuffers_, journal_FullEntry, journal_FullEntry_file_identifier, journal_FullEntry_type_identifier)
 
@@ -105,6 +109,7 @@ __flatbuffers_build_scalar_field(2, flatbuffers_, journal_CompactEntry_priority,
 __flatbuffers_build_string_field(3, flatbuffers_, journal_CompactEntry_message, journal_CompactEntry)
 __flatbuffers_build_scalar_field(4, flatbuffers_, journal_CompactEntry_pid, flatbuffers_uint32, uint32_t, 4, 4, UINT32_C(0), journal_CompactEntry)
 __flatbuffers_build_string_field(5, flatbuffers_, journal_CompactEntry_unit, journal_CompactEntry)
+__flatbuffers_build_scalar_field(6, flatbuffers_, journal_CompactEntry_monotonic_tie_order, flatbuffers_uint16, uint16_t, 2, 2, UINT16_C(0), journal_CompactEntry)
 
 static inline journal_CompactEntry_ref_t journal_CompactEntry_create(flatbuffers_builder_t *B __journal_CompactEntry_formal_args)
 {
@@ -114,6 +119,7 @@ static inline journal_CompactEntry_ref_t journal_CompactEntry_create(flatbuffers
         || journal_CompactEntry_message_add(B, v3)
         || journal_CompactEntry_pid_add(B, v4)
         || journal_CompactEntry_unit_add(B, v5)
+        || journal_CompactEntry_monotonic_tie_order_add(B, v6)
         || journal_CompactEntry_priority_add(B, v2)) {
         return 0;
     }
@@ -129,6 +135,7 @@ static journal_CompactEntry_ref_t journal_CompactEntry_clone(flatbuffers_builder
         || journal_CompactEntry_message_pick(B, t)
         || journal_CompactEntry_pid_pick(B, t)
         || journal_CompactEntry_unit_pick(B, t)
+        || journal_CompactEntry_monotonic_tie_order_pick(B, t)
         || journal_CompactEntry_priority_pick(B, t)) {
         return 0;
     }
@@ -149,6 +156,7 @@ __flatbuffers_build_string_field(10, flatbuffers_, journal_FullEntry_hostname, j
 __flatbuffers_build_string_field(11, flatbuffers_, journal_FullEntry_comm, journal_FullEntry)
 __flatbuffers_build_string_field(12, flatbuffers_, journal_FullEntry_exe, journal_FullEntry)
 __flatbuffers_build_scalar_field(13, flatbuffers_, journal_FullEntry_errno, flatbuffers_uint16, uint16_t, 2, 2, UINT16_C(0), journal_FullEntry)
+__flatbuffers_build_scalar_field(14, flatbuffers_, journal_FullEntry_monotonic_tie_order, flatbuffers_uint16, uint16_t, 2, 2, UINT16_C(0), journal_FullEntry)
 
 static inline journal_FullEntry_ref_t journal_FullEntry_create(flatbuffers_builder_t *B __journal_FullEntry_formal_args)
 {
@@ -166,6 +174,7 @@ static inline journal_FullEntry_ref_t journal_FullEntry_create(flatbuffers_build
         || journal_FullEntry_comm_add(B, v11)
         || journal_FullEntry_exe_add(B, v12)
         || journal_FullEntry_errno_add(B, v13)
+        || journal_FullEntry_monotonic_tie_order_add(B, v14)
         || journal_FullEntry_priority_add(B, v2)) {
         return 0;
     }
@@ -189,6 +198,7 @@ static journal_FullEntry_ref_t journal_FullEntry_clone(flatbuffers_builder_t *B,
         || journal_FullEntry_comm_pick(B, t)
         || journal_FullEntry_exe_pick(B, t)
         || journal_FullEntry_errno_pick(B, t)
+        || journal_FullEntry_monotonic_tie_order_pick(B, t)
         || journal_FullEntry_priority_pick(B, t)) {
         return 0;
     }

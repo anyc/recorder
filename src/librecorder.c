@@ -2463,3 +2463,5 @@ int rec_player_process(RecorderPlayer *reader)
 	}
 	return result;
 }
+			entry.monotonic_tie_order = journal_CompactEntry_monotonic_tie_order(item);
+			entry.monotonic_tie_order = journal_FullEntry_monotonic_tie_order(item);

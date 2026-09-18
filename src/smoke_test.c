@@ -426,7 +426,8 @@ static int check_reader_entry(const RecorderEntry *entry, void *ctx)
 
 	if (entry->boot_seq != 3 || !entry->boot_id || strcmp(entry->boot_id, "boot-a") != 0 ||
 		!entry->message || strcmp(entry->message, "hello smoke") != 0 ||
-		!entry->unit || strcmp(entry->unit, "smoke.service") != 0 || entry->priority != 5) {
+		!entry->unit || strcmp(entry->unit, "smoke.service") != 0 || entry->priority != 5 ||
+		entry->monotonic_tie_order != 7) {
 		fprintf(stderr, "smoke: bad librecorder entry\n");
 		return -1;
 	}
@@ -643,6 +644,7 @@ int main(void)
 	journal_FullEntry_start(&B);
 	journal_FullEntry_realtime_ts_add(&B, 1234);
 	journal_FullEntry_monotonic_ts_add(&B, 5678);
+	journal_FullEntry_monotonic_tie_order_add(&B, 7);
 	journal_FullEntry_priority_add(&B, 5);
 	journal_FullEntry_message_add(&B, message_ref);
 	journal_FullEntry_unit_add(&B, unit_ref);

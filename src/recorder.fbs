@@ -12,6 +12,8 @@ table CompactEntry {
   message:string;
   pid:uint;
   unit:string;
+  // Receipt-order tie breaker for entries sharing a monotonic timestamp.
+  monotonic_tie_order:ushort = 0;
 }
 
 table FullEntry {
@@ -38,6 +40,9 @@ table FullEntry {
 
   // optional structured field
   errno:ushort = 0;
+
+  // Receipt-order tie breaker for entries sharing a monotonic timestamp.
+  monotonic_tie_order:ushort = 0;
 }
 
 table Chunk {
