@@ -118,6 +118,17 @@ static FollowSegment *find_follow_segment(RecorderPlayer *reader, const char *pa
 static int remember_follow_segment(RecorderPlayer *reader, const char *path,
 								   uint64_t segment_seq, uint64_t committed_end);
 static void iterator_reset(RecorderPlayer *reader);
+static void source_clear_frame(IteratorSource *source);
+static int source_has_current(const IteratorSource *source);
+static int source_add_segment(IteratorSource *source, const SegmentPath *path);
+static int source_load_index(RecorderPlayer *reader, IteratorSource *source);
+static int source_load_indexed_from(RecorderPlayer *reader, IteratorSource *source,
+								size_t frame_index, int direction);
+static int source_load_frame(RecorderPlayer *reader, IteratorSource *source,
+							 size_t frame_index, int direction);
+static int source_load_segment_fallback(RecorderPlayer *reader,
+									IteratorSource *source, int direction);
+static int source_advance(RecorderPlayer *reader, IteratorSource *source, int direction);
 static int iterator_initialize(RecorderPlayer *reader, int direction);
 
 static int valid_group_name(const char *name)
@@ -1015,6 +1026,8 @@ static int wallclock_load_segment(RecorderPlayer *reader,
 		if (timestamp > segment->max_realtime_ts)
 			segment->max_realtime_ts = timestamp;
 	}
+	qsort(segment->entries, segment->entry_count, sizeof(*segment->entries),
+			compare_stored_entries);
 	return 0;
 }
 
@@ -1030,49 +1043,77 @@ static void wallclock_free_segment(WallclockSegment *segment)
 	segment->entry_capacity = 0;
 }
 
-static int compare_wallclock_segments(const void *left, const void *right)
+static int wallclock_prepare_source(RecorderPlayer *reader,
+						WallclockSegment *segment, IteratorSource *source)
 {
-	const WallclockSegment *a = left;
-	const WallclockSegment *b = right;
+	int rc;
 
-	if (a->min_realtime_ts < b->min_realtime_ts) return -1;
-	if (a->min_realtime_ts > b->min_realtime_ts) return 1;
-	if (a->max_realtime_ts < b->max_realtime_ts) return -1;
-	if (a->max_realtime_ts > b->max_realtime_ts) return 1;
-	return compare_segment_path(&a->path, &b->path);
+	memset(source, 0, sizeof(*source));
+	source->entry_index = -1;
+	if (group_from_path(segment->path.path,
+			reader->path_is_directory ? reader->path : NULL,
+			source->group, sizeof(source->group)) != 0 ||
+		source_add_segment(source, &segment->path) != 0) return -1;
+	if (segment->needs_sort) {
+		source->entries = segment->entries;
+		source->entry_count = segment->entry_count;
+		source->entry_capacity = segment->entry_capacity;
+		source->segment_scan_fallback = 1;
+		segment->entries = NULL;
+		segment->entry_count = 0;
+		segment->entry_capacity = 0;
+		source->entry_index = source->entry_count != 0 ? 0 : -1;
+		return source->entry_count != 0;
+	}
+	if (source_load_index(reader, source) == 0 && source->frame_count != 0) {
+		rc = source_load_indexed_from(reader, source, 0, 1);
+		if (rc >= 0) return rc;
+	}
+	return source_load_segment_fallback(reader, source, 1);
 }
 
-static int wallclock_append_moved(WallclockEntryList *list,
-						WallclockSegment *segment)
+static int wallclock_heap_less(const IteratorSource *sources,
+						 size_t left, size_t right)
 {
-	size_t required;
-	StoredEntry *tmp;
+	return compare_stored_entries(
+		&sources[left].entries[sources[left].entry_index],
+		&sources[right].entries[sources[right].entry_index]) < 0;
+}
 
-	if (segment->entry_count == 0) return 0;
-	if (list->count > SIZE_MAX - segment->entry_count) return -1;
-	required = list->count + segment->entry_count;
-	if (required > list->capacity) {
-		size_t capacity = list->capacity ? list->capacity : 32;
-		while (capacity < required) {
-			if (capacity > SIZE_MAX / 2) {
-				capacity = required;
-				break;
-			}
-			capacity *= 2;
+static void wallclock_heap_sift_up(const IteratorSource *sources,
+							 size_t *heap, size_t index)
+{
+	while (index != 0) {
+		size_t parent = (index - 1) / 2;
+		if (!wallclock_heap_less(sources, heap[index], heap[parent])) break;
+		{
+			size_t tmp = heap[index];
+			heap[index] = heap[parent];
+			heap[parent] = tmp;
 		}
-		tmp = realloc(list->entries, capacity * sizeof(*tmp));
-		if (!tmp) return -1;
-		list->entries = tmp;
-		list->capacity = capacity;
+		index = parent;
 	}
-	memcpy(list->entries + list->count, segment->entries,
-			segment->entry_count * sizeof(*segment->entries));
-	list->count = required;
-	free(segment->entries);
-	segment->entries = NULL;
-	segment->entry_count = 0;
-	segment->entry_capacity = 0;
-	return 0;
+}
+
+static void wallclock_heap_sift_down(const IteratorSource *sources,
+							 size_t *heap, size_t count, size_t index)
+{
+	for (;;) {
+		size_t left = index * 2 + 1;
+		size_t right = left + 1;
+		size_t smallest = index;
+		if (left < count && wallclock_heap_less(sources, heap[left], heap[smallest]))
+			smallest = left;
+		if (right < count && wallclock_heap_less(sources, heap[right], heap[smallest]))
+			smallest = right;
+		if (smallest == index) break;
+		{
+			size_t tmp = heap[index];
+			heap[index] = heap[smallest];
+			heap[smallest] = tmp;
+		}
+		index = smallest;
+	}
 }
 
 int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callback,
@@ -1080,9 +1121,12 @@ int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callba
 {
 	SegmentPath *paths = NULL;
 	WallclockSegment *segments = NULL;
+	IteratorSource *sources = NULL;
+	size_t *heap = NULL;
 	size_t path_count = 0;
 	size_t path_capacity = 0;
 	size_t segment_count = 0;
+	size_t heap_count = 0;
 	size_t i;
 	int rc = -1;
 
@@ -1106,59 +1150,40 @@ int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callba
 			segments[segment_count].min_realtime_ts != 0)
 			segment_count++;
 	}
-	qsort(segments, segment_count, sizeof(*segments), compare_wallclock_segments);
-
-	for (i = 0; i < segment_count;) {
-		size_t end = i;
-		uint64_t group_max = segments[i].max_realtime_ts;
-
-		while (end + 1 < segment_count &&
-			segments[end + 1].min_realtime_ts <= group_max) {
-			end++;
-			if (segments[end].max_realtime_ts > group_max)
-				group_max = segments[end].max_realtime_ts;
+	sources = calloc(segment_count ? segment_count : 1, sizeof(*sources));
+	heap = malloc((segment_count ? segment_count : 1) * sizeof(*heap));
+	if (!sources || !heap) goto out;
+	for (i = 0; i < segment_count; i++) {
+		int prepared = wallclock_prepare_source(reader, &segments[i], &sources[i]);
+		if (prepared < 0) goto out;
+		if (prepared > 0) {
+			heap[heap_count] = i;
+			wallclock_heap_sift_up(sources, heap, heap_count);
+			heap_count++;
 		}
-		if (i == end && !segments[i].needs_sort) {
-			if (rec_player_scan_file(reader, segments[i].path.path,
-					callback, userdata, 0, NULL) != 0) goto out;
-						} else {
-			WallclockEntryList group = { 0 };
-			size_t j;
-
-			for (j = i; j <= end; j++) {
-				if (segments[j].entry_count != 0) {
-					if (wallclock_append_moved(&group, &segments[j]) != 0) {
-						for (size_t k = 0; k < group.count; k++)
-							free_stored_entry(&group.entries[k]);
-						free(group.entries);
-						goto out;
-					}
-				} else if (rec_player_scan_file(reader, segments[j].path.path,
-						append_wallclock_entry, &group, 0, NULL) != 0) {
-					for (size_t k = 0; k < group.count; k++)
-						free_stored_entry(&group.entries[k]);
-					free(group.entries);
-					goto out;
-				}
-			}
-			qsort(group.entries, group.count, sizeof(*group.entries),
-					compare_stored_entries);
-			for (j = 0; j < group.count; j++) {
-				if (callback(&group.entries[j].entry, userdata) != 0) {
-					for (size_t k = 0; k < group.count; k++)
-						free_stored_entry(&group.entries[k]);
-					free(group.entries);
-					goto out;
-				}
-			}
-			for (j = 0; j < group.count; j++)
-				free_stored_entry(&group.entries[j]);
-			free(group.entries);
+	}
+	while (heap_count != 0) {
+		size_t source_index = heap[0];
+		if (callback(&sources[source_index].entries[sources[source_index].entry_index].entry,
+				userdata) != 0) goto out;
+		if (source_advance(reader, &sources[source_index], 1) < 0) goto out;
+		if (!source_has_current(&sources[source_index])) {
+			heap[0] = heap[--heap_count];
 		}
-		i = end + 1;
+		if (heap_count != 0) wallclock_heap_sift_down(sources, heap, heap_count, 0);
 	}
 	rc = 0;
 out:
+	if (sources) {
+		for (i = 0; i < segment_count; i++) {
+			source_clear_frame(&sources[i]);
+			index_reader_close(sources[i].index_reader);
+			segment_frame_reader_close(sources[i].frame_reader);
+			free(sources[i].segments);
+		}
+	}
+	free(heap);
+	free(sources);
 	for (i = 0; i < segment_count; i++) wallclock_free_segment(&segments[i]);
 	free(segments);
 	free(paths);

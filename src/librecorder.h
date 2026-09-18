@@ -119,8 +119,8 @@ int rec_player_scan_all(RecorderPlayer *reader, rec_player_entry_cb callback,
 						void *userdata);
 /**
  * Scan retained entries in realtime order without sorting the complete store.
- * Ordered segments are streamed; only overlapping or realtime-nonmonotonic
- * segment groups are materialized and sorted.
+ * Ordered segments are k-way merged with bounded frame lookahead; only
+ * realtime-nonmonotonic segments are materialized and sorted.
  */
 int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callback,
 						 void *userdata);
