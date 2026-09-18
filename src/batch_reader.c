@@ -19,7 +19,19 @@ static uint64_t monotonic_usec(void)
 
 static void usage(const char *name)
 {
-	fprintf(stderr, "Usage: %s [-b BATCH-SIZE] LOG-DIRECTORY\n", name);
+	fprintf(stderr, "Usage: %s [-b BATCH-SIZE] [--sort wallclock] LOG-DIRECTORY\n", name);
+}
+
+static int print_entry(RecorderPlayer *reader)
+{
+	const RecorderEntry *entry;
+
+	if (rec_player_get_entry(reader, &entry) != 0 || !entry) return -1;
+	printf("%" PRIu64 " %s:%" PRIu64 ":%" PRIu64 ":%u %s\n",
+		entry->realtime_ts, entry->group ? entry->group : "-", entry->segment_seq,
+		entry->frame_offset, entry->frame_entry_index,
+		entry->message ? entry->message : "");
+	return fflush(stdout) == 0 ? 0 : -1;
 }
 
 int main(int argc, char **argv)
@@ -33,28 +45,48 @@ int main(int argc, char **argv)
 	size_t entries = 0;
 	size_t batches = 0;
 	size_t resumes = 0;
+	RecorderPlayerOrder order = RECORDER_ORDER_RECORDED;
 	int argi = 1;
 	int rc = 1;
 
-	if (argi + 2 <= argc && strcmp(argv[argi], "-b") == 0) {
-		char *end = NULL;
-		unsigned long long value;
+	while (argi < argc - 1) {
+		if (strcmp(argv[argi], "-b") == 0) {
+			char *end = NULL;
+			unsigned long long value;
 
-		errno = 0;
-		value = strtoull(argv[argi + 1], &end, 10);
-		if (errno != 0 || !end || *end != '\0' || value == 0 || value > SIZE_MAX) {
+			if (++argi >= argc - 1) {
+				usage(argv[0]);
+				return 2;
+			}
+			errno = 0;
+			value = strtoull(argv[argi], &end, 10);
+			if (errno != 0 || !end || *end != '\0' || value == 0 || value > SIZE_MAX) {
+				usage(argv[0]);
+				return 2;
+			}
+			batch_size = (size_t)value;
+		} else if (strcmp(argv[argi], "--sort") == 0) {
+			if (++argi >= argc - 1 || strcmp(argv[argi], "wallclock") != 0) {
+				usage(argv[0]);
+				return 2;
+			}
+			order = RECORDER_ORDER_WALLCLOCK;
+		} else if (strncmp(argv[argi], "--sort=", 7) == 0 &&
+			strcmp(argv[argi] + 7, "wallclock") == 0) {
+			order = RECORDER_ORDER_WALLCLOCK;
+		} else {
 			usage(argv[0]);
 			return 2;
 		}
-		batch_size = (size_t)value;
-		argi += 2;
+		argi++;
 	}
 	if (argc - argi != 1) {
 		usage(argv[0]);
 		return 2;
 	}
 	path = argv[argi];
-	if (rec_player_open(&reader, path) != 0 || rec_player_seek_head(reader) != 0) {
+	if (rec_player_open(&reader, path) != 0 || rec_player_set_order(reader, order) != 0 ||
+		rec_player_seek_head(reader) != 0) {
 		fprintf(stderr, "batch-reader: cannot open or seek %s\n", path);
 		goto out;
 	}
@@ -80,6 +112,10 @@ int main(int argc, char **argv)
 			resumes++;
 		}
 		while (in_batch < batch_size && (rc = rec_player_next(reader)) > 0) {
+			if (print_entry(reader) != 0) {
+				fprintf(stderr, "batch-reader: cannot print entry\n");
+				goto out;
+			}
 			entries++;
 			in_batch++;
 		}

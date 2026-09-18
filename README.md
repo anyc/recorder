@@ -52,7 +52,8 @@ This produces `./recorder` and `./player`.
 For cursor-pagination performance checks, build `make batch-reader` and run
 `./batch-reader LOG-DIRECTORY`. It seeks to the head, reads 50 entries, then
 seeks to the cursor of the last entry before reading the next batch. Use
-`-b SIZE` to change the batch size. The reported entry count includes the
+`-b SIZE` to change the batch size. It reads in recorder order by default; use
+`--sort wallclock` for realtime ordering. The reported entry count includes the
 cursor entry at every batch boundary because `rec_player_seek_cursor()`
 positions the reader at that entry.
 
@@ -156,6 +157,11 @@ Run the smoke test, Python tests, and fallback integration test together with
 via `COMPARE_STORAGE_ARGS`, `BENCHMARK_STORAGE_ARGS`, or
 `BENCHMARK_CAPACITY_ARGS` respectively. The latter two operate on the live
 journal and may prompt for `sudo`.
+
+The focused sort-order regression test can be run with `make test-sort` in the
+repository build configuration. It verifies recorded order, wall-clock order,
+nonmonotonic segment marking, and the wall-clock merge path.
+The `make test` build also builds `batch-reader` by default.
 
 For isolated tests, recorder's storage directory can be overridden with
 `--log-dir PATH` (or `-l PATH`). This directory includes the segments, indexes,
