@@ -11,6 +11,7 @@
 #include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
+#include <jansson.h>
 
 #include "librecorder.h"
 #include "index.h"
@@ -41,15 +42,29 @@ typedef struct {
 } PrintContext;
 
 typedef struct PlayerEntry {
+	uint32_t boot_seq;
+	char *boot_id;
+	uint64_t segment_seq;
+	uint64_t frame_offset;
+	uint32_t frame_entry_index;
 	uint64_t realtime_ts;
+	uint64_t monotonic_ts;
 	uint64_t order;
 	int follow_new;
 	uint32_t pid;
+	uint32_t uid;
+	uint32_t gid;
+	uint8_t priority;
+	uint16_t errno_value;
 	char *hostname;
 	char *comm;
 	char *unit;
 	char *exe;
 	char *message;
+	char *message_id;
+	char *group;
+	RecorderField *fields;
+	size_t field_count;
 } PlayerEntry;
 
 typedef struct {
@@ -82,6 +97,7 @@ typedef struct {
 	int have_line_count;
 	int lines_from_head;
 	int sanitize_output;
+	int json_output;
 } PlayerOptions;
 
 typedef struct {
@@ -822,11 +838,19 @@ static void free_player_entries(PlayerEntry *entries, size_t count)
 	size_t i;
 
 	for (i = 0; i < count; i++) {
+		free(entries[i].boot_id);
 		free(entries[i].hostname);
 		free(entries[i].comm);
 		free(entries[i].unit);
 		free(entries[i].exe);
 		free(entries[i].message);
+		free(entries[i].message_id);
+		free(entries[i].group);
+		for (size_t j = 0; j < entries[i].field_count; j++) {
+			free((void *)entries[i].fields[j].name);
+			free((void *)entries[i].fields[j].value);
+		}
+		free(entries[i].fields);
 	}
 	free(entries);
 }
@@ -835,25 +859,53 @@ static int copy_player_entry(PlayerEntry *dst, const RecorderEntry *src)
 {
 	memset(dst, 0, sizeof(*dst));
 	dst->realtime_ts = src->realtime_ts;
+	dst->boot_seq = src->boot_seq;
+	dst->boot_id = src->boot_id ? strdup(src->boot_id) : NULL;
+	dst->segment_seq = src->segment_seq;
+	dst->frame_offset = src->frame_offset;
+	dst->frame_entry_index = src->frame_entry_index;
+	dst->monotonic_ts = src->monotonic_ts;
 	dst->order = 0;
 	dst->pid = src->pid;
+	dst->uid = src->uid;
+	dst->gid = src->gid;
+	dst->priority = src->priority;
+	dst->errno_value = src->errno_value;
 	dst->hostname = src->hostname ? strdup(src->hostname) : NULL;
 	dst->comm = src->comm ? strdup(src->comm) : NULL;
 	dst->unit = src->unit ? strdup(src->unit) : NULL;
 	dst->exe = src->exe ? strdup(src->exe) : NULL;
 	dst->message = src->message ? strdup(src->message) : NULL;
-	if ((src->hostname && !dst->hostname) || (src->comm && !dst->comm) ||
-		(src->unit && !dst->unit) || (src->exe && !dst->exe) ||
-		(src->message && !dst->message)) {
-		free(dst->hostname);
-		free(dst->comm);
-		free(dst->unit);
-		free(dst->exe);
-		free(dst->message);
-		memset(dst, 0, sizeof(*dst));
-		return -1;
+	dst->message_id = src->message_id ? strdup(src->message_id) : NULL;
+	dst->group = src->group ? strdup(src->group) : NULL;
+	if ((src->boot_id && !dst->boot_id) || (src->hostname && !dst->hostname) ||
+		(src->comm && !dst->comm) || (src->unit && !dst->unit) ||
+		(src->exe && !dst->exe) || (src->message && !dst->message) ||
+		(src->message_id && !dst->message_id) || (src->group && !dst->group))
+		goto fail;
+	if (src->field_count != 0) {
+		dst->field_count = src->field_count;
+		dst->fields = calloc(src->field_count, sizeof(*dst->fields));
+		if (!dst->fields) goto fail;
+		for (size_t i = 0; i < src->field_count; i++) {
+			dst->fields[i].name = src->fields[i].name ?
+				strdup(src->fields[i].name) : NULL;
+			if (src->fields[i].name && !dst->fields[i].name) goto fail;
+			if (src->fields[i].value_size != 0) {
+				dst->fields[i].value = malloc(src->fields[i].value_size);
+				if (!dst->fields[i].value) goto fail;
+				memcpy((void *)dst->fields[i].value, src->fields[i].value,
+					src->fields[i].value_size);
+			}
+			dst->fields[i].value_size = src->fields[i].value_size;
+		}
 	}
 	return 0;
+
+fail:
+	free_player_entries(dst, 1);
+	memset(dst, 0, sizeof(*dst));
+	return -1;
 }
 
 static int append_player_entry(PrintContext *pc, const RecorderEntry *entry)
@@ -918,7 +970,86 @@ static void print_player_field(const char *value, int sanitize)
 	}
 }
 
-static void print_entry(const PlayerEntry *entry, int sanitize_output)
+static void print_entry_json(const PlayerEntry *entry)
+{
+	json_t *object;
+	json_t *fields;
+	char ts[32];
+	int rc;
+
+	object = json_object();
+	if (!object) {
+		fprintf(stderr, "player: cannot allocate JSON object\n");
+		return;
+	}
+	format_realtime(entry->realtime_ts, ts, sizeof(ts));
+	json_object_set_new(object, "boot_seq", json_integer(entry->boot_seq));
+	json_object_set_new(object, "boot_id",
+		entry->boot_id ? json_string(entry->boot_id) : json_null());
+	json_object_set_new(object, "segment_seq",
+		json_integer((json_int_t)entry->segment_seq));
+	json_object_set_new(object, "frame_offset",
+		json_integer((json_int_t)entry->frame_offset));
+	json_object_set_new(object, "frame_entry_index",
+		json_integer(entry->frame_entry_index));
+	json_object_set_new(object, "timestamp", json_string(ts));
+	json_object_set_new(object, "realtime_usec",
+		json_integer((json_int_t)entry->realtime_ts));
+	json_object_set_new(object, "monotonic_usec",
+		json_integer((json_int_t)entry->monotonic_ts));
+	json_object_set_new(object, "pid", json_integer(entry->pid));
+	json_object_set_new(object, "uid", json_integer(entry->uid));
+	json_object_set_new(object, "gid", json_integer(entry->gid));
+	json_object_set_new(object, "priority", json_integer(entry->priority));
+	json_object_set_new(object, "errno", json_integer(entry->errno_value));
+	json_object_set_new(object, "hostname",
+		entry->hostname ? json_string(entry->hostname) : json_null());
+	json_object_set_new(object, "comm",
+		entry->comm ? json_string(entry->comm) : json_null());
+	json_object_set_new(object, "unit",
+		entry->unit ? json_string(entry->unit) : json_null());
+	json_object_set_new(object, "exe",
+		entry->exe ? json_string(entry->exe) : json_null());
+	json_object_set_new(object, "message",
+		entry->message ? json_string(entry->message) : json_string(""));
+	json_object_set_new(object, "message_id",
+		entry->message_id ? json_string(entry->message_id) : json_null());
+	json_object_set_new(object, "group",
+		entry->group ? json_string(entry->group) : json_null());
+	fields = json_array();
+	if (!fields) {
+		fprintf(stderr, "player: cannot allocate JSON fields array\n");
+		json_decref(object);
+		return;
+	}
+	for (size_t i = 0; i < entry->field_count; i++) {
+		json_t *field = json_object();
+		json_t *value = json_array();
+
+		if (!field || !value) {
+			json_decref(field);
+			json_decref(value);
+			json_decref(fields);
+			json_decref(object);
+			fprintf(stderr, "player: cannot allocate JSON field\n");
+			return;
+		}
+		json_object_set_new(field, "name",
+			entry->fields[i].name ? json_string(entry->fields[i].name) : json_null());
+		for (size_t j = 0; j < entry->fields[i].value_size; j++)
+			json_array_append_new(value,
+				json_integer(((const unsigned char *)entry->fields[i].value)[j]));
+		json_object_set_new(field, "value", value);
+		json_array_append_new(fields, field);
+	}
+	json_object_set_new(object, "fields", fields);
+	rc = json_dumpf(object, stdout, JSON_COMPACT);
+	if (rc == 0) putchar('\n');
+	else fprintf(stderr, "player: cannot write JSON output\n");
+	json_decref(object);
+}
+
+static void print_entry(const PlayerEntry *entry, int sanitize_output, int json_output)
 {
 	const char *hostname = entry->hostname;
 	const char *comm = entry->comm;
@@ -931,6 +1062,11 @@ static void print_entry(const PlayerEntry *entry, int sanitize_output)
 	uint32_t pid = entry->pid;
 	int have_hostname;
 	int have_identifier;
+
+	if (json_output) {
+		print_entry_json(entry);
+		return;
+	}
 
 	format_realtime(entry->realtime_ts, ts, sizeof(ts));
 	if (!identifier || !identifier[0]) {
@@ -1315,7 +1451,8 @@ static void print_selected_entries(const PlayerEntry *entries, size_t count,
 				first = count - opts->line_count;
 			}
 		}
-		for (i = first; i < last; i++) print_entry(&entries[i], opts->sanitize_output);
+		for (i = first; i < last; i++)
+			print_entry(&entries[i], opts->sanitize_output, opts->json_output);
 		return;
 	}
 	{
@@ -1327,7 +1464,7 @@ static void print_selected_entries(const PlayerEntry *entries, size_t count,
 		for (i = 0; i < count; i++) if (!entries[i].follow_new) old_count++;
 		for (i = 0; i < count; i++) {
 			if (entries[i].follow_new || old_count - old_seen <= initial_count)
-				print_entry(&entries[i], opts->sanitize_output);
+				print_entry(&entries[i], opts->sanitize_output, opts->json_output);
 			if (!entries[i].follow_new) old_seen++;
 		}
 	}
@@ -1484,7 +1621,7 @@ static void usage(const char *prog)
 			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--encryption-private-key PATH] "
-			"[--sanitize-output|--no-sanitize-output]\n",
+			"[--sanitize-output|--no-sanitize-output] [--json]\n",
 			prog);
 	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, YYYY-MM-DD HH:MM[:SS], or a rec1: cursor\n");
 	fprintf(stderr, "       COUNT selects newest entries; +COUNT selects oldest entries\n");
@@ -1576,6 +1713,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->sanitize_output = 1;
 		} else if (strcmp(arg, "--no-sanitize-output") == 0) {
 			opts->sanitize_output = 0;
+		} else if (strcmp(arg, "--json") == 0) {
+			opts->json_output = 1;
 		} else if (strcmp(arg, "--since") == 0) {
 			if (++i >= argc) {
 				return -1;
