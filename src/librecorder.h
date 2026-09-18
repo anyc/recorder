@@ -7,6 +7,13 @@
 /** Opaque reader for recorder segments and log directories. */
 typedef struct RecorderPlayer RecorderPlayer;
 
+typedef enum {
+	/** Iterate by recorder segment/frame/entry order. */
+	RECORDER_ORDER_RECORDED = 0,
+	/** Iterate by realtime timestamp, as journald does. */
+	RECORDER_ORDER_WALLCLOCK = 1,
+} RecorderPlayerOrder;
+
 typedef struct {
 	/** Borrowed field name, valid only during the entry callback/current entry. */
 	const char *name;
@@ -28,6 +35,8 @@ typedef struct {
 	uint64_t realtime_ts;
 	/** Monotonic timestamp in microseconds. */
 	uint64_t monotonic_ts;
+	/** Receipt-order tie breaker for entries sharing a monotonic timestamp. */
+	uint16_t monotonic_tie_order;
 	uint32_t pid;
 	uint32_t uid;
 	uint32_t gid;
@@ -70,6 +79,8 @@ int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit);
 int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled);
 /** Allow lazy repair of the latest segment in each group. */
 int rec_player_set_force_repair_indexes(RecorderPlayer *reader, int enabled);
+/** Select the order used by seek_head()/next()/previous(). The iterator is reset. */
+int rec_player_set_order(RecorderPlayer *reader, RecorderPlayerOrder order);
 /** Close a reader and release all associated resources. */
 void rec_player_close(RecorderPlayer *reader);
 
@@ -143,5 +154,3 @@ int rec_player_reliable_fd(RecorderPlayer *reader);
 int rec_player_process(RecorderPlayer *reader);
 
 #endif
-	/** Receipt-order tie breaker for entries sharing a monotonic timestamp. */
-	uint16_t monotonic_tie_order;

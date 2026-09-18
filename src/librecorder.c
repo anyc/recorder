@@ -60,6 +60,12 @@ struct RecorderPlayer {
 	size_t source_count;
 	size_t current_source;
 	int iterator_state;
+	RecorderPlayerOrder order;
+	int cursor_sources_pending;
+	char cursor_group[64];
+	uint64_t cursor_segment_seq;
+	uint64_t cursor_frame_offset;
+	uint32_t cursor_frame_entry_index;
 };
 
 typedef struct StoredEntry {
@@ -130,6 +136,7 @@ static int source_load_segment_fallback(RecorderPlayer *reader,
 									IteratorSource *source, int direction);
 static int source_advance(RecorderPlayer *reader, IteratorSource *source, int direction);
 static int iterator_initialize(RecorderPlayer *reader, int direction);
+static int iterator_collect_sources(RecorderPlayer *reader);
 
 static int valid_group_name(const char *name)
 {
@@ -242,6 +249,7 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 			journal_CompactEntry_table_t item = journal_CompactEntry_vec_at(entries, i);
 			entry.realtime_ts = journal_CompactEntry_realtime_ts(item);
 			entry.monotonic_ts = journal_CompactEntry_monotonic_ts(item);
+			entry.monotonic_tie_order = journal_CompactEntry_monotonic_tie_order(item);
 			entry.priority = journal_CompactEntry_priority(item);
 			entry.pid = journal_CompactEntry_pid(item);
 			entry.message = journal_CompactEntry_message(item);
@@ -280,6 +288,7 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 			}
 			entry.realtime_ts = journal_FullEntry_realtime_ts(item);
 			entry.monotonic_ts = journal_FullEntry_monotonic_ts(item);
+			entry.monotonic_tie_order = journal_FullEntry_monotonic_tie_order(item);
 			entry.priority = journal_FullEntry_priority(item);
 			entry.pid = journal_FullEntry_pid(item);
 			entry.uid = journal_FullEntry_uid(item);
@@ -522,6 +531,25 @@ static int compare_stored_entries(const void *left, const void *right)
 	return 0;
 }
 
+static int compare_iterator_entries(const RecorderPlayer *reader,
+								const StoredEntry *left, const StoredEntry *right)
+{
+	int result;
+
+	if (reader->order == RECORDER_ORDER_WALLCLOCK)
+		return compare_stored_entries(left, right);
+	if (left->entry.segment_seq < right->entry.segment_seq) return -1;
+	if (left->entry.segment_seq > right->entry.segment_seq) return 1;
+	result = strcmp(left->entry.group ? left->entry.group : "-",
+			right->entry.group ? right->entry.group : "-");
+	if (result != 0) return result;
+	if (left->entry.frame_offset < right->entry.frame_offset) return -1;
+	if (left->entry.frame_offset > right->entry.frame_offset) return 1;
+	if (left->entry.frame_entry_index < right->entry.frame_entry_index) return -1;
+	if (left->entry.frame_entry_index > right->entry.frame_entry_index) return 1;
+	return 0;
+}
+
 static void rebind_stored_entry_strings(RecorderPlayer *reader)
 {
 	size_t i;
@@ -752,6 +780,7 @@ int rec_player_open(RecorderPlayer **reader_out, const char *path)
 	if (!reader_out || !path || stat(path, &st) != 0) return -1;
 	reader = calloc(1, sizeof(*reader));
 	if (!reader) return -1;
+	reader->order = RECORDER_ORDER_WALLCLOCK;
 	reader->path = strdup(path);
 	if (!reader->path) {
 		free(reader);
@@ -864,6 +893,19 @@ int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit)
 	clear_entries(reader);
 	free(reader->unit_filter);
 	reader->unit_filter = copy;
+	return 0;
+}
+
+int rec_player_set_order(RecorderPlayer *reader, RecorderPlayerOrder order)
+{
+	if (!reader || (order != RECORDER_ORDER_RECORDED &&
+		order != RECORDER_ORDER_WALLCLOCK)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (reader->order == order) return 0;
+	reader->order = order;
+	iterator_reset(reader);
 	return 0;
 }
 
@@ -1336,6 +1378,7 @@ static void iterator_reset(RecorderPlayer *reader)
 	reader->current_entry_ptr = NULL;
 	reader->current_valid = 0;
 	reader->iterator_state = ITERATOR_STATE_NONE;
+	reader->cursor_sources_pending = 0;
 }
 
 static int source_add_segment(IteratorSource *source, const SegmentPath *path)
@@ -1743,7 +1786,7 @@ static int iterator_position_at_cursor(RecorderPlayer *reader, size_t source_ind
 }
 
 static int iterator_seek_other_sources_realtime(RecorderPlayer *reader,
-									 size_t cursor_source_index, uint64_t usec)
+										 size_t cursor_source_index, uint64_t usec)
 {
 	size_t i;
 
@@ -1752,6 +1795,54 @@ static int iterator_seek_other_sources_realtime(RecorderPlayer *reader,
 		if (i == cursor_source_index) continue;
 		if (source_seek_realtime(reader, &reader->sources[i], usec) != 0) return -1;
 	}
+	return 0;
+}
+
+static int iterator_materialize_cursor_sources(RecorderPlayer *reader)
+{
+	IteratorSource *source = NULL;
+	StoredEntry cursor_entry;
+	size_t i;
+	size_t source_index;
+	uint64_t realtime_ts;
+
+	if (!reader->cursor_sources_pending) return 0;
+	if (iterator_collect_sources(reader) != 0) return -1;
+	for (i = 0; i < reader->source_count; i++) {
+		if (strcmp(reader->sources[i].group, reader->cursor_group) == 0) {
+			source = &reader->sources[i];
+			break;
+		}
+	}
+	if (!source) {
+		errno = ENOENT;
+		return -1;
+	}
+	if (source_seek_cursor(reader, source, reader->cursor_segment_seq,
+			reader->cursor_frame_offset, reader->cursor_frame_entry_index,
+			&realtime_ts) != 0) return -1;
+	source_index = (size_t)(source - reader->sources);
+	if (reader->order == RECORDER_ORDER_RECORDED) {
+		cursor_entry = source->entries[source->entry_index];
+		for (i = 0; i < reader->source_count; i++) {
+			IteratorSource *other = &reader->sources[i];
+			if (i == source_index) continue;
+			if (source_position_edge(reader, other, ITERATOR_STATE_FORWARD) < 0) return -1;
+			while (source_has_current(other) &&
+				compare_iterator_entries(reader,
+					&other->entries[other->entry_index], &cursor_entry) < 0) {
+				int rc = source_advance(reader, other, ITERATOR_STATE_FORWARD);
+				if (rc < 0) return -1;
+				if (rc == 0) break;
+			}
+		}
+		reader->current_source = source_index;
+		reader->current_entry_ptr = NULL;
+		reader->current_valid = 0;
+		reader->iterator_state = ITERATOR_STATE_CURSOR_PENDING;
+	} else if (iterator_seek_other_sources_realtime(reader, source_index, realtime_ts) != 0 ||
+		iterator_position_at_cursor(reader, source_index) != 0) return -1;
+	reader->cursor_sources_pending = 0;
 	return 0;
 }
 
@@ -1812,7 +1903,8 @@ static ssize_t iterator_pick(RecorderPlayer *reader, int direction)
 	for (i = 0; i < reader->source_count; i++) {
 		IteratorSource *source = &reader->sources[i];
 		if (source->entry_index < 0 || source->entry_index >= (ssize_t)source->entry_count) continue;
-		if (result < 0 || compare_stored_entries(&source->entries[source->entry_index],
+		if (result < 0 || compare_iterator_entries(reader,
+			&source->entries[source->entry_index],
 			&reader->sources[result].entries[reader->sources[result].entry_index]) * direction < 0)
 			result = (ssize_t)i;
 	}
@@ -2089,30 +2181,47 @@ int rec_player_seek_realtime_usec(RecorderPlayer *reader, uint64_t usec)
 }
 
 static int rec_player_seek_cursor_once(RecorderPlayer *reader, const char *group,
-								 uint64_t segment_seq, uint64_t frame_offset,
-								 uint32_t frame_entry_index)
+									 uint64_t segment_seq, uint64_t frame_offset,
+									 uint32_t frame_entry_index)
 {
-	IteratorSource *source = NULL;
-	size_t i;
-	size_t source_index;
-	uint64_t realtime_ts;
+	SegmentPath path;
+	IteratorSource *source;
+	uint64_t ignored_realtime_ts;
 
-	if (iterator_collect_sources(reader) != 0) return -1;
-	for (i = 0; i < reader->source_count; i++) {
-		if (strcmp(reader->sources[i].group, group) == 0) {
-			source = &reader->sources[i];
-			break;
-		}
-	}
-	if (!source) {
-		errno = ENOENT;
+	memset(&path, 0, sizeof(path));
+	path.segment_seq = segment_seq;
+	if (!reader->path_is_directory) {
+		if (snprintf(path.path, sizeof(path.path), "%s", reader->path) >=
+			(int)sizeof(path.path)) return -1;
+	} else if (strcmp(group, "-") == 0) {
+		if (snprintf(path.path, sizeof(path.path), "%s/%llu.seg", reader->path,
+			(unsigned long long)segment_seq) >= (int)sizeof(path.path)) return -1;
+	} else if (snprintf(path.path, sizeof(path.path), "%s/%s/%llu.seg", reader->path,
+		group, (unsigned long long)segment_seq) >= (int)sizeof(path.path)) {
 		return -1;
 	}
-	if (source_seek_cursor(reader, source, segment_seq, frame_offset,
-		frame_entry_index, &realtime_ts) != 0) return -1;
-	source_index = (size_t)(source - reader->sources);
-	if (iterator_seek_other_sources_realtime(reader, source_index, realtime_ts) != 0 ||
-		iterator_position_at_cursor(reader, source_index) != 0) return -1;
+
+	iterator_reset(reader);
+	reader->sources = calloc(1, sizeof(*reader->sources));
+	if (!reader->sources) return -1;
+	reader->source_count = 1;
+	source = &reader->sources[0];
+	if (snprintf(source->group, sizeof(source->group), "%s", group) >=
+		(int)sizeof(source->group) || source_add_segment(source, &path) != 0 ||
+		source_seek_cursor(reader, source, segment_seq, frame_offset,
+			frame_entry_index, &ignored_realtime_ts) != 0) {
+		iterator_reset(reader);
+		return -1;
+	}
+	reader->current_source = 0;
+	reader->cursor_sources_pending = 1;
+	strcpy(reader->cursor_group, group);
+	reader->cursor_segment_seq = segment_seq;
+	reader->cursor_frame_offset = frame_offset;
+	reader->cursor_frame_entry_index = frame_entry_index;
+	reader->current_entry_ptr = NULL;
+	reader->current_valid = 0;
+	reader->iterator_state = ITERATOR_STATE_CURSOR_PENDING;
 	return 0;
 }
 
@@ -2175,6 +2284,40 @@ static int iterator_reposition_after_current(RecorderPlayer *reader, int directi
 	memset(&key, 0, sizeof(key));
 	key.entry = *current;
 	key.entry.group = group;
+	if (reader->order == RECORDER_ORDER_RECORDED) {
+		if (iterator_collect_sources(reader) != 0) return -1;
+		for (i = 0; i < reader->source_count; i++) {
+			IteratorSource *source = &reader->sources[i];
+			if (source_position_edge(reader, source, ITERATOR_STATE_FORWARD) < 0) return -1;
+			if (direction == ITERATOR_STATE_FORWARD) {
+				while (source_has_current(source) &&
+					compare_iterator_entries(reader,
+						&source->entries[source->entry_index], &key) <= 0) {
+					int rc = source_advance(reader, source, ITERATOR_STATE_FORWARD);
+					if (rc < 0) return -1;
+					if (rc == 0) break;
+				}
+			} else {
+				while (source_has_current(source) &&
+					compare_iterator_entries(reader,
+						&source->entries[source->entry_index], &key) < 0) {
+					int rc = source_advance(reader, source, ITERATOR_STATE_FORWARD);
+					if (rc < 0) return -1;
+					if (rc == 0) break;
+				}
+				if (source_has_current(source)) {
+					if (source_advance(reader, source, ITERATOR_STATE_REVERSE) < 0) return -1;
+				} else if (source_position_edge(reader, source, ITERATOR_STATE_REVERSE) < 0) {
+					return -1;
+				}
+			}
+		}
+		reader->current_source = SIZE_MAX;
+		reader->current_entry_ptr = NULL;
+		reader->current_valid = 0;
+		reader->iterator_state = direction;
+		return 0;
+	}
 	if (iterator_seek_realtime(reader, key.entry.realtime_ts) != 0) return -1;
 	for (i = 0; i < reader->source_count; i++) {
 		IteratorSource *source = &reader->sources[i];
@@ -2225,6 +2368,12 @@ int rec_player_next(RecorderPlayer *reader)
 	}
 	if (reader->iterator_state == ITERATOR_STATE_CURSOR_PENDING) {
 		reader->iterator_state = ITERATOR_STATE_FORWARD;
+	} else if (reader->cursor_sources_pending && reader->current_valid) {
+		if (iterator_materialize_cursor_sources(reader) != 0) return -1;
+		/* The source positions now include the cursor entry. Advance it before
+		 * selecting the next merged entry. */
+		if (source_advance(reader, &reader->sources[reader->current_source],
+			ITERATOR_STATE_FORWARD) < 0) return -1;
 	} else if (reader->iterator_state == ITERATOR_STATE_REVERSE && reader->current_valid) {
 		if (iterator_reposition_after_current(reader, ITERATOR_STATE_FORWARD) != 0) return -1;
 	} else if (reader->iterator_state != ITERATOR_STATE_FORWARD &&
@@ -2249,6 +2398,8 @@ int rec_player_previous(RecorderPlayer *reader)
 	ssize_t pick;
 	size_t i;
 	if (!reader) return -1;
+	if (reader->cursor_sources_pending &&
+		iterator_materialize_cursor_sources(reader) != 0) return -1;
 	if (reader->iterator_state == ITERATOR_STATE_CURSOR_PENDING) {
 		for (i = 0; i < reader->source_count; i++) {
 			IteratorSource *source = &reader->sources[i];
@@ -2463,5 +2614,3 @@ int rec_player_process(RecorderPlayer *reader)
 	}
 	return result;
 }
-			entry.monotonic_tie_order = journal_CompactEntry_monotonic_tie_order(item);
-			entry.monotonic_tie_order = journal_FullEntry_monotonic_tie_order(item);

@@ -135,6 +135,9 @@ librecorder.a: $(LIBRECORDER_OBJS)
 smoke-test: src/smoke_test.o $(LIBRECORDER_TARGET)
 	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
+sort-test: src/sort_test.o $(LIBRECORDER_TARGET)
+	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
+
 batch-reader: src/batch_reader.o $(LIBRECORDER_TARGET)
 	$(CC) $(LDFLAGS) $(LIBRECORDER_RPATH) $^ $(LDLIBS) -o $@
 
@@ -170,10 +173,13 @@ test-python:
 test-smoke: smoke-test
 	./smoke-test
 
+test-sort: sort-test
+	./sort-test
+
 # Build test binaries against the repository's bundled FlatCC checkout and
 # sample configuration, then run every non-privileged test suite.
 test:
-	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) test-smoke
+	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) test-smoke test-sort batch-reader
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-python
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) test-fallback
 	$(MAKE) FLATCC_MODE=repo LOG_DIR=$(REPO_LOG_DIR) RECORDER_CONFIG_PATH=$(REPO_CONFIG_PATH) RECORDER_CONFIG_DIR=$(REPO_CONFIG_DIR) RECORDER_TEST_FREE_BYTES=0 test-storage-policy
