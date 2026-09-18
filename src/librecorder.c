@@ -947,6 +947,224 @@ out:
 	return rc;
 }
 
+typedef struct {
+	StoredEntry *entries;
+	size_t count;
+	size_t capacity;
+} WallclockEntryList;
+
+typedef struct {
+	SegmentPath path;
+	uint64_t min_realtime_ts;
+	uint64_t max_realtime_ts;
+	int needs_sort;
+	StoredEntry *entries;
+	size_t entry_count;
+	size_t entry_capacity;
+} WallclockSegment;
+
+static int append_wallclock_entry(const RecorderEntry *entry, void *userdata)
+{
+	WallclockEntryList *list = userdata;
+
+	return append_stored_entry_array(&list->entries, &list->count,
+			&list->capacity, entry);
+}
+
+static int wallclock_segment_metadata(RecorderPlayer *reader,
+						WallclockSegment *segment)
+{
+	SegmentHeader header;
+	SegmentFooter footer;
+
+	if (segment_scan_path(segment->path.path, reader->decryptor, NULL, NULL,
+					&header, &footer, NULL) != 0) return -1;
+	segment->min_realtime_ts = header.first_realtime_ts;
+	segment->max_realtime_ts = footer.present && footer.last_realtime_ts ?
+			footer.last_realtime_ts : header.first_realtime_ts;
+	if (segment->max_realtime_ts < segment->min_realtime_ts)
+		segment->needs_sort = 1;
+	if (!footer.present ||
+		(footer.footer_flags & SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC) != 0)
+		segment->needs_sort = 1;
+	return 0;
+}
+
+static int wallclock_load_segment(RecorderPlayer *reader,
+						WallclockSegment *segment)
+{
+	WallclockEntryList list = {
+		.entries = segment->entries,
+		.count = segment->entry_count,
+		.capacity = segment->entry_capacity
+	};
+	size_t i;
+
+	if (rec_player_scan_file(reader, segment->path.path,
+			append_wallclock_entry, &list, 0, NULL) != 0) return -1;
+	segment->entries = list.entries;
+	segment->entry_count = list.count;
+	segment->entry_capacity = list.capacity;
+	if (segment->entry_count == 0) return 0;
+	segment->min_realtime_ts = segment->entries[0].entry.realtime_ts;
+	segment->max_realtime_ts = segment->entries[0].entry.realtime_ts;
+	for (i = 1; i < segment->entry_count; i++) {
+		uint64_t timestamp = segment->entries[i].entry.realtime_ts;
+		if (timestamp < segment->min_realtime_ts)
+			segment->min_realtime_ts = timestamp;
+		if (timestamp > segment->max_realtime_ts)
+			segment->max_realtime_ts = timestamp;
+	}
+	return 0;
+}
+
+static void wallclock_free_segment(WallclockSegment *segment)
+{
+	size_t i;
+
+	for (i = 0; i < segment->entry_count; i++)
+		free_stored_entry(&segment->entries[i]);
+	free(segment->entries);
+	segment->entries = NULL;
+	segment->entry_count = 0;
+	segment->entry_capacity = 0;
+}
+
+static int compare_wallclock_segments(const void *left, const void *right)
+{
+	const WallclockSegment *a = left;
+	const WallclockSegment *b = right;
+
+	if (a->min_realtime_ts < b->min_realtime_ts) return -1;
+	if (a->min_realtime_ts > b->min_realtime_ts) return 1;
+	if (a->max_realtime_ts < b->max_realtime_ts) return -1;
+	if (a->max_realtime_ts > b->max_realtime_ts) return 1;
+	return compare_segment_path(&a->path, &b->path);
+}
+
+static int wallclock_append_moved(WallclockEntryList *list,
+						WallclockSegment *segment)
+{
+	size_t required;
+	StoredEntry *tmp;
+
+	if (segment->entry_count == 0) return 0;
+	if (list->count > SIZE_MAX - segment->entry_count) return -1;
+	required = list->count + segment->entry_count;
+	if (required > list->capacity) {
+		size_t capacity = list->capacity ? list->capacity : 32;
+		while (capacity < required) {
+			if (capacity > SIZE_MAX / 2) {
+				capacity = required;
+				break;
+			}
+			capacity *= 2;
+		}
+		tmp = realloc(list->entries, capacity * sizeof(*tmp));
+		if (!tmp) return -1;
+		list->entries = tmp;
+		list->capacity = capacity;
+	}
+	memcpy(list->entries + list->count, segment->entries,
+			segment->entry_count * sizeof(*segment->entries));
+	list->count = required;
+	free(segment->entries);
+	segment->entries = NULL;
+	segment->entry_count = 0;
+	segment->entry_capacity = 0;
+	return 0;
+}
+
+int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callback,
+						 void *userdata)
+{
+	SegmentPath *paths = NULL;
+	WallclockSegment *segments = NULL;
+	size_t path_count = 0;
+	size_t path_capacity = 0;
+	size_t segment_count = 0;
+	size_t i;
+	int rc = -1;
+
+	if (!reader || !callback) return -1;
+	if (reader->path_is_directory) {
+		if (collect_segment_paths(reader->path, &paths, &path_count,
+						&path_capacity) != 0) goto out;
+	} else if (add_segment_path(&paths, &path_count, &path_capacity,
+					reader->path, 0) != 0) goto out;
+	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
+	segments = calloc(path_count ? path_count : 1, sizeof(*segments));
+	if (!segments) goto out;
+	for (i = 0; i < path_count; i++) {
+		segments[segment_count].path = paths[i];
+		if (wallclock_segment_metadata(reader, &segments[segment_count]) != 0)
+			goto out;
+		if (segments[segment_count].needs_sort &&
+			wallclock_load_segment(reader, &segments[segment_count]) != 0)
+			goto out;
+		if (segments[segment_count].entry_count != 0 ||
+			segments[segment_count].min_realtime_ts != 0)
+			segment_count++;
+	}
+	qsort(segments, segment_count, sizeof(*segments), compare_wallclock_segments);
+
+	for (i = 0; i < segment_count;) {
+		size_t end = i;
+		uint64_t group_max = segments[i].max_realtime_ts;
+
+		while (end + 1 < segment_count &&
+			segments[end + 1].min_realtime_ts <= group_max) {
+			end++;
+			if (segments[end].max_realtime_ts > group_max)
+				group_max = segments[end].max_realtime_ts;
+		}
+		if (i == end && !segments[i].needs_sort) {
+			if (rec_player_scan_file(reader, segments[i].path.path,
+					callback, userdata, 0, NULL) != 0) goto out;
+						} else {
+			WallclockEntryList group = { 0 };
+			size_t j;
+
+			for (j = i; j <= end; j++) {
+				if (segments[j].entry_count != 0) {
+					if (wallclock_append_moved(&group, &segments[j]) != 0) {
+						for (size_t k = 0; k < group.count; k++)
+							free_stored_entry(&group.entries[k]);
+						free(group.entries);
+						goto out;
+					}
+				} else if (rec_player_scan_file(reader, segments[j].path.path,
+						append_wallclock_entry, &group, 0, NULL) != 0) {
+					for (size_t k = 0; k < group.count; k++)
+						free_stored_entry(&group.entries[k]);
+					free(group.entries);
+					goto out;
+				}
+			}
+			qsort(group.entries, group.count, sizeof(*group.entries),
+					compare_stored_entries);
+			for (j = 0; j < group.count; j++) {
+				if (callback(&group.entries[j].entry, userdata) != 0) {
+					for (size_t k = 0; k < group.count; k++)
+						free_stored_entry(&group.entries[k]);
+					free(group.entries);
+					goto out;
+				}
+			}
+			for (j = 0; j < group.count; j++)
+				free_stored_entry(&group.entries[j]);
+			free(group.entries);
+		}
+		i = end + 1;
+	}
+	rc = 0;
+out:
+	for (i = 0; i < segment_count; i++) wallclock_free_segment(&segments[i]);
+	free(segments);
+	free(paths);
+	return rc;
+}
+
 int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 						   void *userdata, size_t initial_entries)
 {

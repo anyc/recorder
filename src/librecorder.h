@@ -117,6 +117,13 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 /** Scan all currently retained segments in sequence order. */
 int rec_player_scan_all(RecorderPlayer *reader, rec_player_entry_cb callback,
 						void *userdata);
+/**
+ * Scan retained entries in realtime order without sorting the complete store.
+ * Ordered segments are streamed; only overlapping or realtime-nonmonotonic
+ * segment groups are materialized and sorted.
+ */
+int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callback,
+						 void *userdata);
 
 /*
  * Scan only the newest segment in each group and retain per-segment offsets
