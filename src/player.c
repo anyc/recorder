@@ -36,6 +36,9 @@ typedef struct {
 	uint64_t min_frame_offset;
 	uint64_t follow_start_ts;
 	int initial_follow_scan;
+	int stream_output;
+	int sanitize_output;
+	int json_output;
 	struct PlayerEntry *entries;
 	size_t entry_count;
 	size_t entry_capacity;
@@ -124,6 +127,10 @@ typedef struct {
 	size_t group_capacity;
 	uint64_t total_count;
 } StatsContext;
+
+static void free_player_entries(PlayerEntry *entries, size_t count);
+static int copy_player_entry(PlayerEntry *dst, const RecorderEntry *src);
+static void print_entry(const PlayerEntry *entry, int sanitize_output, int json_output);
 
 static int join_path_component(char *path, size_t path_size, const char *base,
 							   const char *name)
@@ -1114,8 +1121,18 @@ static int print_record(const RecorderEntry *entry, void *ctx)
 		!boot_matches(pc, entry->boot_seq, entry->boot_id)) {
 		return 0;
 	}
-	return entry_matches_values(pc, entry->realtime_ts, entry->unit) ?
-		append_player_entry(pc, entry) : 0;
+	if (!entry_matches_values(pc, entry->realtime_ts, entry->unit)) return 0;
+	if (pc->stream_output) {
+		PlayerEntry *copy = calloc(1, sizeof(*copy));
+		if (!copy || copy_player_entry(copy, entry) != 0) {
+			free_player_entries(copy, copy ? 1 : 0);
+			return -1;
+		}
+		print_entry(copy, pc->sanitize_output, pc->json_output);
+		free_player_entries(copy, 1);
+		return 0;
+	}
+	return append_player_entry(pc, entry);
 }
 
 static int add_segment_file(SegmentPath **items, size_t *count, size_t *cap,
@@ -1476,6 +1493,7 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 {
 	PrintContext output;
 	int initial_follow_scan = opts->follow && !*follow_initialized;
+	int output_preordered = 0;
 	int rc;
 
 	memset(&output, 0, sizeof(output));
@@ -1489,11 +1507,20 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 	output.have_until = opts->have_until;
 	output.follow_start_ts = opts->follow_start_ts;
 	output.initial_follow_scan = initial_follow_scan;
+	output.stream_output = opts->sort_wallclock && !opts->follow &&
+		!opts->have_line_count && !opts->since_cursor && !opts->until_cursor;
+	output.sanitize_output = opts->sanitize_output;
+	output.json_output = opts->json_output;
 
 	if (opts->follow) {
 		rc = rec_player_scan_follow(reader, print_record, &output,
 			opts->have_line_count ? opts->line_count : FOLLOW_INITIAL_ENTRY_COUNT);
 		*follow_initialized = 1;
+	} else if (opts->sort_wallclock && !opts->since_cursor && !opts->until_cursor) {
+		/* Realtime-ordered segments are streamed. Only overlapping or marked
+		 * nonmonotonic segment groups are materialized and sorted. */
+		rc = rec_player_scan_wallclock(reader, print_record, &output);
+		output_preordered = 1;
 	} else if (!opts->sort_wallclock && !opts->since_cursor && !opts->until_cursor) {
 		/* Segment paths are visited in recorder sequence order.  Keep that
 		 * order so realtime clock corrections cannot reorder the output. */
@@ -1548,9 +1575,13 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		return 1;
 	}
 
-	if (opts->sort_wallclock) {
+	if (opts->sort_wallclock && !output_preordered) {
 		qsort(output.entries, output.entry_count, sizeof(*output.entries),
 				compare_player_entries);
+	}
+	if (output.stream_output) {
+		free_player_entries(output.entries, output.entry_count);
+		return 0;
 	}
 	print_selected_entries(output.entries, output.entry_count, opts, initial_follow_scan);
 	free_player_entries(output.entries, output.entry_count);
