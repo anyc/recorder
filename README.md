@@ -296,6 +296,9 @@ sequence, actual budget utilization, logical/physical usage, and recorder's
 retention advantage.
 
 `player` scans all subdirectories under the given log root and reads any valid `.seg` files it finds.
+By default it prints entries in recorder order (segment sequence, frame offset,
+and entry index), which remains stable across realtime clock jumps. Use
+`--sort wallclock` to sort output by the stored realtime timestamp instead.
 Player output sanitizes terminal control characters by default. Use
 `--no-sanitize-output` when raw stored fields are required.
 

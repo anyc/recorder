@@ -98,6 +98,7 @@ typedef struct {
 	int lines_from_head;
 	int sanitize_output;
 	int json_output;
+	int sort_wallclock;
 } PlayerOptions;
 
 typedef struct {
@@ -1493,6 +1494,10 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		rc = rec_player_scan_follow(reader, print_record, &output,
 			opts->have_line_count ? opts->line_count : FOLLOW_INITIAL_ENTRY_COUNT);
 		*follow_initialized = 1;
+	} else if (!opts->sort_wallclock && !opts->since_cursor && !opts->until_cursor) {
+		/* Segment paths are visited in recorder sequence order.  Keep that
+		 * order so realtime clock corrections cannot reorder the output. */
+		rc = rec_player_scan_all(reader, print_record, &output);
 	} else if (opts->since_cursor || opts->until_cursor) {
 		int reached_until = 0;
 		const RecorderEntry *entry;
@@ -1543,8 +1548,10 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		return 1;
 	}
 
-	qsort(output.entries, output.entry_count, sizeof(*output.entries),
-			compare_player_entries);
+	if (opts->sort_wallclock) {
+		qsort(output.entries, output.entry_count, sizeof(*output.entries),
+				compare_player_entries);
+	}
 	print_selected_entries(output.entries, output.entry_count, opts, initial_follow_scan);
 	free_player_entries(output.entries, output.entry_count);
 	return 0;
@@ -1620,6 +1627,7 @@ static void usage(const char *prog)
 	fprintf(stderr,
 			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
+			"[--sort wallclock] "
 			"[--encryption-private-key PATH] "
 			"[--sanitize-output|--no-sanitize-output] [--json]\n",
 			prog);
@@ -1715,6 +1723,16 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->sanitize_output = 0;
 		} else if (strcmp(arg, "--json") == 0) {
 			opts->json_output = 1;
+		} else if (strcmp(arg, "--sort") == 0) {
+			if (++i >= argc || strcmp(argv[i], "wallclock") != 0) {
+				return -1;
+			}
+			opts->sort_wallclock = 1;
+		} else if (strncmp(arg, "--sort=", 7) == 0) {
+			if (strcmp(arg + 7, "wallclock") != 0) {
+				return -1;
+			}
+			opts->sort_wallclock = 1;
 		} else if (strcmp(arg, "--since") == 0) {
 			if (++i >= argc) {
 				return -1;
