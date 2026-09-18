@@ -39,7 +39,9 @@ enum {
 };
 
 enum {
-    SEGMENT_FOOTER_FLAG_HAS_SIGNATURE = 1u << 0
+    SEGMENT_FOOTER_FLAG_HAS_SIGNATURE = 1u << 0,
+    /* At least one entry's realtime timestamp was earlier than its predecessor. */
+    SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC = 1u << 1
 };
 
 enum {

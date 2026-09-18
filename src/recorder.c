@@ -277,6 +277,7 @@ typedef struct {
 	uint64_t first_monotonic_ts;
 	uint64_t last_realtime_ts;
 	uint64_t last_monotonic_ts;
+	int realtime_nonmonotonic;
 	time_t opened_mono_sec;
 	time_t last_chunk_flush_mono_sec;
 	time_t last_sync_mono_sec;
@@ -3513,6 +3514,7 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	w->first_monotonic_ts = entry->monotonic_ts;
 	w->last_realtime_ts = entry->realtime_ts;
 	w->last_monotonic_ts = entry->monotonic_ts;
+	w->realtime_nonmonotonic = 0;
 	w->clock_jump_seen_seq = r->clock_jump_seq;
 	w->opened_mono_sec = monotonic_now_sec();
 	w->last_chunk_flush_mono_sec = w->opened_mono_sec;
@@ -3668,6 +3670,8 @@ static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reas
 	footer.entry_count = w->entry_count;
 	footer.last_realtime_ts = w->last_realtime_ts;
 	footer.last_monotonic_ts = w->last_monotonic_ts;
+	if (w->realtime_nonmonotonic)
+		footer.footer_flags |= SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC;
 	if (segment_write_footer(w->fp, &footer) != 0) {
 		fclose(w->fp);
 		segment_encryptor_free(w->encryptor);
@@ -3956,6 +3960,8 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 		w->entries[w->count++] = entry_ref;
 	}
 	w->entry_count++;
+	if (entry->realtime_ts < w->last_realtime_ts)
+		w->realtime_nonmonotonic = 1;
 	w->last_realtime_ts = entry->realtime_ts;
 	w->last_monotonic_ts = entry->monotonic_ts;
 
