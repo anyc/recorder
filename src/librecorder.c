@@ -72,6 +72,7 @@ typedef struct StoredEntry {
 	char *exe;
 	char *message;
 	char *message_id;
+	RecorderField *fields;
 } StoredEntry;
 
 typedef struct {
@@ -242,6 +243,30 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 		flatbuffers_uint32_vec_t entries = journal_Chunk_entries(chunk);
 		for (i = 0; i < flatbuffers_uint32_vec_len(entries); i++) {
 			journal_FullEntry_table_t item = journal_FullEntry_vec_at(entries, i);
+			journal_Field_vec_t fields = journal_FullEntry_fields(item);
+			size_t field_count = journal_Field_vec_len(fields);
+			RecorderField *field_copy = NULL;
+			size_t field_index;
+
+			if (field_count != 0 && !(field_copy = calloc(field_count, sizeof(*field_copy))))
+				return -1;
+			for (field_index = 0; field_index < field_count; field_index++) {
+				journal_Field_table_t field = journal_Field_vec_at(fields, field_index);
+				flatbuffers_uint8_vec_t value = journal_Field_value(field);
+				size_t value_size = flatbuffers_uint8_vec_len(value);
+				unsigned char *value_copy = NULL;
+
+				if (value_size != 0 && !(value_copy = malloc(value_size))) {
+					while (field_index > 0) free((void *)field_copy[--field_index].value);
+					free(field_copy);
+					return -1;
+				}
+				for (size_t value_index = 0; value_index < value_size; value_index++)
+					value_copy[value_index] = flatbuffers_uint8_vec_at(value, value_index);
+				field_copy[field_index].name = journal_Field_name(field);
+				field_copy[field_index].value = value_copy;
+				field_copy[field_index].value_size = value_size;
+			}
 			entry.realtime_ts = journal_FullEntry_realtime_ts(item);
 			entry.monotonic_ts = journal_FullEntry_monotonic_ts(item);
 			entry.priority = journal_FullEntry_priority(item);
@@ -255,8 +280,18 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 			entry.exe = journal_FullEntry_exe(item);
 			entry.message = journal_FullEntry_message(item);
 			entry.message_id = journal_FullEntry_message_id(item);
+			entry.fields = field_copy;
+			entry.field_count = field_count;
 			entry.frame_entry_index = (uint32_t)i;
-			if (ctx->callback(&entry, ctx->userdata) != 0) return -1;
+			if (ctx->callback(&entry, ctx->userdata) != 0) {
+				for (field_index = 0; field_index < field_count; field_index++)
+					free((void *)field_copy[field_index].value);
+				free(field_copy);
+				return -1;
+			}
+			for (field_index = 0; field_index < field_count; field_index++)
+				free((void *)field_copy[field_index].value);
+			free(field_copy);
 		}
 	}
 	return 0;
@@ -264,6 +299,8 @@ static int scan_frame(const SegmentHeader *header, const SegmentFrameInfo *frame
 
 static void free_stored_entry(StoredEntry *stored)
 {
+	size_t i;
+
 	if (!stored) return;
 	free(stored->boot_id);
 	free(stored->group);
@@ -273,7 +310,36 @@ static void free_stored_entry(StoredEntry *stored)
 	free(stored->exe);
 	free(stored->message);
 	free(stored->message_id);
+	for (i = 0; i < stored->entry.field_count; i++) {
+		free((void *)stored->fields[i].name);
+		free((void *)stored->fields[i].value);
+	}
+	free(stored->fields);
 	memset(stored, 0, sizeof(*stored));
+}
+
+static int copy_stored_fields(StoredEntry *stored, const RecorderEntry *entry)
+{
+	size_t i;
+
+	if (entry->field_count == 0) return 0;
+	stored->fields = calloc(entry->field_count, sizeof(*stored->fields));
+	if (!stored->fields) return -1;
+	stored->entry.fields = stored->fields;
+	stored->entry.field_count = entry->field_count;
+	for (i = 0; i < entry->field_count; i++) {
+		stored->fields[i].name = entry->fields[i].name ?
+			strdup(entry->fields[i].name) : NULL;
+		if (entry->fields[i].name && !stored->fields[i].name) return -1;
+		if (entry->fields[i].value_size != 0) {
+			stored->fields[i].value = malloc(entry->fields[i].value_size);
+			if (!stored->fields[i].value) return -1;
+			memcpy((void *)stored->fields[i].value, entry->fields[i].value,
+				entry->fields[i].value_size);
+		}
+		stored->fields[i].value_size = entry->fields[i].value_size;
+	}
+	return 0;
 }
 
 static void clear_entries(RecorderPlayer *reader)
@@ -364,7 +430,8 @@ static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 		copy_string(&stored->unit, entry->unit) != 0 ||
 		copy_string(&stored->exe, entry->exe) != 0 ||
 		copy_string(&stored->message, entry->message) != 0 ||
-		copy_string(&stored->message_id, entry->message_id) != 0) {
+		copy_string(&stored->message_id, entry->message_id) != 0 ||
+		copy_stored_fields(stored, entry) != 0) {
 		free_stored_entry(stored);
 		return -1;
 	}
@@ -376,6 +443,7 @@ static int append_stored_entry(const RecorderEntry *entry, void *userdata)
 	stored->entry.exe = stored->exe;
 	stored->entry.message = stored->message;
 	stored->entry.message_id = stored->message_id;
+	stored->entry.fields = stored->fields;
 	reader->entry_count++;
 	return 0;
 }
@@ -403,7 +471,8 @@ static int append_stored_entry_array(StoredEntry **entries, size_t *count,
 		copy_string(&stored->unit, entry->unit) != 0 ||
 		copy_string(&stored->exe, entry->exe) != 0 ||
 		copy_string(&stored->message, entry->message) != 0 ||
-		copy_string(&stored->message_id, entry->message_id) != 0) {
+		copy_string(&stored->message_id, entry->message_id) != 0 ||
+		copy_stored_fields(stored, entry) != 0) {
 		free_stored_entry(stored);
 		return -1;
 	}
@@ -415,6 +484,7 @@ static int append_stored_entry_array(StoredEntry **entries, size_t *count,
 	stored->entry.exe = stored->exe;
 	stored->entry.message = stored->message;
 	stored->entry.message_id = stored->message_id;
+	stored->entry.fields = stored->fields;
 	(*count)++;
 	return 0;
 }
@@ -456,6 +526,7 @@ static void rebind_stored_entry_strings(RecorderPlayer *reader)
 		stored->entry.exe = stored->exe;
 		stored->entry.message = stored->message;
 		stored->entry.message_id = stored->message_id;
+		stored->entry.fields = stored->fields;
 	}
 }
 

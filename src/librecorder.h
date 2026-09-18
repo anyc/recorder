@@ -8,6 +8,14 @@
 typedef struct RecorderPlayer RecorderPlayer;
 
 typedef struct {
+	/** Borrowed field name, valid only during the entry callback/current entry. */
+	const char *name;
+	/** Borrowed binary field value, valid only during the callback/current entry. */
+	const void *value;
+	size_t value_size;
+} RecorderField;
+
+typedef struct {
 	/** Identity of the boot that produced this entry. */
 	uint32_t boot_seq;
 	/** Borrowed boot ID string. */
@@ -31,6 +39,9 @@ typedef struct {
 	const char *exe;
 	const char *message;
 	const char *message_id;
+	/** Optional arbitrary fields captured as binary name/value pairs. */
+	const RecorderField *fields;
+	size_t field_count;
 	/** Borrowed priority-group name, or NULL for a root-level segment. */
 	const char *group;
 } RecorderEntry;
