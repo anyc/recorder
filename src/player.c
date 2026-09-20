@@ -704,7 +704,7 @@ static int print_stats(const PlayerOptions *opts)
 		if (width > count_width) count_width = width;
 	}
 	printf("%-*s %*s  %-19s  %-19s\n", (int)label_width, "Group", (int)count_width,
-		"Lines", "First entry", "Last entry");
+		"Lines", "First entry", "Latest timestamp");
 	for (i = 0; i < stats.group_count; i++) {
 		char first[32], last[32];
 		format_realtime_full(stats.groups[i].first_realtime_ts, first, sizeof(first));

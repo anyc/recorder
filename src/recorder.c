@@ -276,7 +276,8 @@ typedef struct {
 	uint64_t entry_count;
 	uint64_t first_realtime_ts;
 	uint64_t first_monotonic_ts;
-	uint64_t last_realtime_ts;
+	uint64_t previous_realtime_ts;
+	uint64_t max_realtime_ts;
 	uint64_t last_monotonic_ts;
 	int realtime_nonmonotonic;
 	time_t opened_mono_sec;
@@ -579,6 +580,16 @@ static RotateDecision writer_should_rotate(const Recorder *r, const PriorityWrit
 		decision.delta_diff = r->clock_jump_usec;
 		decision.reason = decision.delta_diff < 0 ? ROTATE_REASON_CLOCK_BACKWARD :
 			ROTATE_REASON_CLOCK_FORWARD;
+		return decision;
+	}
+	/* The header timestamp is a lower bound within one tolerated backward
+	 * clock adjustment.  Keep that invariant by placing an older entry in a
+	 * fresh segment before it is serialized. */
+	if (entry->realtime_ts < w->first_realtime_ts &&
+		w->first_realtime_ts - entry->realtime_ts >
+		(uint64_t)CLOCK_BACKWARD_JUMP_THRESHOLD_USEC) {
+		decision.reason = ROTATE_REASON_CLOCK_BACKWARD;
+		decision.delta_diff = -CLOCK_BACKWARD_JUMP_THRESHOLD_USEC;
 		return decision;
 	}
 	if (w->boot_id[0] != '\0' && entry->boot_id[0] != '\0' &&
@@ -3521,7 +3532,8 @@ static int writer_open_segment(Recorder *r, PriorityWriter *w, const LogEntry *e
 	w->entry_count = 0;
 	w->first_realtime_ts = entry->realtime_ts;
 	w->first_monotonic_ts = entry->monotonic_ts;
-	w->last_realtime_ts = entry->realtime_ts;
+	w->previous_realtime_ts = entry->realtime_ts;
+	w->max_realtime_ts = entry->realtime_ts;
 	w->last_monotonic_ts = entry->monotonic_ts;
 	w->realtime_nonmonotonic = 0;
 	w->clock_jump_seen_seq = r->clock_jump_seq;
@@ -3677,7 +3689,7 @@ static int writer_close_segment(Recorder *r, PriorityWriter *w, const char *reas
 	memset(&footer, 0, sizeof(footer));
 	footer.rotation_reason = rotation_reason;
 	footer.entry_count = w->entry_count;
-	footer.last_realtime_ts = w->last_realtime_ts;
+	footer.last_realtime_ts = w->max_realtime_ts;
 	footer.last_monotonic_ts = w->last_monotonic_ts;
 	if (w->realtime_nonmonotonic)
 		footer.footer_flags |= SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC;
@@ -3969,9 +3981,11 @@ static int recorder_submit_entry(Recorder *r, const LogEntry *entry)
 		w->entries[w->count++] = entry_ref;
 	}
 	w->entry_count++;
-	if (entry->realtime_ts < w->last_realtime_ts)
+	if (entry->realtime_ts < w->previous_realtime_ts)
 		w->realtime_nonmonotonic = 1;
-	w->last_realtime_ts = entry->realtime_ts;
+	w->previous_realtime_ts = entry->realtime_ts;
+	if (entry->realtime_ts > w->max_realtime_ts)
+		w->max_realtime_ts = entry->realtime_ts;
 	w->last_monotonic_ts = entry->monotonic_ts;
 
 	if (w->count == CHUNK_SIZE) {
@@ -4297,8 +4311,8 @@ static void recorder_shutdown(Recorder *r)
 	}
 	for (i = 0; i < r->config.group_count; i++) {
 		if (r->writers[i].open &&
-			r->writers[i].last_realtime_ts > max_last_rt[i]) {
-			max_last_rt[i] = r->writers[i].last_realtime_ts;
+			r->writers[i].max_realtime_ts > max_last_rt[i]) {
+			max_last_rt[i] = r->writers[i].max_realtime_ts;
 		}
 		memcpy(boot_ids[i], r->writers[i].boot_id, RECORDER_BOOT_ID_SIZE);
 		boot_ids[i][RECORDER_BOOT_ID_SIZE] = '\0';

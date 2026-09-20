@@ -64,7 +64,7 @@
   - Optional dictionary area immediately after the header: dictionary metadata plus dictionary bytes, or an explicit empty dictionary marker.
   - Frame: `uint32_t frame_len_le`, frame metadata, stored payload bytes, `uint32_t frame_crc32_le`.
   - Frame metadata records compression mode, stored payload length, and uncompressed payload length.
-  - Footer body v1: `footer_flags`, numeric `rotation_reason`, `entry_count`, `last_realtime_ts`, `last_monotonic_ts`, `footer_crc32`.
+  - Footer body v1: `footer_flags`, numeric `rotation_reason`, `entry_count`, `last_realtime_ts`, `last_monotonic_ts`, `footer_crc32`. `last_realtime_ts` stores the maximum realtime timestamp in the segment.
   - `footer_flags` reserves `FOOTER_HAS_SIGNATURE`.
   - When `FOOTER_HAS_SIGNATURE` is set, place `signature_algorithm`, `signature_len`, and `signature_bytes` before `footer_flags`.
   - Reserve `SEGMENT_FLAG_SIGNED` and the Ed25519 algorithm identifier for a

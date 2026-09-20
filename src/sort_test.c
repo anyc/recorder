@@ -51,11 +51,13 @@ static int write_test_segment(const char *path, uint64_t sequence,
 	FILE *fp = NULL;
 	size_t chunk_size;
 	size_t i;
+	uint64_t max_realtime_ts;
 	int rc = -1;
 
 	entries = calloc(count, sizeof(*entries));
 	if (!entries) goto out;
 	flatcc_builder_init(&builder);
+	max_realtime_ts = timestamps[0];
 	message = flatbuffers_string_create_str(&builder, "sort-test");
 	unit = flatbuffers_string_create_str(&builder, "sort-test.service");
 	for (i = 0; i < count; i++) {
@@ -67,6 +69,7 @@ static int write_test_segment(const char *path, uint64_t sequence,
 		journal_CompactEntry_unit_add(&builder, unit);
 		entries[i] = journal_CompactEntry_end(&builder);
 		if (!entries[i]) goto builder_out;
+		if (timestamps[i] > max_realtime_ts) max_realtime_ts = timestamps[i];
 	}
 	entry_vector = journal_CompactEntry_vec_create(&builder, entries, count);
 	if (!entry_vector || !journal_DefaultChunk_create_as_root(&builder, entry_vector) ||
@@ -82,7 +85,7 @@ static int write_test_segment(const char *path, uint64_t sequence,
 	header.first_monotonic_ts = timestamps[0];
 	memset(&footer, 0, sizeof(footer));
 	footer.entry_count = count;
-	footer.last_realtime_ts = timestamps[count - 1];
+	footer.last_realtime_ts = max_realtime_ts;
 	footer.last_monotonic_ts = timestamps[count - 1];
 	if (nonmonotonic)
 		footer.footer_flags |= SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC;
@@ -198,8 +201,9 @@ int main(void)
 		}
 	}
 	if (segment_scan_path(path[2], NULL, NULL, NULL, &header, &footer, NULL) != 0 ||
-		(footer.footer_flags & SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC) == 0) {
-		fprintf(stderr, "sort-test: nonmonotonic footer flag missing\n");
+		(footer.footer_flags & SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC) == 0 ||
+		footer.last_realtime_ts != 400) {
+		fprintf(stderr, "sort-test: nonmonotonic footer metadata invalid\n");
 		goto out;
 	}
 	if (rec_player_open(&reader, store_template) != 0 ||

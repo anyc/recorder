@@ -86,7 +86,8 @@ typedef struct {
     uint32_t footer_flags;
     uint32_t rotation_reason;
     uint64_t entry_count;
-    uint64_t last_realtime_ts;
+	/* Maximum realtime timestamp among all entries in the segment. */
+	uint64_t last_realtime_ts;
     uint64_t last_monotonic_ts;
 	/* Set by readers when a structurally valid footer was present on disk. */
 	int present;
