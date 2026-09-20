@@ -139,6 +139,20 @@ static int collect_iterator(RecorderPlayer *reader, TimestampList *list)
 	return rc;
 }
 
+static int current_timestamp_is(RecorderPlayer *reader, uint64_t timestamp)
+{
+	const RecorderEntry *entry;
+
+	return rec_player_get_entry(reader, &entry) == 0 && entry->realtime_ts == timestamp;
+}
+
+static int has_current_entry(RecorderPlayer *reader)
+{
+	const RecorderEntry *entry;
+
+	return rec_player_get_entry(reader, &entry) == 0;
+}
+
 int main(void)
 {
 	const uint64_t first[] = {100, 300};
@@ -202,6 +216,16 @@ int main(void)
 		expect_timestamps("iterator recorded", recorded, 6, &actual) != 0) goto out;
 	free(actual.timestamps);
 	actual = (TimestampList){0};
+	if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+		!current_timestamp_is(reader, 100) || rec_player_next(reader) != 1 ||
+		!current_timestamp_is(reader, 300) ||
+		rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0 ||
+		!current_timestamp_is(reader, 300) || rec_player_next(reader) != 1 ||
+		rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
+		!has_current_entry(reader)) {
+		fprintf(stderr, "sort-test: order change did not preserve position\n");
+		goto out;
+	}
 	if (rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0 ||
 		rec_player_seek_head(reader) != 0) goto out;
 	rc = 0;
