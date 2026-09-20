@@ -312,6 +312,7 @@ typedef struct {
 	int verbose;
 	int current_entry_pending;
 	int cursor_enabled;
+	int runtime_cursor_is_volatile;
 	int persistent_cursor_enabled;
 	char cursor_path[PATH_MAX];
 	char persistent_cursor_path[PATH_MAX];
@@ -3825,8 +3826,9 @@ static int recorder_init(Recorder *r, sd_journal *j, const RecorderConfig *cfg,
 		}
 		r->cursor_enabled = 1;
 	} else if (select_runtime_cursor_path(r->cursor_path,
-										 sizeof(r->cursor_path)) == 0) {
+									 sizeof(r->cursor_path)) == 0) {
 		r->cursor_enabled = 1;
+		r->runtime_cursor_is_volatile = 1;
 		if (journal_namespace &&
 			(join_path_suffix(runtime_cursor_path, sizeof(runtime_cursor_path),
 				r->cursor_path, ".") != 0 ||
@@ -4328,6 +4330,8 @@ static void recorder_shutdown(Recorder *r)
 		r->script_worker = NULL;
 	}
 	if (close_ok && r->pending_cursor) {
+		int persistent_cursor_written = 0;
+
 		if (r->cursor_enabled && persist_journal_cursor(r) != 0) {
 			fprintf(stderr, "recorder: failed to persist volatile journal cursor during shutdown\n");
 			r->cursor_enabled = 0;
@@ -4335,7 +4339,14 @@ static void recorder_shutdown(Recorder *r)
 		if (r->persistent_cursor_enabled &&
 			write_journal_cursor(r->persistent_cursor_path, r->pending_cursor) != 0) {
 			fprintf(stderr, "recorder: failed to persist journal cursor to %s: %m\n",
-					r->persistent_cursor_path);
+				r->persistent_cursor_path);
+		} else if (r->persistent_cursor_enabled) {
+			persistent_cursor_written = 1;
+		}
+		if (persistent_cursor_written && r->runtime_cursor_is_volatile &&
+			unlink(r->cursor_path) != 0 && errno != ENOENT) {
+			fprintf(stderr, "recorder: failed to remove volatile journal cursor %s: %m\n",
+				r->cursor_path);
 		}
 	}
 	free(r->pending_cursor);
@@ -4530,6 +4541,10 @@ int main(int argc, char **argv)
 						if (n >= 0) {
 							r.current_entry_pending = n > 0;
 							resumed = 1;
+							/* Preserve the effective checkpoint even when no entry is
+							 * processed before a clean shutdown. */
+							r.pending_cursor = cursor;
+							cursor = NULL;
 						}
 					}
 				} else {

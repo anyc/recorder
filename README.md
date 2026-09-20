@@ -106,7 +106,8 @@ Run the recorder:
 By default, recorder resumes after the last journal cursor checkpoint stored
 under `/run` when that directory is `tmpfs`-backed. A cursor from the last
 clean shutdown is also stored in the log directory's `state/journal.cursor`
-and is used as a fallback after reboot. If no checkpoint exists, it imports
+and is used as a fallback after reboot. After a successful clean shutdown the
+volatile checkpoint is removed. If no checkpoint exists, it imports
 all journal entries still available. To start with only the current last
 journal entry, use:
 
