@@ -51,6 +51,11 @@ int index_scan_frames(const char *path, const char *segment_path,
  * on an unusable index. */
 int index_find_realtime_frame(const char *path, const char *segment_path, uint64_t usec,
 					  IndexFrame *frame_out, size_t *frame_index_out);
+/* Locate the first frame whose monotonic range can contain usec. Returns zero
+ * when found, one when the index is valid but no frame can match, and negative
+ * on an unusable index. */
+int index_find_monotonic_frame(const char *path, const char *segment_path, uint64_t usec,
+					   IndexFrame *frame_out, size_t *frame_index_out);
 int index_find_offset_frame(const char *path, const char *segment_path, uint64_t file_offset,
 					IndexFrame *frame_out, size_t *frame_index_out);
 

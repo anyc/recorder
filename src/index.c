@@ -531,6 +531,33 @@ out:
 	return rc;
 }
 
+int index_find_monotonic_frame(const char *path, const char *segment_path, uint64_t usec,
+					   IndexFrame *frame_out, size_t *frame_index_out)
+{
+	IndexFrame frame;
+	size_t count = 0, lo = 0, hi;
+	int fd;
+	int rc = -1;
+
+	if (!frame_out || !frame_index_out ||
+		index_open_read(path, segment_path, &fd, &count) != 0) return -1;
+	hi = count;
+	while (lo < hi) {
+		size_t mid = lo + (hi - lo) / 2;
+		if (index_pread_frame(fd, mid, &frame) != 0) goto out;
+		if (frame.max_monotonic_ts < usec) lo = mid + 1;
+		else hi = mid;
+	}
+	if (lo < count) {
+		if (index_pread_frame(fd, lo, frame_out) != 0) goto out;
+		*frame_index_out = lo;
+		rc = 0;
+	} else rc = 1;
+out:
+	close(fd);
+	return rc;
+}
+
 int index_find_offset_frame(const char *path, const char *segment_path, uint64_t file_offset,
 					IndexFrame *frame_out, size_t *frame_index_out)
 {
