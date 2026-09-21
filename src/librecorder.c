@@ -2272,6 +2272,22 @@ int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor)
 		errno = ESTALE;
 		return -1;
 	}
+	/* Batch clients commonly checkpoint the entry just returned by this same
+	 * reader. Keep its per-group candidate positions: the first next() returns
+	 * that entry and the following next() advances normally without rebuilding
+	 * or replaying the iterator. */
+	if (reader->current_valid && reader->current_entry_ptr &&
+		reader->current_entry_ptr->entry.group &&
+		strcmp(reader->current_entry_ptr->entry.group, group) == 0 &&
+		reader->current_entry_ptr->entry.segment_seq == segment_seq &&
+		reader->current_entry_ptr->entry.frame_offset == frame_offset &&
+		reader->current_entry_ptr->entry.frame_entry_index == frame_entry_index) {
+		reader->cursor_pending = 1;
+		reader->cursor_sources_pending = 0;
+		reader->current_entry_ptr = NULL;
+		reader->current_valid = 0;
+		return 0;
+	}
 	if (rec_player_seek_cursor_once(reader, group, segment_seq, frame_offset,
 			frame_entry_index) == 0) return 0;
 	{
