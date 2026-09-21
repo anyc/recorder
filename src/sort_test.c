@@ -37,7 +37,8 @@ static int collect_timestamp(const RecorderEntry *entry, void *userdata)
 }
 
 static int write_test_segment(const char *path, uint64_t sequence,
-						 const uint64_t *timestamps, size_t count,
+						 const uint64_t *timestamps, const uint64_t *monotonic,
+						 size_t count,
 						 int nonmonotonic)
 {
 	flatcc_builder_t builder;
@@ -63,7 +64,8 @@ static int write_test_segment(const char *path, uint64_t sequence,
 	for (i = 0; i < count; i++) {
 		if (journal_CompactEntry_start(&builder) != 0) goto builder_out;
 		journal_CompactEntry_realtime_ts_add(&builder, timestamps[i]);
-		journal_CompactEntry_monotonic_ts_add(&builder, timestamps[i]);
+		journal_CompactEntry_monotonic_ts_add(&builder,
+			monotonic ? monotonic[i] : timestamps[i]);
 		journal_CompactEntry_priority_add(&builder, 5);
 		journal_CompactEntry_message_add(&builder, message);
 		journal_CompactEntry_unit_add(&builder, unit);
@@ -82,11 +84,11 @@ static int write_test_segment(const char *path, uint64_t sequence,
 	strcpy(header.boot_id, "sort-test-boot");
 	strcpy(header.timezone, "+0000");
 	header.first_realtime_ts = timestamps[0];
-	header.first_monotonic_ts = timestamps[0];
+	header.first_monotonic_ts = monotonic ? monotonic[0] : timestamps[0];
 	memset(&footer, 0, sizeof(footer));
 	footer.entry_count = count;
 	footer.last_realtime_ts = max_realtime_ts;
-	footer.last_monotonic_ts = timestamps[count - 1];
+	footer.last_monotonic_ts = monotonic ? monotonic[count - 1] : timestamps[count - 1];
 	if (nonmonotonic)
 		footer.footer_flags |= SEGMENT_FOOTER_FLAG_REALTIME_NONMONOTONIC;
 
@@ -161,36 +163,68 @@ int main(void)
 	const uint64_t first[] = {100, 300};
 	const uint64_t second[] = {50, 200};
 	const uint64_t third[] = {400, 350};
+	const uint64_t first_monotonic[] = {100, 300};
+	const uint64_t second_monotonic[] = {400, 500};
+	const uint64_t third_monotonic[] = {600, 700};
+	const uint64_t other[] = {1000, 2000};
+	const uint64_t other_monotonic[] = {200, 550};
 	const uint64_t recorded[] = {100, 300, 50, 200, 400, 350};
 	const uint64_t wallclock[] = {50, 100, 200, 300, 350, 400};
 	char store_template[] = "/tmp/recorder-sort-test-XXXXXX";
-	char group_path[512];
-	char path[3][512];
-	char index_path[3][512];
+	char group_path[512] = {0};
+	char state_path[512] = {0};
+	char store_id_path[512] = {0};
+	char other_group_path[512] = {0};
+	char path[3][512] = {{0}};
+	char index_path[3][512] = {{0}};
+	char other_path[512] = {0};
+	char other_index_path[512] = {0};
 	RecorderPlayer *reader = NULL;
 	TimestampList actual = {0};
 	SegmentHeader header;
 	SegmentFooter footer;
 	int store_fd = -1;
+	FILE *state_fp = NULL;
 	int rc = 1;
 	int i;
 
 	store_fd = mkstemp(store_template);
 	if (store_fd < 0 || close(store_fd) != 0 || unlink(store_template) != 0 ||
 		mkdir(store_template, 0755) != 0 ||
+		snprintf(state_path, sizeof(state_path), "%s/state", store_template) >=
+			(int)sizeof(state_path) || mkdir(state_path, 0755) != 0 ||
+		snprintf(store_id_path, sizeof(store_id_path), "%s/store-id", state_path) >=
+			(int)sizeof(store_id_path) ||
 		snprintf(group_path, sizeof(group_path), "%s/p5", store_template) >=
 			(int)sizeof(group_path) || mkdir(group_path, 0755) != 0) {
 		fprintf(stderr, "sort-test: create store failed\n");
 		goto out;
 	}
+	state_fp = fopen(store_id_path, "w");
+	if (!state_fp) {
+		fprintf(stderr, "sort-test: create store ID failed\n");
+		goto out;
+	}
+	if (fputs("0123456789abcdef\n", state_fp) == EOF) {
+		fclose(state_fp);
+		state_fp = NULL;
+		fprintf(stderr, "sort-test: create store ID failed\n");
+		goto out;
+	}
+	if (fclose(state_fp) != 0) {
+		state_fp = NULL;
+		fprintf(stderr, "sort-test: create store ID failed\n");
+		goto out;
+	}
+	state_fp = NULL;
 	for (i = 0; i < 3; i++) {
 		if (snprintf(path[i], sizeof(path[i]), "%s/%d.seg", group_path, i + 1) >=
 				(int)sizeof(path[i]) || snprintf(index_path[i], sizeof(index_path[i]),
 					"%s/%d.idx", group_path, i + 1) >= (int)sizeof(index_path[i])) goto out;
 	}
-	if (write_test_segment(path[0], 1, first, 2, 0) != 0 ||
-		write_test_segment(path[1], 2, second, 2, 0) != 0 ||
-		write_test_segment(path[2], 3, third, 2, 1) != 0) {
+	if (write_test_segment(path[0], 1, first, first_monotonic, 2, 0) != 0 ||
+		write_test_segment(path[1], 2, second, second_monotonic, 2, 0) != 0 ||
+		write_test_segment(path[2], 3, third, third_monotonic, 2, 1) != 0) {
 		fprintf(stderr, "sort-test: write segments failed\n");
 		goto out;
 	}
@@ -232,16 +266,71 @@ int main(void)
 	}
 	if (rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0 ||
 		rec_player_seek_head(reader) != 0) goto out;
+	rec_player_close(reader);
+	reader = NULL;
+	if (snprintf(other_group_path, sizeof(other_group_path), "%s/p6", store_template) >=
+			(int)sizeof(other_group_path) || mkdir(other_group_path, 0755) != 0 ||
+		snprintf(other_path, sizeof(other_path), "%s/1.seg", other_group_path) >=
+			(int)sizeof(other_path) ||
+		snprintf(other_index_path, sizeof(other_index_path), "%s/1.idx", other_group_path) >=
+			(int)sizeof(other_index_path) ||
+		write_test_segment(other_path, 1, other, other_monotonic, 2, 0) != 0 ||
+		index_rebuild_for_segment(other_path, other_index_path, NULL) != 0 ||
+		rec_player_open(&reader, store_template) != 0 ||
+		rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
+		rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+		!current_timestamp_is(reader, 100) || rec_player_next(reader) != 1 ||
+		!current_timestamp_is(reader, 1000)) {
+		fprintf(stderr, "sort-test: recorded cross-group order failed\n");
+		goto out;
+	}
+	{
+		char *cursor = NULL;
+
+		if (rec_player_get_cursor(reader, &cursor) != 0) goto out;
+		rec_player_close(reader);
+		reader = NULL;
+		if (rec_player_open(&reader, store_template) != 0 ||
+			rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
+			rec_player_seek_cursor(reader, cursor) != 0) {
+			fprintf(stderr, "sort-test: recorded cursor seek failed\n");
+			free(cursor);
+			goto out;
+		}
+		if (rec_player_next(reader) != 1 || !current_timestamp_is(reader, 1000)) {
+			fprintf(stderr, "sort-test: cursor entry mismatch\n");
+			free(cursor);
+			goto out;
+		}
+		if (rec_player_next(reader) != 1 || !current_timestamp_is(reader, 300)) {
+			fprintf(stderr, "sort-test: cursor successor mismatch\n");
+			free(cursor);
+			goto out;
+		}
+		if (rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_previous(reader) != 1 || !current_timestamp_is(reader, 100)) {
+			fprintf(stderr, "sort-test: recorded cross-group cursor resume failed\n");
+			free(cursor);
+			goto out;
+		}
+		free(cursor);
+	}
 	rc = 0;
 
 out:
+	if (state_fp) fclose(state_fp);
 	free(actual.timestamps);
 	rec_player_close(reader);
 	for (i = 0; i < 3; i++) {
 		unlink(index_path[i]);
 		unlink(path[i]);
 	}
+	unlink(other_index_path);
+	unlink(other_path);
 	rmdir(group_path);
+	rmdir(other_group_path);
+	unlink(store_id_path);
+	rmdir(state_path);
 	rmdir(store_template);
 	if (rc == 0) printf("sort ordering ok\n");
 	return rc;
