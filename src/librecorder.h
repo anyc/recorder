@@ -7,6 +7,14 @@
 /** Opaque reader for recorder segments and log directories. */
 typedef struct RecorderPlayer RecorderPlayer;
 
+typedef struct {
+	char name[64];
+	uint64_t entry_count;
+	uint64_t disk_bytes;
+	uint64_t first_realtime_usec;
+	uint64_t last_realtime_usec;
+} RecorderGroupStats;
+
 typedef enum {
 	/** Iterate by recorder segment/frame/entry order. */
 	RECORDER_ORDER_RECORDED = 0,
@@ -86,6 +94,16 @@ int rec_player_set_group_filter(RecorderPlayer *reader,
  */
 int rec_player_list_groups(RecorderPlayer *reader, char ***groups_out,
 				   size_t *count_out);
+/**
+ * Summarize groups with segment files, ignoring the reader's filters.
+ * Timestamps are the minimum and maximum entry realtime values in usec,
+ * or zero when a group has no entries. disk_bytes counts allocated bytes
+ * for each segment, including active ones, and its matching index. A missing
+ * or unusable index requires a segment scan and a key for encrypted data.
+ * The caller frees the array. An empty store returns NULL and count zero.
+ */
+int rec_player_get_group_stats(RecorderPlayer *reader,
+					RecorderGroupStats **stats_out, size_t *count_out);
 /** Enable lazy repair of unusable sidecar indexes while reading. */
 int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled);
 /** Allow lazy repair of the latest segment in each group. */

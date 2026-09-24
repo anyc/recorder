@@ -184,6 +184,8 @@ int main(void)
 	RecorderPlayer *reader = NULL;
 	char **listed_groups = NULL;
 	size_t listed_count = 0;
+	RecorderGroupStats *group_stats = NULL;
+	size_t group_stats_count = 0;
 	TimestampList actual = {0};
 	SegmentHeader header;
 	SegmentFooter footer;
@@ -349,6 +351,34 @@ int main(void)
 		free(listed_groups);
 		listed_groups = NULL;
 		listed_count = 0;
+		if (rec_player_set_unit_filter(reader, "absent.service") != 0 ||
+			rec_player_get_group_stats(reader, &group_stats, &group_stats_count) != 0 ||
+			group_stats_count != 2 ||
+			strcmp(group_stats[0].name, "p5") != 0 ||
+			group_stats[0].entry_count != 6 ||
+			group_stats[0].first_realtime_usec != 50 ||
+			group_stats[0].last_realtime_usec != 400 ||
+			strcmp(group_stats[1].name, "p6") != 0 ||
+			group_stats[1].entry_count != 2 ||
+			group_stats[1].first_realtime_usec != 1000 ||
+			group_stats[1].last_realtime_usec != 2000) {
+			fprintf(stderr, "sort-test: indexed group statistics failed\n");
+			goto out;
+		}
+		{
+			struct stat segment_st, index_st;
+			if (stat(other_path, &segment_st) != 0 ||
+				stat(other_index_path, &index_st) != 0 ||
+				group_stats[1].disk_bytes !=
+					(uint64_t)(segment_st.st_blocks + index_st.st_blocks) * 512u) {
+				fprintf(stderr, "sort-test: indexed group disk usage failed\n");
+				goto out;
+			}
+		}
+		free(group_stats);
+		group_stats = NULL;
+		group_stats_count = 0;
+		if (rec_player_set_unit_filter(reader, NULL) != 0) goto out;
 		if (rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
 			expect_timestamps("filtered scan", other, 2, &actual) != 0) goto out;
 		free(actual.timestamps);
@@ -379,6 +409,10 @@ int main(void)
 		free(actual.timestamps);
 		actual = (TimestampList){0};
 		if (unlink(other_index_path) != 0 ||
+			rec_player_get_group_stats(reader, &group_stats, &group_stats_count) != 0 ||
+			group_stats_count != 2 || group_stats[1].entry_count != 2 ||
+			group_stats[1].first_realtime_usec != 1000 ||
+			group_stats[1].last_realtime_usec != 2000 ||
 			rec_player_set_group_filter(reader, both, 1) != 0 ||
 			rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
 			rec_player_seek_cursor(reader, excluded_cursor) != 0 ||
@@ -387,6 +421,18 @@ int main(void)
 			free(excluded_cursor);
 			goto out;
 		}
+		{
+			struct stat segment_st;
+			if (stat(other_path, &segment_st) != 0 ||
+				group_stats[1].disk_bytes != (uint64_t)segment_st.st_blocks * 512u) {
+				fprintf(stderr, "sort-test: fallback group disk usage failed\n");
+				free(excluded_cursor);
+				goto out;
+			}
+		}
+		free(group_stats);
+		group_stats = NULL;
+		group_stats_count = 0;
 		free(excluded_cursor);
 		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
 			rec_player_get_cursor(reader, &excluded_cursor) != 0 ||
@@ -414,6 +460,7 @@ out:
 	if (state_fp) fclose(state_fp);
 	for (size_t j = 0; j < listed_count; j++) free(listed_groups[j]);
 	free(listed_groups);
+	free(group_stats);
 	free(actual.timestamps);
 	rec_player_close(reader);
 	for (i = 0; i < 3; i++) {

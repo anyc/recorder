@@ -1544,6 +1544,149 @@ static int segment_index_path(const char *segment_path, char *index_path, size_t
 	return 0;
 }
 
+static int group_stats_add_entries(RecorderGroupStats *stats, uint64_t count,
+						   uint64_t first, uint64_t last)
+{
+	if (count == 0) return 0;
+	if (UINT64_MAX - stats->entry_count < count) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	if (stats->entry_count == 0 || first < stats->first_realtime_usec)
+		stats->first_realtime_usec = first;
+	if (stats->entry_count == 0 || last > stats->last_realtime_usec)
+		stats->last_realtime_usec = last;
+	stats->entry_count += count;
+	return 0;
+}
+
+static int group_stats_index_frame(const IndexFrame *frame, void *userdata)
+{
+	return group_stats_add_entries(userdata, frame->entry_count,
+		frame->min_realtime_ts, frame->max_realtime_ts);
+}
+
+static int group_stats_entry(const RecorderEntry *entry, void *userdata)
+{
+	return group_stats_add_entries(userdata, 1,
+		entry->realtime_ts, entry->realtime_ts);
+}
+
+static int group_stats_add_file_bytes(RecorderGroupStats *stats, const struct stat *st)
+{
+	uint64_t bytes;
+
+	if (st->st_blocks < 0 || (uint64_t)st->st_blocks > UINT64_MAX / 512u) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	bytes = (uint64_t)st->st_blocks * 512u;
+	if (stats->disk_bytes > UINT64_MAX - bytes) {
+		errno = EOVERFLOW;
+		return -1;
+	}
+	stats->disk_bytes += bytes;
+	return 0;
+}
+
+static int compare_group_stats(const void *a, const void *b)
+{
+	const RecorderGroupStats *left = a;
+	const RecorderGroupStats *right = b;
+	return strcmp(left->name, right->name);
+}
+
+int rec_player_get_group_stats(RecorderPlayer *reader,
+					RecorderGroupStats **stats_out, size_t *count_out)
+{
+	RecorderPlayer unfiltered;
+	SegmentPath *paths = NULL;
+	size_t path_count = 0, path_capacity = 0;
+	RecorderGroupStats *groups = NULL;
+	size_t group_count = 0, group_capacity = 0;
+	size_t i, j;
+
+	if (!reader || !stats_out || !count_out) {
+		errno = EINVAL;
+		return -1;
+	}
+	*stats_out = NULL;
+	*count_out = 0;
+	unfiltered = *reader;
+	unfiltered.group_filter_count = 0;
+	unfiltered.unit_filter = NULL;
+	if (reader->path_is_directory) {
+		if (collect_segment_paths(&unfiltered, &paths, &path_count,
+				&path_capacity) != 0) goto fail;
+	} else if (add_segment_path(&paths, &path_count, &path_capacity,
+			reader->path, 0) != 0) goto fail;
+	for (i = 0; i < path_count; i++) {
+		char group_name[64], index_path[512];
+		RecorderGroupStats segment_stats = {0};
+		struct stat segment_st, index_st;
+
+		if (stat(paths[i].path, &segment_st) != 0 || !S_ISREG(segment_st.st_mode))
+			continue;
+		if (group_from_path(paths[i].path,
+			reader->path_is_directory ? reader->path : NULL,
+			group_name, sizeof(group_name)) != 0 ||
+			segment_index_path(paths[i].path, index_path, sizeof(index_path)) != 0)
+			goto fail;
+		if (group_stats_add_file_bytes(&segment_stats, &segment_st) != 0)
+			goto fail;
+		if (stat(index_path, &index_st) == 0) {
+			if (S_ISREG(index_st.st_mode) &&
+				group_stats_add_file_bytes(&segment_stats, &index_st) != 0) goto fail;
+		} else if (errno != ENOENT) goto fail;
+		if (index_scan_frames(index_path, paths[i].path,
+				group_stats_index_frame, &segment_stats) != 0) {
+			segment_stats.entry_count = 0;
+			segment_stats.first_realtime_usec = 0;
+			segment_stats.last_realtime_usec = 0;
+			if (rec_player_scan_file(&unfiltered, paths[i].path,
+					group_stats_entry, &segment_stats, 0, NULL) != 0) goto fail;
+		}
+		for (j = 0; j < group_count; j++)
+			if (strcmp(groups[j].name, group_name) == 0) break;
+		if (j == group_count) {
+			RecorderGroupStats *updated;
+			if (group_count == group_capacity) {
+				size_t capacity = group_capacity ? group_capacity * 2 : 8;
+				if (capacity < group_capacity ||
+					capacity > SIZE_MAX / sizeof(*groups)) {
+					errno = ENOMEM;
+					goto fail;
+				}
+				updated = realloc(groups, capacity * sizeof(*groups));
+				if (!updated) goto fail;
+				groups = updated;
+				group_capacity = capacity;
+			}
+			groups[j] = (RecorderGroupStats){0};
+			strcpy(groups[j].name, group_name);
+			group_count++;
+		}
+		if (groups[j].disk_bytes > UINT64_MAX - segment_stats.disk_bytes) {
+			errno = EOVERFLOW;
+			goto fail;
+		}
+		groups[j].disk_bytes += segment_stats.disk_bytes;
+		if (group_stats_add_entries(&groups[j], segment_stats.entry_count,
+			segment_stats.first_realtime_usec,
+			segment_stats.last_realtime_usec) != 0) goto fail;
+	}
+	if (group_count > 1)
+		qsort(groups, group_count, sizeof(*groups), compare_group_stats);
+	free(paths);
+	*stats_out = groups;
+	*count_out = group_count;
+	return 0;
+fail:
+	free(paths);
+	free(groups);
+	return -1;
+}
+
 static int source_repair_index(RecorderPlayer *reader, IteratorSource *source,
 						 const char *index_path)
 {

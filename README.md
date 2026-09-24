@@ -94,6 +94,11 @@ make LIBRECORDER_STATIC=1
 `$(libdir)/pkgconfig`. Consumers can use `pkg-config --cflags --libs
 librecorder`.
 
+Applications can call `rec_player_get_group_stats()` to query the entry count,
+allocated segment and index bytes, and earliest and latest entry timestamps
+for each group. The values are a snapshot of the files present during the
+call; the active group filter does not affect them.
+
 To build binaries that run directly from the repository checkout, use:
 
 ```sh
