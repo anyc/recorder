@@ -547,28 +547,62 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
   Escape terminal control characters in `recorder -vv` output. Enabled by
   default.
 - `priority_groups`
-  Optional grouping of priorities into named segment directories. Each priority
-  `0..7` must appear exactly once. A group may also set `max_bytes` (an integer
-  or size string) and `max_age_sec` to retain less data than the global limits.
+  Assign priorities to named storage groups with optional per-group retention
+  limits. See [Priority Groups](#priority-groups).
 - `static_dict_paths`
   Optional map from priority number to a zstd static dictionary path. If
   priorities are grouped together, all priorities in that group must use the
   same dictionary path or no dictionary path.
 
-## Default Behavior
+## Priority Groups
 
-If `priority_groups` is not set, recorder uses one directory per priority:
+If `priority_groups` is omitted, recorder creates one group per priority:
+`p0` through `p7`. Each configured group has these keys:
 
-- `p0`
-- `p1`
-- `p2`
-- `p3`
-- `p4`
-- `p5`
-- `p6`
-- `p7`
+- `name` (required): Unique name for the segment directory.
+- `priorities` (required): Non-empty list of priorities assigned to the group.
+- `max_bytes` (optional): Maximum combined size of the group's closed `.seg`
+  files. Give a byte count or a size string such as `16M`. When the total is
+  greater than this value, recorder deletes older closed segments until the
+  total is within the limit. Active segments and `.idx` files do not count.
+- `max_age_sec` (optional): Maximum age of each closed `.seg` file, in seconds.
+  Age starts at the file's last modification time. Recorder deletes a file
+  once its age reaches this value, even if the group is below `max_bytes`.
 
-With explicit groups, the directory names come from the configured group names.
+Omitting a limit or setting it to zero disables that limit for the group.
+Either limit can cause a closed segment to be deleted independently.
+
+Every priority from `0` through `7` must appear in exactly one group. Group
+names may contain letters, digits, underscores, and hyphens. Recorder rejects
+duplicate names and overlapping or missing priorities.
+
+### Different retention times
+
+This example sets a seven-day age limit for closed segments in `important` and
+a one-day limit for those in `routine`:
+
+```json
+{
+  "log_max_bytes": "128M",
+  "priority_groups": [
+    {
+      "name": "important",
+      "priorities": [0, 1, 2, 3],
+      "max_age_sec": 604800
+    },
+    {
+      "name": "routine",
+      "priorities": [4, 5, 6, 7],
+      "max_age_sec": 86400
+    }
+  ]
+}
+```
+
+Recorder checks retention at startup, when a segment closes, and at shutdown.
+There is no exact expiry timer, so a file may remain past its age limit until
+the next check. Active segments remain until they close. The global
+`log_max_bytes` limit may remove closed segments sooner if space is needed.
 
 ## Storage Layout
 
@@ -599,10 +633,6 @@ Example:
 ## Retention
 
 Recorder keeps the total on-disk size within `log_max_bytes`.
-
-Priority groups may define independent `max_bytes` and `max_age_sec` limits.
-Closed segments that exceed a group limit are removed according to the same
-priority and age ordering as global retention.
 
 When a write fails because the filesystem is full or over quota, recorder
 removes closed segments from lower-priority groups and retries the write. If no
