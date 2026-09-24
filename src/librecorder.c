@@ -826,6 +826,69 @@ static int compare_segment_path(const void *a, const void *b)
 		left->segment_seq > right->segment_seq;
 }
 
+static int compare_group_names(const void *a, const void *b)
+{
+	return strcmp(*(const char *const *)a, *(const char *const *)b);
+}
+
+int rec_player_list_groups(RecorderPlayer *reader, char ***groups_out,
+				   size_t *count_out)
+{
+	RecorderPlayer unfiltered;
+	SegmentPath *paths = NULL;
+	size_t path_count = 0, path_capacity = 0;
+	char **groups = NULL;
+	size_t group_count = 0;
+	size_t i, j;
+
+	if (!reader || !groups_out || !count_out) {
+		errno = EINVAL;
+		return -1;
+	}
+	*groups_out = NULL;
+	*count_out = 0;
+	unfiltered = *reader;
+	unfiltered.group_filter_count = 0;
+	if (reader->path_is_directory) {
+		if (collect_segment_paths(&unfiltered, &paths, &path_count,
+							  &path_capacity) != 0) goto fail;
+	} else if (add_segment_path(&paths, &path_count, &path_capacity,
+					reader->path, 0) != 0) goto fail;
+	for (i = 0; i < path_count; i++) {
+		char group[64];
+		char **updated;
+		struct stat st;
+
+		if (stat(paths[i].path, &st) != 0 || !S_ISREG(st.st_mode)) continue;
+		if (group_from_path(paths[i].path,
+			reader->path_is_directory ? reader->path : NULL,
+			group, sizeof(group)) != 0) goto fail;
+		for (j = 0; j < group_count; j++)
+			if (strcmp(groups[j], group) == 0) break;
+		if (j != group_count) continue;
+		if (group_count == SIZE_MAX / sizeof(*groups)) {
+			errno = ENOMEM;
+			goto fail;
+		}
+		updated = realloc(groups, (group_count + 1) * sizeof(*groups));
+		if (!updated) goto fail;
+		groups = updated;
+		groups[group_count] = strdup(group);
+		if (!groups[group_count]) goto fail;
+		group_count++;
+	}
+	if (group_count > 1)
+		qsort(groups, group_count, sizeof(*groups), compare_group_names);
+	free(paths);
+	*groups_out = groups;
+	*count_out = group_count;
+	return 0;
+fail:
+	free(paths);
+	free_group_filter(groups, group_count);
+	return -1;
+}
+
 int rec_player_open(RecorderPlayer **reader_out, const char *path)
 {
 	RecorderPlayer *reader;

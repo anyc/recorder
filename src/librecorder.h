@@ -78,6 +78,14 @@ int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit);
 /** Select priority groups by exact name. An empty list clears the filter. */
 int rec_player_set_group_filter(RecorderPlayer *reader,
 					const char *const *groups, size_t group_count);
+/**
+ * List groups with segment files in the opened store, ignoring the group
+ * filter. Names are sorted and allocated independently of the reader.
+ * The caller must free each name and then the array. An empty store returns
+ * a NULL array and count zero. Root-level segments use the name "-".
+ */
+int rec_player_list_groups(RecorderPlayer *reader, char ***groups_out,
+				   size_t *count_out);
 /** Enable lazy repair of unusable sidecar indexes while reading. */
 int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled);
 /** Allow lazy repair of the latest segment in each group. */

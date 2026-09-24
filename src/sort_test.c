@@ -175,11 +175,14 @@ int main(void)
 	char state_path[512] = {0};
 	char store_id_path[512] = {0};
 	char other_group_path[512] = {0};
+	char empty_group_path[512] = {0};
 	char path[3][512] = {{0}};
 	char index_path[3][512] = {{0}};
 	char other_path[512] = {0};
 	char other_index_path[512] = {0};
 	RecorderPlayer *reader = NULL;
+	char **listed_groups = NULL;
+	size_t listed_count = 0;
 	TimestampList actual = {0};
 	SegmentHeader header;
 	SegmentFooter footer;
@@ -320,8 +323,21 @@ int main(void)
 		const char *both[] = {"p5", "p6"};
 		char *excluded_cursor = NULL;
 
-		if (rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
-			rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
+		if (snprintf(empty_group_path, sizeof(empty_group_path), "%s/p7",
+			store_template) >= (int)sizeof(empty_group_path) ||
+			mkdir(empty_group_path, 0755) != 0 ||
+			rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_list_groups(reader, &listed_groups, &listed_count) != 0 ||
+			listed_count != 2 || strcmp(listed_groups[0], "p5") != 0 ||
+			strcmp(listed_groups[1], "p6") != 0) {
+			fprintf(stderr, "sort-test: available group listing failed\n");
+			goto out;
+		}
+		for (size_t j = 0; j < listed_count; j++) free(listed_groups[j]);
+		free(listed_groups);
+		listed_groups = NULL;
+		listed_count = 0;
+		if (rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
 			expect_timestamps("filtered scan", other, 2, &actual) != 0) goto out;
 		free(actual.timestamps);
 		actual = (TimestampList){0};
@@ -384,6 +400,8 @@ int main(void)
 
 out:
 	if (state_fp) fclose(state_fp);
+	for (size_t j = 0; j < listed_count; j++) free(listed_groups[j]);
+	free(listed_groups);
 	free(actual.timestamps);
 	rec_player_close(reader);
 	for (i = 0; i < 3; i++) {
@@ -394,6 +412,7 @@ out:
 	unlink(other_path);
 	rmdir(group_path);
 	rmdir(other_group_path);
+	rmdir(empty_group_path);
 	unlink(store_id_path);
 	rmdir(state_path);
 	rmdir(store_template);
