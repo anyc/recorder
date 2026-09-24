@@ -101,7 +101,7 @@ flatcc/src/runtime/%.pic.o: flatcc/src/runtime/%.c
 
 LIBRECORDER_OBJS = src/librecorder.o src/helper.o src/segment.o src/index.o src/recorder_crypto.o $(FLATCC_RUNTIME_OBJS)
 
-all: recorder player $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
+all: recorder player batch-reader $(LIBRECORDER_TARGET) $(LIBRECORDER_LINK_TARGETS)
 
 librecorder.pc: packaging/librecorder.pc.in Makefile FORCE
 	sed -e 's|@PREFIX@|$(PREFIX)|g' \

@@ -56,6 +56,8 @@ seeks to the cursor of the last entry before reading the next batch. Use
 `--sort wallclock` for realtime ordering. The reported entry count includes the
 cursor entry at every batch boundary because `rec_player_seek_cursor()`
 positions the reader at that entry.
+Use `-f` to keep the reader running at the end of the log and print records as
+they are appended.
 
 Normal player queries and `player --stats` use sidecar indexes when available.
 Timestamp seeks skip older indexed segments, `-n` reads from the requested
