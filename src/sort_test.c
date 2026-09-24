@@ -315,6 +315,71 @@ int main(void)
 		}
 		free(cursor);
 	}
+	{
+		const char *only_p6[] = {"p6"};
+		const char *both[] = {"p5", "p6"};
+		char *excluded_cursor = NULL;
+
+		if (rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
+			expect_timestamps("filtered scan", other, 2, &actual) != 0) goto out;
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+		if (rec_player_scan_wallclock(reader, collect_timestamp, &actual) != 0 ||
+			expect_timestamps("filtered wallclock", other, 2, &actual) != 0) goto out;
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+		if (rec_player_scan_follow(reader, collect_timestamp, &actual, 2) != 0 ||
+			expect_timestamps("filtered follow", other, 2, &actual) != 0) goto out;
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+		if (rec_player_seek_head(reader) != 0 || collect_iterator(reader, &actual) != 0 ||
+			expect_timestamps("filtered iterator", other, 2, &actual) != 0) goto out;
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_get_cursor(reader, &excluded_cursor) != 0 ||
+			rec_player_set_group_filter(reader, both, 2) != 0 ||
+			rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
+			actual.count != 8 ||
+			rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_seek_cursor(reader, excluded_cursor) != 0) {
+			fprintf(stderr, "sort-test: group selection failed\n");
+			free(excluded_cursor);
+			goto out;
+		}
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+		if (unlink(other_index_path) != 0 ||
+			rec_player_set_group_filter(reader, both, 1) != 0 ||
+			rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
+			rec_player_seek_cursor(reader, excluded_cursor) != 0 ||
+			rec_player_next(reader) != 1 || !current_timestamp_is(reader, 300)) {
+			fprintf(stderr, "sort-test: excluded cursor did not resume in recorded order\n");
+			free(excluded_cursor);
+			goto out;
+		}
+		free(excluded_cursor);
+		if (rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			rec_player_get_cursor(reader, &excluded_cursor) != 0 ||
+			rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0 ||
+			rec_player_seek_cursor(reader, excluded_cursor) != 0 ||
+			rec_player_next(reader) != 1 || !current_timestamp_is(reader, 1000)) {
+			fprintf(stderr, "sort-test: excluded cursor did not resume in wallclock order\n");
+			free(excluded_cursor);
+			goto out;
+		}
+		free(excluded_cursor);
+		if (rec_player_set_group_filter(reader, NULL, 0) != 0 ||
+			rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
+			actual.count != 8) {
+			fprintf(stderr, "sort-test: clearing group selection failed\n");
+			goto out;
+		}
+		free(actual.timestamps);
+		actual = (TimestampList){0};
+	}
 	rc = 0;
 
 out:

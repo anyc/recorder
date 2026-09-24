@@ -46,6 +46,8 @@ struct RecorderPlayer {
 	int repair_indexes;
 	int force_repair_indexes;
 	char *unit_filter;
+	char **group_filter;
+	size_t group_filter_count;
 	struct FollowSegment *follow_segments;
 	size_t follow_count;
 	size_t follow_capacity;
@@ -149,6 +151,24 @@ static int valid_group_name(const char *name)
 				(ch >= '0' && ch <= '9') || ch == '_' || ch == '-')) return 0;
 	}
 	return 1;
+}
+
+static int group_allowed(const RecorderPlayer *reader, const char *group)
+{
+	size_t i;
+
+	if (reader->group_filter_count == 0) return 1;
+	for (i = 0; i < reader->group_filter_count; i++)
+		if (strcmp(reader->group_filter[i], group) == 0) return 1;
+	return 0;
+}
+
+static void free_group_filter(char **groups, size_t count)
+{
+	size_t i;
+
+	for (i = 0; i < count; i++) free(groups[i]);
+	free(groups);
 }
 
 static int read_store_id(const char *dir_path, uint64_t *store_id_out)
@@ -668,6 +688,16 @@ static int add_segment_path(SegmentPath **paths, size_t *count, size_t *capacity
 	return 0;
 }
 
+static int add_reader_file_path(RecorderPlayer *reader, SegmentPath **paths,
+					 size_t *count, size_t *capacity)
+{
+	char group[64];
+
+	if (group_from_path(reader->path, NULL, group, sizeof(group)) != 0) return -1;
+	return group_allowed(reader, group) ?
+		add_segment_path(paths, count, capacity, reader->path, 0) : 0;
+}
+
 static int collect_segment_paths_in_dir(const char *dir_path, SegmentPath **paths,
 								size_t *count, size_t *capacity)
 {
@@ -690,9 +720,10 @@ static int collect_segment_paths_in_dir(const char *dir_path, SegmentPath **path
 	return 0;
 }
 
-static int collect_segment_paths(const char *root_path, SegmentPath **paths,
+static int collect_segment_paths(RecorderPlayer *reader, SegmentPath **paths,
 								 size_t *count, size_t *capacity)
 {
+	const char *root_path = reader->path;
 	DIR *dir = opendir(root_path);
 	struct dirent *de;
 
@@ -704,9 +735,11 @@ static int collect_segment_paths(const char *root_path, SegmentPath **paths,
 
 		if (snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >= (int)sizeof(path) ||
 			stat(path, &st) != 0) continue;
-		if (S_ISREG(st.st_mode) && segment_seq_from_name(de->d_name, &seq) == 0) {
+		if (S_ISREG(st.st_mode) && group_allowed(reader, "-") &&
+			segment_seq_from_name(de->d_name, &seq) == 0) {
 			if (add_segment_path(paths, count, capacity, path, seq) != 0) goto fail;
 		} else if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
+			group_allowed(reader, de->d_name) &&
 			collect_segment_paths_in_dir(path, paths, count, capacity) != 0) {
 			goto fail;
 		}
@@ -746,9 +779,10 @@ static int collect_latest_segment_in_dir(const char *dir_path,
 	return have_latest ? add_segment_path(paths, count, capacity, latest_path, latest_seq) : 0;
 }
 
-static int collect_latest_segment_paths(const char *root_path, SegmentPath **paths,
+static int collect_latest_segment_paths(RecorderPlayer *reader, SegmentPath **paths,
 								size_t *count, size_t *capacity)
 {
+	const char *root_path = reader->path;
 	DIR *dir = opendir(root_path);
 	struct dirent *de;
 	char latest_path[512] = { 0 };
@@ -764,13 +798,14 @@ static int collect_latest_segment_paths(const char *root_path, SegmentPath **pat
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
 			snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
 				(int)sizeof(path)) continue;
-		if (segment_seq_from_name(de->d_name, &seq) == 0) {
+		if (group_allowed(reader, "-") && segment_seq_from_name(de->d_name, &seq) == 0) {
 			if (!have_root_latest || seq > latest_seq) {
 				strcpy(latest_path, path);
 				latest_seq = seq;
 				have_root_latest = 1;
 			}
-		} else if (valid_group_name(de->d_name) && stat(path, &st) == 0 &&
+		} else if (valid_group_name(de->d_name) && group_allowed(reader, de->d_name) &&
+			stat(path, &st) == 0 &&
 			S_ISDIR(st.st_mode) &&
 				collect_latest_segment_in_dir(path, paths, count, capacity) != 0) {
 			closedir(dir);
@@ -826,6 +861,7 @@ void rec_player_close(RecorderPlayer *reader)
 	clear_entries(reader);
 	segment_decryptor_free(reader->decryptor);
 	free(reader->unit_filter);
+	free_group_filter(reader->group_filter, reader->group_filter_count);
 	free(reader->follow_segments);
 	free(reader->data);
 	free(reader->path);
@@ -915,6 +951,39 @@ int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit)
 	return 0;
 }
 
+int rec_player_set_group_filter(RecorderPlayer *reader,
+					const char *const *groups, size_t group_count)
+{
+	char **copy = NULL;
+	size_t i;
+
+	if (!reader || (group_count != 0 && !groups) ||
+		group_count > SIZE_MAX / sizeof(*copy)) {
+		errno = EINVAL;
+		return -1;
+	}
+	if (group_count != 0) {
+		copy = calloc(group_count, sizeof(*copy));
+		if (!copy) return -1;
+		for (i = 0; i < group_count; i++) {
+			if (!groups[i] || strlen(groups[i]) >= 64 || !valid_group_name(groups[i])) {
+				errno = EINVAL;
+				goto fail;
+			}
+			copy[i] = strdup(groups[i]);
+			if (!copy[i]) goto fail;
+		}
+	}
+	clear_entries(reader);
+	free_group_filter(reader->group_filter, reader->group_filter_count);
+	reader->group_filter = copy;
+	reader->group_filter_count = group_count;
+	return 0;
+fail:
+	free_group_filter(copy, group_count);
+	return -1;
+}
+
 int rec_player_set_order(RecorderPlayer *reader, RecorderPlayerOrder order)
 {
 	if (!reader || (order != RECORDER_ORDER_RECORDED &&
@@ -960,6 +1029,10 @@ int rec_player_scan_file(RecorderPlayer *reader, const char *path,
 	ctx.min_frame_offset = min_frame_offset;
 	if (group_from_path(path, reader->path_is_directory ? reader->path : NULL,
 			ctx.group, sizeof(ctx.group)) != 0) return -1;
+	if (!group_allowed(reader, ctx.group)) {
+		if (committed_end_out) *committed_end_out = 0;
+		return 0;
+	}
 	if (segment_scan_path_from_offset(path, reader->decryptor, scan_frame, &ctx,
 							min_frame_offset, &header,
 						  &footer, &committed_end) != 0) return -1;
@@ -1007,8 +1080,8 @@ int rec_player_scan_all(RecorderPlayer *reader, rec_player_entry_cb callback,
 
 	if (!reader || !callback) return -1;
 	if (reader->path_is_directory) {
-		if (collect_segment_paths(reader->path, &paths, &path_count, &path_capacity) != 0) goto out;
-	} else if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0) {
+		if (collect_segment_paths(reader, &paths, &path_count, &path_capacity) != 0) goto out;
+	} else if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0) {
 		goto out;
 	}
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
@@ -1195,10 +1268,9 @@ int rec_player_scan_wallclock(RecorderPlayer *reader, rec_player_entry_cb callba
 
 	if (!reader || !callback) return -1;
 	if (reader->path_is_directory) {
-		if (collect_segment_paths(reader->path, &paths, &path_count,
+		if (collect_segment_paths(reader, &paths, &path_count,
 						&path_capacity) != 0) goto out;
-	} else if (add_segment_path(&paths, &path_count, &path_capacity,
-					reader->path, 0) != 0) goto out;
+	} else if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0) goto out;
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
 	segments = calloc(path_count ? path_count : 1, sizeof(*segments));
 	if (!segments) goto out;
@@ -1266,11 +1338,11 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 	if (!reader || !callback) return -1;
 	if (reader->path_is_directory) {
 		if (reader->follow_initialized && reader->follow_topology_pending) {
-			if (collect_segment_paths(reader->path, &paths, &path_count,
+			if (collect_segment_paths(reader, &paths, &path_count,
 									  &path_capacity) != 0) goto out;
-		} else if (collect_latest_segment_paths(reader->path, &paths, &path_count,
+		} else if (collect_latest_segment_paths(reader, &paths, &path_count,
 										 &path_capacity) != 0) goto out;
-	} else if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0) {
+	} else if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0) {
 		goto out;
 	}
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
@@ -1292,7 +1364,7 @@ int rec_player_scan_follow(RecorderPlayer *reader, rec_player_entry_cb callback,
 		size_t history_count = 0;
 		size_t history_capacity = 0;
 
-		if (collect_segment_paths(reader->path, &history, &history_count, &history_capacity) != 0) {
+		if (collect_segment_paths(reader, &history, &history_count, &history_capacity) != 0) {
 			free(history);
 			goto out;
 		}
@@ -1349,10 +1421,9 @@ static int initialize_tail_follow(RecorderPlayer *reader)
 	int rc = -1;
 
 	if (reader->path_is_directory) {
-		if (collect_latest_segment_paths(reader->path, &paths, &path_count,
+		if (collect_latest_segment_paths(reader, &paths, &path_count,
 								 &path_capacity) != 0) goto out;
-	} else if (add_segment_path(&paths, &path_count, &path_capacity,
-			reader->path, 0) != 0) {
+	} else if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0) {
 		goto out;
 	}
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
@@ -1938,8 +2009,8 @@ static int iterator_collect_sources(RecorderPlayer *reader)
 
 	iterator_reset(reader);
 	if (reader->path_is_directory) {
-		if (collect_segment_paths(reader->path, &paths, &path_count, &path_capacity) != 0) goto fail;
-	} else if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0) goto fail;
+		if (collect_segment_paths(reader, &paths, &path_count, &path_capacity) != 0) goto fail;
+	} else if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0) goto fail;
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
 	for (i = 0; i < path_count; i++) {
 		char group[64];
@@ -2015,9 +2086,9 @@ static int initialize_lazy_history(RecorderPlayer *reader)
 		reader->lazy_history = 1;
 	}
 	if (!reader->path_is_directory) {
-		if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0)
+		if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0)
 			goto out;
-	} else if (collect_segment_paths(reader->path, &paths, &path_count,
+	} else if (collect_segment_paths(reader, &paths, &path_count,
 									&path_capacity) != 0) {
 		goto out;
 	}
@@ -2061,9 +2132,9 @@ static int initialize_lazy_head(RecorderPlayer *reader)
 	int rc = -1;
 
 	if (!reader->path_is_directory) {
-		if (add_segment_path(&paths, &path_count, &path_capacity, reader->path, 0) != 0)
+		if (add_reader_file_path(reader, &paths, &path_count, &path_capacity) != 0)
 			goto out;
-	} else if (collect_segment_paths(reader->path, &paths, &path_count,
+	} else if (collect_segment_paths(reader, &paths, &path_count,
 									&path_capacity) != 0) goto out;
 	qsort(paths, path_count, sizeof(*paths), compare_segment_path);
 	loaded = calloc(path_count ? path_count : 1, sizeof(*loaded));
@@ -2279,7 +2350,9 @@ static int rec_player_seek_cursor_once(RecorderPlayer *reader, const char *group
 {
 	SegmentPath path;
 	IteratorSource *source;
+	RecorderPlayer cursor_reader;
 	uint64_t ignored_realtime_ts;
+	size_t i;
 
 	memset(&path, 0, sizeof(path));
 	path.segment_seq = segment_seq;
@@ -2304,12 +2377,46 @@ static int rec_player_seek_cursor_once(RecorderPlayer *reader, const char *group
 	if (!reader->sources) return -1;
 	reader->source_count = 1;
 	source = &reader->sources[0];
+	/* The cursor supplies an ordering key even when its group is excluded.
+	 * Read that one entry without the query's group or unit filters. */
+	cursor_reader = *reader;
+	cursor_reader.group_filter_count = 0;
+	cursor_reader.unit_filter = NULL;
 	if (snprintf(source->group, sizeof(source->group), "%s", group) >=
 		(int)sizeof(source->group) || source_add_segment(source, &path) != 0 ||
-		source_seek_cursor(reader, source, segment_seq, frame_offset,
+		source_seek_cursor(&cursor_reader, source, segment_seq, frame_offset,
 			frame_entry_index, &ignored_realtime_ts) != 0) {
 		iterator_reset(reader);
 		return -1;
+	}
+	if (!group_allowed(reader, group)) {
+		StoredEntry key = source->entries[source->entry_index];
+
+		/* The source is released when the selected groups are collected. */
+		key.entry.group = group;
+		if (reader->order == RECORDER_ORDER_RECORDED) {
+			if (iterator_collect_sources(reader) != 0) return -1;
+			for (i = 0; i < reader->source_count; i++)
+				if (source_seek_recorded_after(reader, &reader->sources[i], &key) != 0)
+					return -1;
+		} else {
+			if (iterator_seek_realtime(reader, key.entry.realtime_ts) != 0) return -1;
+			for (i = 0; i < reader->source_count; i++) {
+				IteratorSource *selected = &reader->sources[i];
+
+				while (source_has_current(selected) &&
+					compare_stored_entries(&selected->entries[selected->entry_index],
+						&key) <= 0) {
+					int rc = source_advance(reader, selected, ITERATOR_DIRECTION_FORWARD);
+
+					if (rc < 0) return -1;
+					if (rc == 0) break;
+				}
+			}
+		}
+		reader->last_direction = ITERATOR_DIRECTION_FORWARD;
+		reader->order_changed = 0;
+		return 0;
 	}
 	reader->current_source = 0;
 	reader->cursor_pending = 1;

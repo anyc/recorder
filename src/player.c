@@ -75,6 +75,8 @@ typedef struct {
 	const char *dir_path;
 	const char *file_path;
 	const char *unit_filter;
+	char **groups;
+	size_t group_count;
 	const char *boot_filter;
 	const char *since_arg;
 	const char *until_arg;
@@ -182,6 +184,37 @@ static int valid_group_name(const char *name)
 		}
 	}
 	return 1;
+}
+
+static int add_group_option(PlayerOptions *opts, const char *value)
+{
+	const char *start = value;
+
+	if (!value || !*value) return -1;
+	for (;;) {
+		const char *end = strchr(start, ',');
+		size_t len = end ? (size_t)(end - start) : strlen(start);
+		char *group;
+		char **groups;
+
+		if (len == 0 || len >= 64 || opts->group_count == SIZE_MAX / sizeof(*groups))
+			return -1;
+		group = strndup(start, len);
+		if (!group) return -1;
+		if (!valid_group_name(group)) {
+			free(group);
+			return -1;
+		}
+		groups = realloc(opts->groups, (opts->group_count + 1) * sizeof(*groups));
+		if (!groups) {
+			free(group);
+			return -1;
+		}
+		opts->groups = groups;
+		opts->groups[opts->group_count++] = group;
+		if (!end) return 0;
+		start = end + 1;
+	}
 }
 
 static int disk_usage_path(const char *path, uint64_t *bytes_out)
@@ -1641,6 +1674,12 @@ static int scan_log_root(const PlayerOptions *opts)
 		rec_player_close(reader);
 		return 1;
 	}
+	if (opts->group_count && rec_player_set_group_filter(reader,
+			(const char *const *)opts->groups, opts->group_count) != 0) {
+		fprintf(stderr, "player: failed to configure group filter\n");
+		rec_player_close(reader);
+		return 1;
+	}
 	do {
 		rc = scan_log_once(reader, opts, &follow_initialized);
 		if (rc != 0 || !opts->follow) {
@@ -1656,7 +1695,7 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [--group NAME[,NAME...]] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--sort wallclock] "
 			"[--encryption-private-key PATH] "
@@ -1729,6 +1768,10 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			opts->unit_filter = argv[i];
 		} else if (strncmp(arg, "-u", 2) == 0 && arg[2] != '\0') {
 			opts->unit_filter = arg + 2;
+		} else if (strcmp(arg, "--group") == 0) {
+			if (++i >= argc || add_group_option(opts, argv[i]) != 0) return -1;
+		} else if (strncmp(arg, "--group=", 8) == 0) {
+			if (add_group_option(opts, arg + 8) != 0) return -1;
 		} else if (strcmp(arg, "-b") == 0) {
 			if (++i >= argc) {
 				return -1;
@@ -1798,7 +1841,8 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 		(opts->force_repair && opts->follow) ||
 		(opts->stats && opts->follow) ||
 		(opts->follow && opts->have_line_count && opts->lines_from_head) ||
-		(opts->rebuild_index && (!opts->file_path || opts->follow || opts->unit_filter ||
+		(opts->group_count && (opts->disk_usage || opts->list_boots || opts->stats)) ||
+		(opts->rebuild_index && (!opts->file_path || opts->follow || opts->unit_filter || opts->group_count ||
 			opts->boot_filter || opts->since_arg || opts->until_arg)) ||
 		(opts->follow && (is_cursor_arg(opts->since_arg) || is_cursor_arg(opts->until_arg)))) {
 		return -1;
@@ -1832,6 +1876,15 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 	return 0;
 }
 
+static int finish_player(PlayerOptions *opts, int result)
+{
+	size_t i;
+
+	for (i = 0; i < opts->group_count; i++) free(opts->groups[i]);
+	free(opts->groups);
+	return result;
+}
+
 int main(int argc, char **argv)
 {
 	PlayerOptions opts;
@@ -1840,7 +1893,7 @@ int main(int argc, char **argv)
 
 	if (parse_options(argc, argv, &opts) != 0) {
 		usage(argv[0]);
-		return 1;
+		return finish_player(&opts, 1);
 	}
 
 	if (stat(opts.path, &st) != 0) {
@@ -1853,19 +1906,19 @@ int main(int argc, char **argv)
 					"player: no recorder data found there; use -D DIR or -i FILE, "
 					"or run 'make repo' and start recorder first\n");
 		}
-		return 1;
+		return finish_player(&opts, 1);
 	}
 	if (opts.list_boots) {
-		return print_boots(&opts);
+		return finish_player(&opts, print_boots(&opts));
 	}
 	if (opts.rebuild_index) {
-		return rebuild_index(&opts);
+		return finish_player(&opts, rebuild_index(&opts));
 	}
 	if (opts.stats) {
-		return print_stats(&opts);
+		return finish_player(&opts, print_stats(&opts));
 	}
 	if (resolve_boot_filter(&opts) != 0) {
-		return 1;
+		return finish_player(&opts, 1);
 	}
 	if (opts.follow && clock_gettime(CLOCK_REALTIME, &now) == 0) {
 		opts.follow_start_ts = (uint64_t)now.tv_sec * 1000000ull +
@@ -1873,25 +1926,25 @@ int main(int argc, char **argv)
 	}
 	if (S_ISDIR(st.st_mode)) {
 		if (opts.disk_usage) {
-			return print_disk_usage(opts.path);
+			return finish_player(&opts, print_disk_usage(opts.path));
 		}
-		return scan_log_root(&opts);
+		return finish_player(&opts, scan_log_root(&opts));
 	}
 	if (opts.disk_usage) {
 		fprintf(stderr, "player: --disk-usage requires a log directory\n");
-		return 1;
+		return finish_player(&opts, 1);
 	}
 	if (opts.dir_path) {
 		fprintf(stderr, "player: -D path is not a directory: %s\n", opts.path);
-		return 1;
+		return finish_player(&opts, 1);
 	}
 	if (opts.file_path && !S_ISREG(st.st_mode)) {
 		fprintf(stderr, "player: -i path is not a file: %s\n", opts.path);
-		return 1;
+		return finish_player(&opts, 1);
 	}
 	if (opts.follow) {
 		fprintf(stderr, "player: -f requires a log directory\n");
-		return 1;
+		return finish_player(&opts, 1);
 	}
-	return scan_log_root(&opts);
+	return finish_player(&opts, scan_log_root(&opts));
 }

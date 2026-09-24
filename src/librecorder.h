@@ -75,6 +75,9 @@ int rec_player_open(RecorderPlayer **reader, const char *path);
 int rec_player_set_private_key(RecorderPlayer *reader, const char *path);
 /** Set an exact unit match used to skip indexed frames. Pass NULL to clear it. */
 int rec_player_set_unit_filter(RecorderPlayer *reader, const char *unit);
+/** Select priority groups by exact name. An empty list clears the filter. */
+int rec_player_set_group_filter(RecorderPlayer *reader,
+					const char *const *groups, size_t group_count);
 /** Enable lazy repair of unusable sidecar indexes while reading. */
 int rec_player_set_repair_indexes(RecorderPlayer *reader, int enabled);
 /** Allow lazy repair of the latest segment in each group. */
@@ -106,7 +109,8 @@ int rec_player_seek_tail(RecorderPlayer *reader);
 /** Position before the first entry with realtime timestamp at or after usec. */
 int rec_player_seek_realtime_usec(RecorderPlayer *reader, uint64_t usec);
 /** Seek to a cursor position without making an entry current. The following
- * next() returns the cursor entry; previous() returns its predecessor. */
+ * next() returns the cursor entry when its group is selected, or the first
+ * selected entry after it when the group is excluded. */
 int rec_player_seek_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_test_cursor(RecorderPlayer *reader, const char *cursor);
 int rec_player_next(RecorderPlayer *reader);

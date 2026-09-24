@@ -64,6 +64,12 @@ Timestamp seeks skip older indexed segments, `-n` reads from the requested
 edge, and `-u UNIT` uses the per-frame service filter as a skip hint. Missing,
 stale, incompatible, or damaged indexes fall back to decoding the matching
 segment. Recreate an index with `player --rebuild-index -i PATH/SEGMENT.seg`.
+Use `--group NAME` to read only a priority group. Repeat the option or separate
+names with commas to select several groups, for example
+`player -D /var/log/recorder --group p0,p1 --group p2`. Group selection works
+with follow mode, time ranges, and `-n`. The default is to read all groups.
+With `--since` set to a cursor from an excluded group, output starts at the
+next entry from the selected groups.
 For lazy repair while reading, use `player --repair-index -D PATH`; only an
 unusable index for a segment actually reached by the query is considered. The
 option also accepts a single segment with `-i PATH/SEGMENT.seg` and may be
