@@ -310,7 +310,8 @@ not used as proof. The result reports retained entries, oldest retained
 sequence, actual budget utilization, logical/physical usage, and recorder's
 retention advantage.
 
-`player` scans all subdirectories under the given log root and reads any valid `.seg` files it finds.
+`player` scans all subdirectories under the given log root and reads any valid
+`.seg` files it finds.
 By default it prints entries in recorder order (segment sequence, frame offset,
 and entry index), which remains stable across realtime clock jumps. Use
 `--sort wallclock` to sort output by the stored realtime timestamp instead.
@@ -324,7 +325,8 @@ By default, the build uses:
 - log directory: `/var/log/recorder`
 - config file: `/etc/recorder.json`
 
-The package ships a commented sample config at [packaging/recorder.json](packaging/recorder.json).
+The package ships a commented sample config at
+[packaging/recorder.json](packaging/recorder.json).
 
 At runtime, you can override the config file path with:
 
@@ -342,7 +344,8 @@ For deterministic low-space testing, builds may set
 `RECORDER_TEST_FREE_BYTES=N`; this overrides the reported available space used
 by retention and diagnostics without consuming the real filesystem.
 
-The config file is JSON. Before parsing, lines starting with `#` are removed, so this is valid:
+The config file is JSON. Before parsing, lines starting with `#` are removed, so
+this is valid:
 
 ```json
 # recorder config
@@ -479,7 +482,8 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 ## Configuration Keys
 
 - `log_max_bytes`
-  Maximum total space used by recorder-owned files. Accepts an integer byte count or a size string such as `64M`.
+  Maximum total space used by recorder-owned files. Accepts an integer byte
+  count or a size string such as `64M`.
 - `min_free_bytes`
   Minimum free space to preserve on the log filesystem. When set, recorder
   removes closed lower-priority segments before writing higher-priority data.
@@ -489,7 +493,8 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 - `segment_max_age_sec`
   Maximum age of a segment before rotation.
 - `durable_priority_max`
-  Priorities `0..N` are written with the durable policy automatically enabled. Use `-1` to disable this.
+  Priorities `0..N` are written with the durable policy automatically enabled.
+  Use `-1` to disable this.
 - `durability_flush_frames`
   Flush after this many frames when durable mode is active.
 - `durability_flush_interval_sec`
@@ -499,9 +504,14 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
 - `compress_min_frame_bytes`
   Minimum uncompressed frame size before compression is attempted.
 - `compress_if_smaller`
-  If `true`, compressed output is only kept when it is smaller than the original frame.
+  If `true`, compressed output is only kept when it is smaller than the original
+  frame.
 - `encryption_public_key`
-  Optional path to a readable PEM public key. When set, recorder encrypts frame payloads in newly opened segments. The player must be given the matching private key with `--encryption-private-key`. Encrypted segments receive indexes while they are written; the player still needs the private key to read their payloads.
+  Optional path to a readable PEM public key. When set, recorder encrypts frame
+  payloads in newly opened segments. The player must be given the matching
+  private key with `--encryption-private-key`. Encrypted segments receive
+  indexes while they are written; the player still needs the private key to read
+  their payloads.
 - `capture_message_id`
   Store `MESSAGE_ID` when present.
 - `capture_unit`
@@ -534,11 +544,16 @@ two cases apart. `timeout_sec` defaults to 10 seconds and limits each child.
   Optional array of custom journald field names to skip. The blacklist takes
   precedence over the whitelist.
 - `sanitize_output`
-  Escape terminal control characters in `recorder -vv` output. Enabled by default.
+  Escape terminal control characters in `recorder -vv` output. Enabled by
+  default.
 - `priority_groups`
-  Optional grouping of priorities into named segment directories. Each priority `0..7` must appear exactly once. A group may also set `max_bytes` (an integer or size string) and `max_age_sec` to retain less data than the global limits.
+  Optional grouping of priorities into named segment directories. Each priority
+  `0..7` must appear exactly once. A group may also set `max_bytes` (an integer
+  or size string) and `max_age_sec` to retain less data than the global limits.
 - `static_dict_paths`
-  Optional map from priority number to a zstd static dictionary path. If priorities are grouped together, all priorities in that group must use the same dictionary path or no dictionary path.
+  Optional map from priority number to a zstd static dictionary path. If
+  priorities are grouped together, all priorities in that group must use the
+  same dictionary path or no dictionary path.
 
 ## Default Behavior
 
