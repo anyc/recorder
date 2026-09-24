@@ -176,6 +176,7 @@ int main(void)
 	char store_id_path[512] = {0};
 	char other_group_path[512] = {0};
 	char empty_group_path[512] = {0};
+	char root_segment_path[512] = {0};
 	char path[3][512] = {{0}};
 	char index_path[3][512] = {{0}};
 	char other_path[512] = {0};
@@ -231,6 +232,12 @@ int main(void)
 		fprintf(stderr, "sort-test: write segments failed\n");
 		goto out;
 	}
+	if (snprintf(root_segment_path, sizeof(root_segment_path), "%s/4.seg",
+		store_template) >= (int)sizeof(root_segment_path) ||
+		write_test_segment(root_segment_path, 4, other, other_monotonic, 2, 0) != 0) {
+		fprintf(stderr, "sort-test: write root-level fixture failed\n");
+		goto out;
+	}
 	for (i = 0; i < 3; i++) {
 		if (index_rebuild_for_segment(path[i], index_path[i], NULL) != 0) {
 			fprintf(stderr, "sort-test: build index %d failed\n", i + 1);
@@ -243,8 +250,13 @@ int main(void)
 		fprintf(stderr, "sort-test: nonmonotonic footer metadata invalid\n");
 		goto out;
 	}
-	if (rec_player_open(&reader, store_template) != 0 ||
-		rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
+	if (rec_player_open(&reader, store_template) != 0) goto out;
+	if (rec_player_scan_file(reader, root_segment_path, collect_timestamp,
+		&actual, 0, NULL) == 0) {
+		fprintf(stderr, "sort-test: root-level segment was accepted\n");
+		goto out;
+	}
+	if (rec_player_scan_all(reader, collect_timestamp, &actual) != 0 ||
 		expect_timestamps("recorded", recorded, 6, &actual) != 0) goto out;
 	free(actual.timestamps);
 	actual = (TimestampList){0};
@@ -410,6 +422,7 @@ out:
 	}
 	unlink(other_index_path);
 	unlink(other_path);
+	unlink(root_segment_path);
 	rmdir(group_path);
 	rmdir(other_group_path);
 	rmdir(empty_group_path);

@@ -310,8 +310,8 @@ not used as proof. The result reports retained entries, oldest retained
 sequence, actual budget utilization, logical/physical usage, and recorder's
 retention advantage.
 
-`player` scans all subdirectories under the given log root and reads any valid
-`.seg` files it finds.
+`player` scans priority-group subdirectories under the given log root and reads
+valid `.seg` files it finds there.
 By default it prints entries in recorder order (segment sequence, frame offset,
 and entry index), which remains stable across realtime clock jumps. Use
 `--sort wallclock` to sort output by the stored realtime timestamp instead.

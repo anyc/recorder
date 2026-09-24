@@ -420,31 +420,31 @@ static int group_from_path(const char *path, const char *root_path,
 	size_t len;
 
 	if (!path || !group || group_size == 0) return -1;
-	strcpy(group, "-");
 	if (root_path) {
 		size_t root_len = strlen(root_path);
-		if (strncmp(path, root_path, root_len) == 0 && path[root_len] == '/') {
-			relative = path + root_len + 1;
+		if (root_len != 0 && strncmp(path, root_path, root_len) == 0 &&
+			(root_path[root_len - 1] == '/' || path[root_len] == '/')) {
+			relative = path + root_len;
+			while (*relative == '/') relative++;
 			end = strchr(relative, '/');
-			if (!end) return 0;
+			if (!end) return -1;
 			len = (size_t)(end - relative);
-			if (len == 0 || len >= group_size) return 0;
+			if (len == 0 || len >= group_size) return -1;
 			memcpy(group, relative, len);
 			group[len] = '\0';
-			if (!valid_group_name(group)) strcpy(group, "-");
-			return 0;
+			return valid_group_name(group) ? 0 : -1;
 		}
+		return -1;
 	}
 	end = strrchr(path, '/');
-	if (!end || end == path) return 0;
+	if (!end || end == path) return -1;
 	start = end - 1;
 	while (start > path && start[-1] != '/') start--;
 	len = (size_t)(end - start);
-	if (len == 0 || len >= group_size) return 0;
+	if (len == 0 || len >= group_size) return -1;
 	memcpy(group, start, len);
 	group[len] = '\0';
-	if (!valid_group_name(group)) strcpy(group, "-");
-	return 0;
+	return valid_group_name(group) ? 0 : -1;
 }
 
 static int append_stored_entry(const RecorderEntry *entry, void *userdata)
@@ -731,14 +731,10 @@ static int collect_segment_paths(RecorderPlayer *reader, SegmentPath **paths,
 	while ((de = readdir(dir)) != NULL) {
 		char path[512];
 		struct stat st;
-		uint64_t seq;
 
 		if (snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >= (int)sizeof(path) ||
 			stat(path, &st) != 0) continue;
-		if (S_ISREG(st.st_mode) && group_allowed(reader, "-") &&
-			segment_seq_from_name(de->d_name, &seq) == 0) {
-			if (add_segment_path(paths, count, capacity, path, seq) != 0) goto fail;
-		} else if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
+		if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name) &&
 			group_allowed(reader, de->d_name) &&
 			collect_segment_paths_in_dir(path, paths, count, capacity) != 0) {
 			goto fail;
@@ -785,26 +781,16 @@ static int collect_latest_segment_paths(RecorderPlayer *reader, SegmentPath **pa
 	const char *root_path = reader->path;
 	DIR *dir = opendir(root_path);
 	struct dirent *de;
-	char latest_path[512] = { 0 };
-	uint64_t latest_seq = 0;
-	int have_root_latest = 0;
 
 	if (!dir) return -1;
 	while ((de = readdir(dir)) != NULL) {
 		char path[512];
 		struct stat st;
-		uint64_t seq;
 
 		if (strcmp(de->d_name, ".") == 0 || strcmp(de->d_name, "..") == 0 ||
 			snprintf(path, sizeof(path), "%s/%s", root_path, de->d_name) >=
 				(int)sizeof(path)) continue;
-		if (group_allowed(reader, "-") && segment_seq_from_name(de->d_name, &seq) == 0) {
-			if (!have_root_latest || seq > latest_seq) {
-				strcpy(latest_path, path);
-				latest_seq = seq;
-				have_root_latest = 1;
-			}
-		} else if (valid_group_name(de->d_name) && group_allowed(reader, de->d_name) &&
+		if (valid_group_name(de->d_name) && group_allowed(reader, de->d_name) &&
 			stat(path, &st) == 0 &&
 			S_ISDIR(st.st_mode) &&
 				collect_latest_segment_in_dir(path, paths, count, capacity) != 0) {
@@ -813,8 +799,7 @@ static int collect_latest_segment_paths(RecorderPlayer *reader, SegmentPath **pa
 		}
 	}
 	closedir(dir);
-	return have_root_latest ? add_segment_path(paths, count, capacity,
-											latest_path, latest_seq) : 0;
+	return 0;
 }
 
 static int compare_segment_path(const void *a, const void *b)
@@ -2422,9 +2407,6 @@ static int rec_player_seek_cursor_once(RecorderPlayer *reader, const char *group
 	if (!reader->path_is_directory) {
 		if (snprintf(path.path, sizeof(path.path), "%s", reader->path) >=
 			(int)sizeof(path.path)) return -1;
-	} else if (strcmp(group, "-") == 0) {
-		if (snprintf(path.path, sizeof(path.path), "%s/%llu.seg", reader->path,
-			(unsigned long long)segment_seq) >= (int)sizeof(path.path)) return -1;
 	} else if (snprintf(path.path, sizeof(path.path), "%s/%s/%llu.seg", reader->path,
 		group, (unsigned long long)segment_seq) >= (int)sizeof(path.path)) {
 		return -1;

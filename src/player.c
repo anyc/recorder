@@ -683,7 +683,20 @@ static int scan_stats_path(RecorderPlayer *reader, const char *path, int is_dire
 				   StatsContext *stats)
 {
     if (!is_directory) {
-		return stats_scan_segment_with_fallback(reader, path, "-", private_key,
+		const char *end = strrchr(path, '/');
+		const char *start;
+		char group[64];
+		size_t length;
+
+		if (!end || end == path) return -1;
+		start = end - 1;
+		while (start > path && start[-1] != '/') start--;
+		length = (size_t)(end - start);
+		if (length == 0 || length >= sizeof(group)) return -1;
+		memcpy(group, start, length);
+		group[length] = '\0';
+		if (!valid_group_name(group)) return -1;
+		return stats_scan_segment_with_fallback(reader, path, group, private_key,
 			repair_indexes, force_repair, stats);
     }
     {
@@ -694,16 +707,12 @@ static int scan_stats_path(RecorderPlayer *reader, const char *path, int is_dire
         while ((de = readdir(dir)) != NULL) {
             char child[512];
             struct stat st;
-            size_t len = strlen(de->d_name);
             if (snprintf(child, sizeof(child), "%s/%s", path, de->d_name) >= (int)sizeof(child) ||
                 stat(child, &st) != 0) continue;
             if (S_ISDIR(st.st_mode) && valid_group_name(de->d_name)) {
 				if (stats_scan_directory(reader, child, de->d_name, private_key,
 					repair_indexes, force_repair, stats) != 0) goto out;
-            } else if (S_ISREG(st.st_mode) && len >= 5 &&
-                strcmp(de->d_name + len - 4, ".seg") == 0 &&
-				stats_scan_segment_with_fallback(reader, child, "-", private_key,
-					repair_indexes, force_repair, stats) != 0) goto out;
+            }
         }
         rc = 0;
 out:

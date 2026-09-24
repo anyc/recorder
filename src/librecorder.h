@@ -51,7 +51,7 @@ typedef struct {
 	/** Optional arbitrary fields captured as binary name/value pairs. */
 	const RecorderField *fields;
 	size_t field_count;
-	/** Borrowed priority-group name, or NULL for a root-level segment. */
+	/** Borrowed priority-group name. */
 	const char *group;
 } RecorderEntry;
 
@@ -82,7 +82,7 @@ int rec_player_set_group_filter(RecorderPlayer *reader,
  * List groups with segment files in the opened store, ignoring the group
  * filter. Names are sorted and allocated independently of the reader.
  * The caller must free each name and then the array. An empty store returns
- * a NULL array and count zero. Root-level segments use the name "-".
+ * a NULL array and count zero.
  */
 int rec_player_list_groups(RecorderPlayer *reader, char ***groups_out,
 				   size_t *count_out);
