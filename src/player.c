@@ -99,7 +99,9 @@ typedef struct {
 	int repair_indexes;
 	int force_repair;
 	size_t line_count;
+	size_t batch_size;
 	int have_line_count;
+	int have_batch_size;
 	int lines_from_head;
 	int sanitize_output;
 	int json_output;
@@ -1172,6 +1174,7 @@ static int print_record(const RecorderEntry *entry, void *ctx)
 		}
 		print_entry(copy, pc->sanitize_output, pc->json_output);
 		free_player_entries(copy, 1);
+		pc->entry_count++;
 		return 0;
 	}
 	return append_player_entry(pc, entry);
@@ -1530,6 +1533,8 @@ static void print_selected_entries(const PlayerEntry *entries, size_t count,
 	}
 }
 
+static void wait_for_reader_change(RecorderPlayer *reader);
+
 static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 							 int *follow_initialized)
 {
@@ -1553,7 +1558,86 @@ static int scan_log_once(RecorderPlayer *reader, const PlayerOptions *opts,
 		!opts->have_line_count && !opts->since_cursor && !opts->until_cursor;
 	output.sanitize_output = opts->sanitize_output;
 	output.json_output = opts->json_output;
-
+	if (opts->have_batch_size) {
+		char *cursor = NULL;
+		int reached_until = 0;
+		const RecorderEntry *entry;
+		output.stream_output = !opts->follow;
+		rc = 0;
+		if (opts->have_line_count && opts->line_count == 0) reached_until = 1;
+		else rc = opts->since_cursor ? rec_player_seek_cursor(reader, opts->since_cursor) :
+			opts->have_since ? rec_player_seek_realtime_usec(reader, opts->since_ts) :
+			rec_player_seek_head(reader);
+		if (rc == 0 && !reached_until) {
+			for (;;) {
+				size_t in_batch = 0;
+				if (cursor) {
+					if (rec_player_seek_cursor(reader, cursor) != 0 ||
+						rec_player_next(reader) != 1 ||
+						rec_player_test_cursor(reader, cursor) != 1) {
+						rc = -1;
+						break;
+					}
+				}
+				while (in_batch < opts->batch_size) {
+					rc = rec_player_next(reader);
+					if (rc <= 0) break;
+					if (rec_player_get_entry(reader, &entry) != 0 ||
+						print_record(entry, &output) != 0) {
+						rc = -1;
+						break;
+					}
+					{
+						char *next_cursor = NULL;
+						if (rec_player_get_cursor(reader, &next_cursor) != 0) {
+							rc = -1;
+							break;
+						}
+						free(cursor);
+						cursor = next_cursor;
+					}
+					in_batch++;
+					if (opts->until_cursor &&
+						rec_player_test_cursor(reader, opts->until_cursor) == 1) {
+						reached_until = 1;
+						rc = 0;
+						break;
+					}
+					if (opts->have_line_count && output.entry_count >= opts->line_count) {
+						rc = 0;
+						reached_until = 1;
+						break;
+					}
+				}
+				if (rc < 0 || reached_until) break;
+				if (rc == 0) {
+					if (!opts->follow) break;
+					if (initial_follow_scan) {
+						print_selected_entries(output.entries, output.entry_count, opts, 1);
+					free_player_entries(output.entries, output.entry_count);
+					output.entries = NULL;
+					output.entry_count = 0;
+					output.entry_capacity = 0;
+					output.initial_follow_scan = 0;
+					initial_follow_scan = 0;
+					output.stream_output = 1;
+				}
+					fflush(stdout);
+					wait_for_reader_change(reader);
+					continue;
+				}
+			}
+		}
+		free(cursor);
+		if (rc == 0 && opts->until_cursor && !reached_until) rc = -1;
+		if (opts->have_line_count && opts->line_count == 0) rc = 0;
+		if (rc != 0) {
+			fprintf(stderr, "player: failed to scan log in batches\n");
+			free_player_entries(output.entries, output.entry_count);
+			return 1;
+		}
+		return 0;
+	}
 	if (opts->follow) {
 		rc = rec_player_scan_follow(reader, print_record, &output,
 			opts->have_line_count ? opts->line_count : FOLLOW_INITIAL_ENTRY_COUNT);
@@ -1678,6 +1762,12 @@ static int scan_log_root(const PlayerOptions *opts)
 		rec_player_close(reader);
 		return 1;
 	}
+	if (opts->have_batch_size && opts->sort_wallclock &&
+		rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0) {
+		fprintf(stderr, "player: failed to configure wallclock order\n");
+		rec_player_close(reader);
+		return 1;
+	}
 	if (opts->unit_filter && rec_player_set_unit_filter(reader, opts->unit_filter) != 0) {
 		fprintf(stderr, "player: failed to configure unit filter\n");
 		rec_player_close(reader);
@@ -1704,7 +1794,7 @@ static int scan_log_root(const PlayerOptions *opts)
 static void usage(const char *prog)
 {
 	fprintf(stderr,
-			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [-D DIR|-i FILE] [-u UNIT] [--group NAME[,NAME...]] [-b BOOT_ID|BOOT_SEQ|-N] "
+			"usage: %s [--disk-usage|--stats|--rebuild-index|--repair-index] [--force-repair] [-f] [-n COUNT] [--batch-size SIZE] [-D DIR|-i FILE] [-u UNIT] [--group NAME[,NAME...]] [-b BOOT_ID|BOOT_SEQ|-N] "
 			"[--since TIME] [--until TIME] [--list-boots] "
 			"[--sort wallclock] "
 			"[--encryption-private-key PATH] "
@@ -1712,6 +1802,20 @@ static void usage(const char *prog)
 			prog);
 	fprintf(stderr, "       TIME is usec, seconds, YYYY-MM-DD, YYYY-MM-DD HH:MM[:SS], or a rec1: cursor\n");
 	fprintf(stderr, "       COUNT selects newest entries; +COUNT selects oldest entries\n");
+}
+
+static int parse_batch_size(const char *text, size_t *size_out)
+{
+	char *end = NULL;
+	unsigned long long value;
+
+	if (!text || !text[0] || text[0] == '-') return -1;
+	errno = 0;
+	value = strtoull(text, &end, 10);
+	if (errno != 0 || !end || *end != '\0' || value == 0 || value > SIZE_MAX)
+		return -1;
+	*size_out = (size_t)value;
+	return 0;
 }
 
 static int parse_line_count(const char *text, size_t *count_out, int *from_head_out)
@@ -1756,6 +1860,15 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 			if (parse_line_count(arg + 2, &opts->line_count, &opts->lines_from_head) != 0)
 				return -1;
 			opts->have_line_count = 1;
+		} else if (strcmp(arg, "--batch-size") == 0 || strcmp(arg, "-B") == 0) {
+			if (++i >= argc || parse_batch_size(argv[i], &opts->batch_size) != 0)
+				return -1;
+			opts->have_batch_size = 1;
+		} else if (strncmp(arg, "--batch-size=", 13) == 0 ||
+			strncmp(arg, "-B", 2) == 0) {
+			const char *value = arg[1] == 'B' ? arg + 2 : arg + 13;
+			if (parse_batch_size(value, &opts->batch_size) != 0) return -1;
+			opts->have_batch_size = 1;
 		} else if (strcmp(arg, "-D") == 0) {
 			if (++i >= argc) {
 				return -1;
@@ -1856,6 +1969,9 @@ static int parse_options(int argc, char **argv, PlayerOptions *opts)
 		(opts->follow && (is_cursor_arg(opts->since_arg) || is_cursor_arg(opts->until_arg)))) {
 		return -1;
 	}
+	if (opts->have_batch_size && ((opts->have_line_count && !opts->lines_from_head) || opts->disk_usage ||
+		opts->stats || opts->list_boots || opts->rebuild_index || opts->repair_indexes ||
+		opts->force_repair)) return -1;
 	opts->path = opts->file_path ? opts->file_path :
 					(opts->dir_path ? opts->dir_path : LOG_DIR);
 	if (opts->since_arg) {

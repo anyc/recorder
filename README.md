@@ -64,6 +64,10 @@ Timestamp seeks skip older indexed segments, `-n` reads from the requested
 edge, and `-u UNIT` uses the per-frame service filter as a skip hint. Missing,
 stale, incompatible, or damaged indexes fall back to decoding the matching
 segment. Recreate an index with `player --rebuild-index -i PATH/SEGMENT.seg`.
+Use `--batch-size SIZE` (or `-B SIZE`) for bounded forward reads that resume
+each batch from its last cursor. Batch mode streams output, supports follow
+mode and wallclock sorting, and supports `-n +COUNT`; it cannot be combined
+with newest-entry reads (`-n COUNT`).
 Use `--group NAME` to read only a priority group. Repeat the option or separate
 names with commas to select several groups, for example
 `player -D /var/log/recorder --group p0,p1 --group p2`. Group selection works
