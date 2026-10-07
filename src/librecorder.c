@@ -2795,6 +2795,13 @@ int rec_player_next(RecorderPlayer *reader)
 		reader->order_changed = 0;
 	} else if (reader->cursor_sources_pending && reader->current_valid) {
 		if (iterator_materialize_cursor_sources(reader) != 0) return -1;
+		/* Wallclock materialization positions the cursor source inclusively.
+		 * Skip the cursor entry before merging its successor with the other
+		 * sources, which are already positioned at or after its timestamp. */
+		if (reader->order == RECORDER_ORDER_WALLCLOCK &&
+			reader->current_source < reader->source_count &&
+			source_advance(reader, &reader->sources[reader->current_source],
+				ITERATOR_DIRECTION_FORWARD) < 0) return -1;
 	} else if (reader->last_direction == ITERATOR_DIRECTION_REVERSE && reader->current_valid) {
 		if (iterator_reposition_after_current(reader, ITERATOR_DIRECTION_FORWARD) != 0) return -1;
 	} else if (reader->last_direction != ITERATOR_DIRECTION_FORWARD) {

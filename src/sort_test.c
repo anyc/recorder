@@ -334,6 +334,37 @@ int main(void)
 	}
 	{
 		const char *only_p6[] = {"p6"};
+		char *cursor = NULL;
+
+		if (rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_set_order(reader, RECORDER_ORDER_RECORDED) != 0 ||
+			rec_player_seek_head(reader) != 0 || rec_player_next(reader) != 1 ||
+			!current_timestamp_is(reader, 1000) ||
+			rec_player_get_cursor(reader, &cursor) != 0) {
+			fprintf(stderr, "sort-test: prepare wallclock cursor failed\n");
+			goto wallclock_cursor_fail;
+		}
+		rec_player_close(reader);
+		reader = NULL;
+		if (rec_player_open(&reader, store_template) != 0 ||
+			rec_player_set_group_filter(reader, only_p6, 1) != 0 ||
+			rec_player_set_order(reader, RECORDER_ORDER_WALLCLOCK) != 0 ||
+			rec_player_seek_cursor(reader, cursor) != 0 ||
+			rec_player_next(reader) != 1 || !current_timestamp_is(reader, 1000) ||
+			rec_player_next(reader) != 1 || !current_timestamp_is(reader, 2000)) {
+			fprintf(stderr, "sort-test: wallclock cursor repeated or skipped entry\n");
+			free(cursor);
+			goto out;
+		}
+		free(cursor);
+		goto wallclock_cursor_done;
+wallclock_cursor_fail:
+		free(cursor);
+		goto out;
+wallclock_cursor_done:;
+	}
+	{
+		const char *only_p6[] = {"p6"};
 		const char *both[] = {"p5", "p6"};
 		char *excluded_cursor = NULL;
 
