@@ -164,7 +164,10 @@ install: all librecorder.pc
 test-fallback: recorder player
 	$(PYTHON) scripts/test_fallback.py --recorder ./recorder --player ./player
 
-test-storage-policy: recorder
+# Make does not track compiler flags, so rebuild recorder with the test-only
+# simulated free-space value even if the normal binary was built already.
+test-storage-policy:
+	$(MAKE) -B RECORDER_TEST_FREE_BYTES=0 recorder
 	$(PYTHON) scripts/test_storage_policy.py
 
 test-python:

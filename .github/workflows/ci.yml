@@ -1,0 +1,41 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-and-test:
+    runs-on: ubuntu-24.04
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Build test container
+        run: docker build --tag recorder-ci .
+
+      - name: Build and test in container
+        run: |
+          docker run --rm \
+            --volume "$GITHUB_WORKSPACE:/workspace" \
+            --workdir /workspace \
+            recorder-ci \
+            sh -ec '
+              ln -s /opt/flatcc-src flatcc
+              export LD_LIBRARY_PATH=/workspace
+              make FLATCC_MODE=repo REPO_BUILD=1 \
+                LOG_DIR=/workspace/.ci-recorder-log \
+                RECORDER_CONFIG_PATH=/workspace/packaging/recorder.json \
+                RECORDER_CONFIG_DIR=/workspace/packaging/recorder.d \
+                all
+              make FLATCC_MODE=repo REPO_BUILD=1 \
+                REPO_LOG_DIR=/workspace/.ci-recorder-log \
+                REPO_CONFIG_PATH=/workspace/packaging/recorder.json \
+                REPO_CONFIG_DIR=/workspace/packaging/recorder.d \
+                test
+            '
