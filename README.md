@@ -12,10 +12,14 @@ fast read access to logs.
 - Stores logs in a compact FlatBuffers format, with optional zstd compression.
 - Lets you choose which journal fields to store, so you can keep only the
   metadata your application needs.
+- Lets you choose how often data is written to storage by priority: write
+  critical logs immediately and batch writes for less critical logs.
 - Detects when the system clock jumps and starts a new log file. Logs can still
   be read in the order they were recorded, even if timestamps move backward.
 - Builds indexes that help find logs by time or service without scanning every
   entry. If an index is damaged or missing, it can read the log files directly.
+- Supports custom compression dictionaries for priorities with recurring log
+  patterns.
 - Can encrypt logs for confidentiality.
 
 ## Build
