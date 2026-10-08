@@ -4,18 +4,19 @@ recorder is an alternative log backend targeting embedded Linux systems. It
 focuses on efficient, fault-tolerant log storage while still providing
 fast read access to logs.
 
-Author: Mario Kicherer <dev@kicherer.org>
+## Why Use Recorder?
 
-## What It Does
-
-- Reads from the local systemd journal.
-- Writes retained logs into segment files under a configurable log directory.
-- Rotates segments by size, age, boot changes, timezone changes, and significant
-  realtime clock jumps (backward jumps over 1 ms or forward jumps over 1 s).
-- Enforces a configurable total disk usage limit.
-- Can group multiple journal priorities into the same segment directory to
-  reduce storage wear.
-- Can optionally compress stored frames with zstd.
+- Protects important logs when disk space runs low: it removes older,
+  lower-priority logs before higher-priority ones. You can set different
+  retention limits for each priority group.
+- Stores logs in a compact FlatBuffers format, with optional zstd compression.
+- Lets you choose which journal fields to store, so you can keep only the
+  metadata your application needs.
+- Detects when the system clock jumps and starts a new log file. Logs can still
+  be read in the order they were recorded, even if timestamps move backward.
+- Builds indexes that help find logs by time or service without scanning every
+  entry. If an index is damaged or missing, it can read the log files directly.
+- Can encrypt logs for confidentiality.
 
 ## Build
 
@@ -48,60 +49,6 @@ make PCRE2=0 LIBC_REGEX=0
 ```
 
 This produces `./recorder` and `./player`.
-
-For cursor-pagination performance checks, build `make batch-reader` and run
-`./batch-reader LOG-DIRECTORY`. It seeks to the head, reads 50 entries, then
-seeks to the cursor of the last entry before reading the next batch. Use
-`-b SIZE` to change the batch size. It reads in recorder order by default; use
-`--sort wallclock` for realtime ordering. The reported entry count includes the
-cursor entry at every batch boundary because `rec_player_seek_cursor()`
-positions the reader at that entry.
-Use `-f` to keep the reader running at the end of the log and print records as
-they are appended.
-
-Normal player queries and `player --stats` use sidecar indexes when available.
-Timestamp seeks skip older indexed segments, `-n` reads from the requested
-edge, and `-u UNIT` uses the per-frame service filter as a skip hint. Missing,
-stale, incompatible, or damaged indexes fall back to decoding the matching
-segment. Recreate an index with `player --rebuild-index -i PATH/SEGMENT.seg`.
-Use `--batch-size SIZE` (or `-B SIZE`) for bounded forward reads that resume
-each batch from its last cursor. Batch mode streams output, supports follow
-mode and wallclock sorting, and supports `-n +COUNT`; it cannot be combined
-with newest-entry reads (`-n COUNT`).
-Use `--group NAME` to read only a priority group. Repeat the option or separate
-names with commas to select several groups, for example
-`player -D /var/log/recorder --group p0,p1 --group p2`. Group selection works
-with follow mode, time ranges, and `-n`. The default is to read all groups.
-With `--since` set to a cursor from an excluded group, output starts at the
-next entry from the selected groups.
-For lazy repair while reading, use `player --repair-index -D PATH`; only an
-unusable index for a segment actually reached by the query is considered. The
-option also accepts a single segment with `-i PATH/SEGMENT.seg` and may be
-combined with `--stats`. Only finalized segments with valid footers are
-repaired, and the highest sequence-numbered segment in each group is skipped
-because recorder may still be using it. Active or otherwise non-finalized
-segments, skipped indexes, and indexes that cannot be repaired use the normal
-segment-scan fallback. For offline stores, add `--force-repair` to include the
-latest finalized segment. `--force-repair --rebuild-index -i PATH/SEGMENT.seg`
-also explicitly permits rebuilding a non-finalized segment from its complete
-frames.
-
-By default, it also builds the versioned shared library
-`./librecorder.so.1.0.0` with SONAME `librecorder.so.1`; `librecorder.so` and
-`librecorder.so.1` are symlinks. To build the static library instead, use:
-
-```sh
-make LIBRECORDER_STATIC=1
-```
-
-`make install` installs the library's pkg-config file as `librecorder.pc` in
-`$(libdir)/pkgconfig`. Consumers can use `pkg-config --cflags --libs
-librecorder`.
-
-Applications can call `rec_player_get_group_stats()` to query the entry count,
-allocated segment and index bytes, and earliest and latest entry timestamps
-for each group. The values are a snapshot of the files present during the
-call; the active group filter does not affect them.
 
 To build binaries that run directly from the repository checkout, use:
 
@@ -139,194 +86,6 @@ updates an existing file or device in place. A missing path is created.
 To read a systemd journal namespace instead of the default namespace, use
 `--namespace NAME` (or `-n NAME`).
 
-To report total allocated disk usage and usage for each priority-group
-directory, use:
-
-```sh
-./player --disk-usage -D /var/log/recorder
-```
-
-### Non-systemd fallback input
-
-On systems without a running journald instance, recorder can collect local
-syslog datagrams and kernel messages directly:
-
-```sh
-recorder --fallback
-```
-
-Fallback mode binds `/dev/log` and reads `/dev/kmsg`. It must own `/dev/log`;
-stop or configure any existing syslog daemon before starting it. Kernel access
-typically requires root or `CAP_SYSLOG`. Use `--no-kmsg` if kernel collection
-is unavailable, `--syslog-socket PATH` to use a different syslog socket, and
-`--kernel-path PATH` to use a different kernel-message source. The fallback
-collector records socket credentials and process metadata when available, but
-it cannot provide a systemd unit or journald-style replay cursor.
-
-Run its end-to-end test with:
-
-```sh
-make test-fallback
-```
-
-Run the smoke test, Python tests, and fallback integration test together with
-`make test`. The benchmark entry points are `make benchmark-compare-storage`,
-`make benchmark-storage`, and `make benchmark-capacity`; pass script options
-via `COMPARE_STORAGE_ARGS`, `BENCHMARK_STORAGE_ARGS`, or
-`BENCHMARK_CAPACITY_ARGS` respectively. The latter two operate on the live
-journal and may prompt for `sudo`.
-
-The focused sort-order regression test can be run with `make test-sort` in the
-repository build configuration. It verifies recorded order, wall-clock order,
-nonmonotonic segment marking, and the wall-clock merge path.
-The `make test` build also builds `batch-reader` by default.
-
-For isolated tests, recorder's storage directory can be overridden with
-`--log-dir PATH` (or `-l PATH`). This directory includes the segments, indexes,
-state, lock, and cursor files for that run.
-
-Run the player on one segment:
-
-```sh
-./player -i /var/log/recorder/high/42.seg
-```
-
-Run the player on a whole recorder directory:
-
-```sh
-./player -D /var/log/recorder
-```
-
-Encrypted segments require the corresponding PEM private key:
-
-```sh
-./player -D /var/log/recorder \
-  --encryption-private-key /path/to/encryption-private.pem
-```
-
-## Storage Comparison
-
-To measure how much space journald and recorder consume over the same period:
-
-```sh
-python3 scripts/compare_storage.py \
-  --duration 3600 \
-  --interval 60 \
-  --csv /tmp/recorder-storage.csv
-```
-
-The script reports absolute logical and physical usage, allocation growth,
-journal entries observed during the test, file counts, and the physical space
-saved by recorder relative to journald. Journald may reuse preallocated file
-space, so entry counts can increase even when allocation growth is zero. It
-measures storage only and does not compare stored fields.
-
-For a repeatable namespace benchmark, use `scripts/benchmark_storage.py`:
-
-```sh
-python3 scripts/benchmark_storage.py config \
-  --namespace recorder-bench \
-  --output /tmp/journald@recorder-bench.conf
-
-python3 scripts/benchmark_storage.py capture \
-  --since "1 day ago" \
-  --output /tmp/recorder-bench.log
-```
-
-Copy the generated config as instructed by the script, clear the namespace's
-old journal files, and run the baseline replay:
-
-```sh
-python3 scripts/benchmark_storage.py replay \
-  --namespace recorder-bench \
-  --input /tmp/recorder-bench.log
-```
-
-Replay uses `sudo systemd-run` so it can create a system service assigned to
-the namespace. Use `--run-as USER` to run the replay process unprivileged, or
-`--no-sudo` when already running as root.
-
-For the recorder run, configure the namespace with `Storage=volatile`, start
-recorder with a fresh output directory, and replay the same input again:
-
-```sh
-recorder --namespace recorder-bench --log-dir /tmp/recorder-bench-output
-```
-
-Measure the persistent namespace directory for the journald run and
-`/tmp/recorder-bench-output` for the recorder run with `compare_storage.py`.
-
-The complete workflow can also be run interactively. It captures the input,
-creates and installs the namespace configuration through prompted `sudo`
-commands, runs both fresh-storage phases, prints the result, and offers to
-remove the namespace data and temporary files. A differing existing namespace
-configuration is backed up and always restored afterward; an identical config
-does not create a redundant backup. Existing journal data must be explicitly
-approved for deletion:
-
-Before the first privileged operation, it prints the complete `sudo` command
-plan. The recorder transient unit is started with `User=` set to the user who
-invoked the benchmark, so recorder itself does not run as root.
-
-```sh
-python3 scripts/benchmark_storage.py interactive \
-  --since "1 day ago" \
-  --capture-all-fields \
-  --recorder ./recorder
-```
-
-Add `--capture-all-fields` to enable all optional journald metadata fields
-that recorder currently represents (`MESSAGE_ID`, unit, hostname, comm,
-executable, PID, UID, and GID). Timestamps, priority, boot identity, and
-errno are stored by recorder regardless of this option. With the option
-enabled, arbitrary journald fields are also preserved in the entry's
-`fields` vector, including binary values. This makes the benchmark compare
-the fuller recorder entry representation.
-
-The interactive run disables journald and per-service rate limiting, verifies
-that both replays contain every input message, and waits for recorder's cursor
-to reach a fixed journal-tail cursor. `--drain-seconds` controls the short
-additional settling delay after that cursor is reached.
-
-The result compares journald and recorder physical allocation directly for the
-headline space saving. It also reports apparent size, the value from
-`journalctl --header`, and a nonzero-data extent calculated by ignoring
-trailing zero-filled journal preallocation. That extent is an upper bound, not
-an exact measure of journal object bytes. The export size is reported
-separately to show the serialized entries and metadata rather than on-disk
-storage.
-
-To compare retention capacity under an equal storage budget, use the separate
-capacity benchmark:
-
-```sh
-python3 scripts/benchmark_capacity.py \
-  --budget 20M \
-  --capture-all-fields \
-  --recorder ./recorder \
-  --player ./player
-```
-
-The script generates one oversized, random-looking workload and replays the
-same generated messages into both phases. Journald and recorder use separate
-fresh namespaces, so changing the baseline limit cannot affect recorder's
-input transport. Before recorder starts, the script verifies that its larger
-transport journal retained every generated sequence. Journald rate limiting is
-disabled in both benchmark namespaces so burst drops cannot distort the result.
-Both stores are considered full only after the oldest generated sequences have
-actually been evicted; rotation log messages and preallocated file size are
-not used as proof. The result reports retained entries, oldest retained
-sequence, actual budget utilization, logical/physical usage, and recorder's
-retention advantage.
-
-`player` scans priority-group subdirectories under the given log root and reads
-valid `.seg` files it finds there.
-By default it prints entries in recorder order (segment sequence, frame offset,
-and entry index), which remains stable across realtime clock jumps. Use
-`--sort wallclock` to sort output by the stored realtime timestamp instead.
-Player output sanitizes terminal control characters by default. Use
-`--no-sanitize-output` when raw stored fields are required.
-
 ## Configuration
 
 By default, the build uses:
@@ -336,32 +95,6 @@ By default, the build uses:
 
 The package ships a commented sample config at
 [packaging/recorder.json](packaging/recorder.json).
-
-At runtime, you can override the config file path with:
-
-```sh
-RECORDER_CONFIG=/path/to/recorder.json ./recorder
-```
-
-After loading the main config, recorder also loads every regular `*.json` file
-in the configured drop-in directory (normally `/etc/recorder.d`), in lexical
-filename order. Later files override earlier values, so drop-ins can customize
-the packaged defaults. The directory is set at build time with the
-`RECORDER_CONFIG_DIR` Make variable.
-
-For deterministic low-space testing, builds may set
-`RECORDER_TEST_FREE_BYTES=N`; this overrides the reported available space used
-by retention and diagnostics without consuming the real filesystem.
-
-The config file is JSON. Before parsing, lines starting with `#` are removed, so
-this is valid:
-
-```json
-# recorder config
-{
-  "log_max_bytes": "64M"
-}
-```
 
 ### Modifiers
 
